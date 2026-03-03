@@ -1,0 +1,15 @@
+{
+  "name": "nt208-attendance-system",
+  "version": "1.0.0",
+  "description": "NT208 Student Attendance System with AI Exam Generation",
+  "private": true,
+  "scripts": {
+    "install:all": "cd backend && npm install && cd ../frontend && npm install",
+    "setup:db": "cd backend && npx prisma generate && npx prisma migrate dev --name init && npx ts-node prisma/seed.ts",
+    "dev:backend": "cd backend && npm run dev",
+    "dev:frontend": "cd frontend && npm run dev",
+    "build:backend": "cd backend && npm run build",
+    "build:frontend": "cd frontend && npm run build"
+  },
+  "workspaces": ["backend", "frontend"]
+}

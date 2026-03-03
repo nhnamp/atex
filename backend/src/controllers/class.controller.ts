@@ -1,0 +1,219 @@
+import { Response } from 'express';
+import { PrismaClient } from '@prisma/client';
+import { AuthRequest } from '../middleware/auth';
+
+const prisma = new PrismaClient();
+
+export const getClasses = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const classes = await prisma.class.findMany({
+      where: { teacherId: req.user!.id },
+      include: {
+        _count: { select: { students: true, sessions: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(classes);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+export const createClass = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { name, description } = req.body;
+    if (!name) {
+      res.status(400).json({ error: 'Class name is required' });
+      return;
+    }
+
+    const newClass = await prisma.class.create({
+      data: { name, description, teacherId: req.user!.id },
+      include: { _count: { select: { students: true, sessions: true } } },
+    });
+    res.status(201).json(newClass);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+export const getClassById = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const id = parseInt(req.params.id);
+    const cls = await prisma.class.findUnique({
+      where: { id },
+      include: {
+        teacher: { select: { id: true, fullName: true, username: true } },
+        students: {
+          include: {
+            student: { select: { id: true, username: true, fullName: true } },
+          },
+        },
+        sessions: {
+          orderBy: { createdAt: 'desc' },
+          take: 10,
+        },
+        _count: { select: { students: true, sessions: true } },
+      },
+    });
+
+    if (!cls) {
+      res.status(404).json({ error: 'Class not found' });
+      return;
+    }
+
+    // Access check
+    if (req.user!.role === 'TEACHER' && cls.teacherId !== req.user!.id) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    if (req.user!.role === 'STUDENT') {
+      const enrolled = cls.students.some((s) => s.studentId === req.user!.id);
+      if (!enrolled) {
+        res.status(403).json({ error: 'Access denied' });
+        return;
+      }
+    }
+
+    res.json(cls);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+export const updateClass = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const id = parseInt(req.params.id);
+    const cls = await prisma.class.findUnique({ where: { id } });
+
+    if (!cls || cls.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Class not found' });
+      return;
+    }
+
+    const updated = await prisma.class.update({
+      where: { id },
+      data: { name: req.body.name, description: req.body.description },
+    });
+    res.json(updated);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+export const deleteClass = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const id = parseInt(req.params.id);
+    const cls = await prisma.class.findUnique({ where: { id } });
+
+    if (!cls || cls.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Class not found' });
+      return;
+    }
+
+    await prisma.class.delete({ where: { id } });
+    res.json({ message: 'Class deleted' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+export const addStudents = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const classId = parseInt(req.params.id);
+    const { studentIds } = req.body as { studentIds: string[] };
+
+    if (!studentIds || !Array.isArray(studentIds) || studentIds.length === 0) {
+      res.status(400).json({ error: 'studentIds array is required' });
+      return;
+    }
+
+    const cls = await prisma.class.findUnique({ where: { id: classId } });
+    if (!cls || cls.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Class not found' });
+      return;
+    }
+
+    const results = { added: [] as string[], notFound: [] as string[], alreadyEnrolled: [] as string[] };
+
+    for (const sid of studentIds) {
+      const student = await prisma.user.findFirst({
+        where: { username: sid.trim(), role: 'STUDENT' },
+      });
+
+      if (!student) {
+        results.notFound.push(sid.trim());
+        continue;
+      }
+
+      const existing = await prisma.classStudent.findUnique({
+        where: { classId_studentId: { classId, studentId: student.id } },
+      });
+
+      if (existing) {
+        results.alreadyEnrolled.push(sid.trim());
+        continue;
+      }
+
+      await prisma.classStudent.create({ data: { classId, studentId: student.id } });
+      results.added.push(sid.trim());
+    }
+
+    res.json({
+      message: `Processed ${studentIds.length} student IDs`,
+      ...results,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+export const removeStudent = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const classId = parseInt(req.params.id);
+    const studentId = parseInt(req.params.studentId);
+
+    const cls = await prisma.class.findUnique({ where: { id: classId } });
+    if (!cls || cls.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Class not found' });
+      return;
+    }
+
+    await prisma.classStudent.delete({
+      where: { classId_studentId: { classId, studentId } },
+    });
+
+    res.json({ message: 'Student removed from class' });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+export const getStudentClasses = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const studentId = req.user!.id;
+    const enrollments = await prisma.classStudent.findMany({
+      where: { studentId },
+      include: {
+        class: {
+          include: {
+            teacher: { select: { id: true, fullName: true, username: true } },
+            _count: { select: { students: true, sessions: true } },
+          },
+        },
+      },
+    });
+    res.json(enrollments.map((e) => e.class));
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};

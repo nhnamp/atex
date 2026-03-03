@@ -1,0 +1,100 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  username  String   @unique
+  password  String
+  fullName  String
+  role      String   @default("STUDENT") // ADMIN | TEACHER | STUDENT
+  status    String   @default("APPROVED") // PENDING | APPROVED | REJECTED
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  teacherClasses    Class[]        @relation("TeacherClasses")
+  studentClasses    ClassStudent[]
+  attendanceRecords AttendanceRecord[]
+  subjects          Subject[]
+}
+
+model Class {
+  id          Int      @id @default(autoincrement())
+  name        String
+  description String?
+  teacherId   Int
+  teacher     User     @relation("TeacherClasses", fields: [teacherId], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  students ClassStudent[]
+  sessions AttendanceSession[]
+}
+
+model ClassStudent {
+  classId   Int
+  studentId Int
+  class     Class @relation(fields: [classId], references: [id], onDelete: Cascade)
+  student   User  @relation(fields: [studentId], references: [id])
+  joinedAt  DateTime @default(now())
+
+  @@id([classId, studentId])
+}
+
+model AttendanceSession {
+  id        Int      @id @default(autoincrement())
+  classId   Int
+  class     Class    @relation(fields: [classId], references: [id])
+  codes     String   // JSON: ["123456","654321","111222"]
+  status    String   @default("ACTIVE") // ACTIVE | COMPLETED
+  startedAt DateTime @default(now())
+  endedAt   DateTime?
+  createdAt DateTime @default(now())
+
+  records AttendanceRecord[]
+}
+
+model AttendanceRecord {
+  id           Int      @id @default(autoincrement())
+  sessionId    Int
+  session      AttendanceSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  studentId    Int
+  student      User     @relation(fields: [studentId], references: [id])
+  codesEntered String   @default("{}") // JSON: {"0":"123456","1":"654321","2":"111222"}
+  isPresent    Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([sessionId, studentId])
+}
+
+model Subject {
+  id        Int      @id @default(autoincrement())
+  name      String
+  teacherId Int
+  teacher   User     @relation(fields: [teacherId], references: [id])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  questions Question[]
+}
+
+model Question {
+  id        Int      @id @default(autoincrement())
+  subjectId Int
+  subject   Subject  @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  type      String   // MULTIPLE_CHOICE | ESSAY | TRUE_FALSE
+  content   String
+  answer    String
+  options   String?  // JSON: ["Option A","Option B","Option C","Option D"] for MC
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
