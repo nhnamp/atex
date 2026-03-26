@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
-import { ArrowLeft, UserPlus, Play, ClipboardList, Trash2, X } from 'lucide-react';
+import { ArrowLeft, UserPlus, Play, ClipboardList, Trash2, X, ScanFace } from 'lucide-react';
 import toast from 'react-hot-toast';
 import Layout from '../../components/Layout';
 import LoadingSpinner from '../../components/LoadingSpinner';
@@ -17,6 +17,7 @@ const TeacherClassDetail: React.FC = () => {
   const [studentIds, setStudentIds] = useState('');
   const [addingStudents, setAddingStudents] = useState(false);
   const [startingSession, setStartingSession] = useState(false);
+  const [startingFaceSession, setStartingFaceSession] = useState(false);
 
   const fetchData = async () => {
     setLoading(true);
@@ -87,6 +88,19 @@ const TeacherClassDetail: React.FC = () => {
     }
   };
 
+  const handleStartFaceSession = async () => {
+    setStartingFaceSession(true);
+    try {
+      const { data } = await api.post('/attendance/sessions/face', { classId: parseInt(id!) });
+      toast.success('Face attendance session started!');
+      navigate(`/teacher/face-attendance/${data.id}`);
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to start face session');
+    } finally {
+      setStartingFaceSession(false);
+    }
+  };
+
   if (loading) {
     return (
       <Layout>
@@ -110,20 +124,34 @@ const TeacherClassDetail: React.FC = () => {
               <h1 className="text-2xl font-bold text-gray-900">{cls.name}</h1>
               {cls.description && <p className="text-gray-500 mt-1">{cls.description}</p>}
             </div>
-            <div className="flex gap-3">
+            <div className="flex gap-3 flex-wrap">
               <button
                 onClick={() => setShowAddStudents(true)}
                 className="btn-secondary flex items-center gap-2"
               >
                 <UserPlus size={16} /> Add Students
               </button>
+              <Link
+                to={`/teacher/classes/${id}/face-enroll`}
+                className="btn-secondary flex items-center gap-2"
+              >
+                <ScanFace size={16} /> Manage Faces
+              </Link>
               <button
                 onClick={handleStartSession}
                 disabled={startingSession}
                 className="btn-primary flex items-center gap-2"
               >
                 <Play size={16} />
-                {startingSession ? 'Starting...' : 'Start Attendance'}
+                {startingSession ? 'Starting...' : 'Code Attendance'}
+              </button>
+              <button
+                onClick={handleStartFaceSession}
+                disabled={startingFaceSession}
+                className="btn-primary flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700"
+              >
+                <ScanFace size={16} />
+                {startingFaceSession ? 'Starting...' : 'Face Attendance'}
               </button>
             </div>
           </div>

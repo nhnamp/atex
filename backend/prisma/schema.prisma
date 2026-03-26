@@ -24,6 +24,7 @@ model User {
   studentClasses    ClassStudent[]
   attendanceRecords AttendanceRecord[]
   subjects          Subject[]
+  faceDescriptors   FaceDescriptor[]
 }
 
 model Class {
@@ -54,6 +55,7 @@ model AttendanceSession {
   classId   Int
   class     Class    @relation(fields: [classId], references: [id])
   codes     String   // JSON: ["123456","654321","111222"]
+  method    String   @default("CODE") // CODE | FACE
   status    String   @default("ACTIVE") // ACTIVE | COMPLETED
   startedAt DateTime @default(now())
   endedAt   DateTime?
@@ -97,4 +99,14 @@ model Question {
   options   String?  // JSON: ["Option A","Option B","Option C","Option D"] for MC
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model FaceDescriptor {
+  id          Int      @id @default(autoincrement())
+  studentId   Int
+  student     User     @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  descriptor  String   // JSON: array of 128 float numbers
+  createdAt   DateTime @default(now())
+
+  @@index([studentId])
 }

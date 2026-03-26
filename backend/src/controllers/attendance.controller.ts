@@ -465,3 +465,131 @@ export const getStudentAttendanceRecord = async (req: AuthRequest, res: Response
     res.status(500).json({ error: 'Internal server error' });
   }
 };
+
+/**
+ * Create a face-recognition attendance session (no rolling codes).
+ */
+export const createFaceSession = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const { classId } = req.body;
+    if (!classId) {
+      res.status(400).json({ error: 'classId is required' });
+      return;
+    }
+
+    const cls = await prisma.class.findUnique({ where: { id: parseInt(classId) } });
+    if (!cls || cls.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Class not found' });
+      return;
+    }
+
+    // Check if there's an active session already
+    const existingActive = await prisma.attendanceSession.findFirst({
+      where: { classId: parseInt(classId), status: 'ACTIVE' },
+    });
+    if (existingActive) {
+      res.status(400).json({ error: 'A session is already active for this class' });
+      return;
+    }
+
+    const session = await prisma.attendanceSession.create({
+      data: {
+        classId: parseInt(classId),
+        codes: '[]', // No codes for face sessions
+        method: 'FACE',
+        status: 'ACTIVE',
+        startedAt: new Date(),
+      },
+    });
+
+    res.status(201).json({
+      ...session,
+      method: 'FACE',
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+/**
+ * Submit face-recognized attendance — bulk-mark matched students as present.
+ * Body: { studentIds: number[] }
+ */
+export const submitFaceAttendance = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const sessionId = parseInt(req.params.id);
+    const { studentIds } = req.body;
+
+    if (!studentIds || !Array.isArray(studentIds) || studentIds.length === 0) {
+      res.status(400).json({ error: 'studentIds array is required' });
+      return;
+    }
+
+    const session = await prisma.attendanceSession.findUnique({
+      where: { id: sessionId },
+      include: { class: true },
+    });
+
+    if (!session) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+    if (session.class.teacherId !== req.user!.id) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+    if (session.status !== 'ACTIVE') {
+      res.status(400).json({ error: 'Session is not active' });
+      return;
+    }
+
+    // Verify all students are enrolled in the class
+    const enrolledStudents = await prisma.classStudent.findMany({
+      where: {
+        classId: session.classId,
+        studentId: { in: studentIds.map((id: number) => parseInt(String(id))) },
+      },
+    });
+    const enrolledIds = new Set(enrolledStudents.map((e) => e.studentId));
+
+    const results: { studentId: number; marked: boolean }[] = [];
+
+    for (const sid of studentIds) {
+      const studentId = parseInt(String(sid));
+      if (!enrolledIds.has(studentId)) {
+        results.push({ studentId, marked: false });
+        continue;
+      }
+
+      // Upsert attendance record
+      await prisma.attendanceRecord.upsert({
+        where: { sessionId_studentId: { sessionId, studentId } },
+        create: {
+          sessionId,
+          studentId,
+          codesEntered: JSON.stringify({ face: true }),
+          isPresent: true,
+        },
+        update: {
+          isPresent: true,
+          codesEntered: JSON.stringify({ face: true }),
+        },
+      });
+
+      results.push({ studentId, marked: true });
+    }
+
+    const markedCount = results.filter((r) => r.marked).length;
+
+    res.json({
+      success: true,
+      message: `Marked ${markedCount} student(s) as present via face recognition`,
+      markedCount,
+      results,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};

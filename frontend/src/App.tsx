@@ -18,6 +18,8 @@ import TeacherAttendanceSession from './pages/teacher/AttendanceSession';
 import TeacherSubjects from './pages/teacher/Subjects';
 import TeacherQuestions from './pages/teacher/Questions';
 import TeacherExamGenerator from './pages/teacher/ExamGenerator';
+import TeacherFaceEnrollment from './pages/teacher/FaceEnrollment';
+import TeacherFaceAttendance from './pages/teacher/FaceAttendance';
 
 // Student pages
 import StudentDashboard from './pages/student/Dashboard';
@@ -49,7 +51,9 @@ function AppRoutes() {
         <Route path="/teacher" element={<TeacherDashboard />} />
         <Route path="/teacher/classes" element={<TeacherClasses />} />
         <Route path="/teacher/classes/:id" element={<TeacherClassDetail />} />
+        <Route path="/teacher/classes/:id/face-enroll" element={<TeacherFaceEnrollment />} />
         <Route path="/teacher/attendance/:sessionId" element={<TeacherAttendanceSession />} />
+        <Route path="/teacher/face-attendance/:sessionId" element={<TeacherFaceAttendance />} />
         <Route path="/teacher/subjects" element={<TeacherSubjects />} />
         <Route path="/teacher/subjects/:subjectId/questions" element={<TeacherQuestions />} />
         <Route path="/teacher/exams" element={<TeacherExamGenerator />} />

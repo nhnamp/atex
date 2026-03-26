@@ -24,6 +24,7 @@ export interface AttendanceSession {
   classId: number;
   class?: Class;
   status: 'ACTIVE' | 'COMPLETED';
+  method?: 'CODE' | 'FACE';
   startedAt: string;
   endedAt?: string;
   createdAt?: string;
@@ -33,6 +34,13 @@ export interface AttendanceSession {
   codeIndex?: number;
   timeLeft?: number;
   totalCodes?: number;
+}
+
+export interface FaceDescriptor {
+  id: number;
+  studentId: number;
+  descriptor: number[];
+  createdAt?: string;
 }
 
 export interface AttendanceRecord {

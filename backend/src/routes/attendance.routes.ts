@@ -8,6 +8,8 @@ import {
   getSessionRecords,
   getActiveSessionsForStudent,
   getStudentAttendanceRecord,
+  createFaceSession,
+  submitFaceAttendance,
 } from '../controllers/attendance.controller';
 import { authenticate, requireRole, requireApproved } from '../middleware/auth';
 
@@ -16,9 +18,11 @@ router.use(authenticate, requireApproved);
 
 // Teacher routes
 router.post('/sessions', requireRole('TEACHER'), createSession);
+router.post('/sessions/face', requireRole('TEACHER'), createFaceSession);
 router.get('/sessions/class/:classId', requireRole('TEACHER'), getSessionsByClass);
 router.put('/sessions/:id/end', requireRole('TEACHER'), endSession);
 router.get('/sessions/:id/records', requireRole('TEACHER'), getSessionRecords);
+router.post('/sessions/:id/face-submit', requireRole('TEACHER'), submitFaceAttendance);
 
 // Shared - status (used by both teacher and student)
 router.get('/sessions/:id/status', getSessionStatus);

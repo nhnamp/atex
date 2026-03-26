@@ -11,6 +11,7 @@ import attendanceRoutes from './routes/attendance.routes';
 import subjectRoutes from './routes/subject.routes';
 import questionRoutes from './routes/question.routes';
 import examRoutes from './routes/exam.routes';
+import faceRoutes from './routes/face.routes';
 
 dotenv.config();
 
@@ -49,6 +50,7 @@ app.use('/api/attendance', attendanceRoutes);
 app.use('/api/subjects', subjectRoutes);
 app.use('/api/questions', questionRoutes);
 app.use('/api/exams', examRoutes);
+app.use('/api/face', faceRoutes);
 
 // Socket.io connection handler
 io.on('connection', (socket) => {
