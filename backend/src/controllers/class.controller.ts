@@ -20,17 +20,51 @@ export const getClasses = async (req: AuthRequest, res: Response): Promise<void>
   }
 };
 
+export const getAllClasses = async (_req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const classes = await prisma.class.findMany({
+      include: {
+        teacher: { select: { id: true, fullName: true, username: true } },
+        _count: { select: { students: true, sessions: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    res.json(classes);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
 export const createClass = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const { name, description } = req.body;
+    const { name, description, teacherId } = req.body;
     if (!name) {
       res.status(400).json({ error: 'Class name is required' });
       return;
     }
 
+    // Admin must provide teacherId; teacher uses own id
+    const assignedTeacherId = req.user!.role === 'ADMIN' ? parseInt(teacherId) : req.user!.id;
+
+    if (!assignedTeacherId || isNaN(assignedTeacherId)) {
+      res.status(400).json({ error: 'teacherId is required' });
+      return;
+    }
+
+    // Verify teacher exists and is approved
+    const teacher = await prisma.user.findUnique({ where: { id: assignedTeacherId } });
+    if (!teacher || teacher.role !== 'TEACHER' || teacher.status !== 'APPROVED') {
+      res.status(400).json({ error: 'Invalid or unapproved teacher' });
+      return;
+    }
+
     const newClass = await prisma.class.create({
-      data: { name, description, teacherId: req.user!.id },
-      include: { _count: { select: { students: true, sessions: true } } },
+      data: { name, description, teacherId: assignedTeacherId },
+      include: {
+        teacher: { select: { id: true, fullName: true, username: true } },
+        _count: { select: { students: true, sessions: true } },
+      },
     });
     res.status(201).json(newClass);
   } catch (error) {
@@ -90,8 +124,13 @@ export const updateClass = async (req: AuthRequest, res: Response): Promise<void
     const id = parseInt(req.params.id);
     const cls = await prisma.class.findUnique({ where: { id } });
 
-    if (!cls || cls.teacherId !== req.user!.id) {
+    if (!cls) {
       res.status(404).json({ error: 'Class not found' });
+      return;
+    }
+    // Admin can update any class; teacher only their own
+    if (req.user!.role !== 'ADMIN' && cls.teacherId !== req.user!.id) {
+      res.status(403).json({ error: 'Access denied' });
       return;
     }
 
@@ -111,8 +150,13 @@ export const deleteClass = async (req: AuthRequest, res: Response): Promise<void
     const id = parseInt(req.params.id);
     const cls = await prisma.class.findUnique({ where: { id } });
 
-    if (!cls || cls.teacherId !== req.user!.id) {
+    if (!cls) {
       res.status(404).json({ error: 'Class not found' });
+      return;
+    }
+    // Admin can delete any class; teacher only their own
+    if (req.user!.role !== 'ADMIN' && cls.teacherId !== req.user!.id) {
+      res.status(403).json({ error: 'Access denied' });
       return;
     }
 
@@ -135,8 +179,12 @@ export const addStudents = async (req: AuthRequest, res: Response): Promise<void
     }
 
     const cls = await prisma.class.findUnique({ where: { id: classId } });
-    if (!cls || cls.teacherId !== req.user!.id) {
-      res.status(404).json({ error: 'Class not found' });
+    if (!cls) {
+      res.status(404).json({ error: 'Course not found' });
+      return;
+    }
+    if (req.user!.role !== 'ADMIN' && cls.teacherId !== req.user!.id) {
+      res.status(403).json({ error: 'Access denied' });
       return;
     }
 
@@ -181,8 +229,12 @@ export const removeStudent = async (req: AuthRequest, res: Response): Promise<vo
     const studentId = parseInt(req.params.studentId);
 
     const cls = await prisma.class.findUnique({ where: { id: classId } });
-    if (!cls || cls.teacherId !== req.user!.id) {
-      res.status(404).json({ error: 'Class not found' });
+    if (!cls) {
+      res.status(404).json({ error: 'Course not found' });
+      return;
+    }
+    if (req.user!.role !== 'ADMIN' && cls.teacherId !== req.user!.id) {
+      res.status(403).json({ error: 'Access denied' });
       return;
     }
 
@@ -217,3 +269,58 @@ export const getStudentClasses = async (req: AuthRequest, res: Response): Promis
     res.status(500).json({ error: 'Internal server error' });
   }
 };
+
+export const addStudentsByClass = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const courseId = parseInt(req.params.id as string);
+    const { studentClassId } = req.body;
+
+    if (!studentClassId) {
+      res.status(400).json({ error: 'studentClassId is required' });
+      return;
+    }
+
+    const course = await prisma.class.findUnique({ where: { id: courseId } });
+    if (!course) {
+      res.status(404).json({ error: 'Course not found' });
+      return;
+    }
+
+    // Get all students in the selected class (cohort)
+    const classStudents = await prisma.user.findMany({
+      where: { role: 'STUDENT', studentClassId: parseInt(studentClassId) },
+      select: { id: true, username: true },
+    });
+
+    if (classStudents.length === 0) {
+      res.status(400).json({ error: 'No students found in the selected class' });
+      return;
+    }
+
+    let added = 0;
+    let alreadyEnrolled = 0;
+
+    for (const student of classStudents) {
+      const existing = await prisma.classStudent.findUnique({
+        where: { classId_studentId: { classId: courseId, studentId: student.id } },
+      });
+      if (existing) {
+        alreadyEnrolled++;
+        continue;
+      }
+      await prisma.classStudent.create({ data: { classId: courseId, studentId: student.id } });
+      added++;
+    }
+
+    res.json({
+      message: `Added ${added} students from class. ${alreadyEnrolled} already enrolled.`,
+      added,
+      alreadyEnrolled,
+      total: classStudents.length,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+

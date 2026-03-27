@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { GraduationCap, Eye, EyeOff } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { useAuth } from '../../contexts/AuthContext';
@@ -95,34 +95,6 @@ const Login: React.FC = () => {
               )}
             </button>
           </form>
-
-          <p className="text-center text-sm text-gray-500 mt-6">
-            Don't have an account?{' '}
-            <Link to="/register" className="text-primary-600 hover:text-primary-700 font-medium">
-              Register here
-            </Link>
-          </p>
-        </div>
-
-        {/* Demo credentials */}
-        <div className="mt-6 card p-4">
-          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-3">
-            Demo Accounts
-          </p>
-          <div className="space-y-2 text-xs text-gray-600">
-            <div className="flex justify-between">
-              <span className="font-medium">Admin:</span>
-              <span>admin / admin123</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="font-medium">Teacher:</span>
-              <span>Nguyen Van A / teacher123</span>
-            </div>
-            <div className="flex justify-between">
-              <span className="font-medium">Student:</span>
-              <span>22521000 / student123</span>
-            </div>
-          </div>
         </div>
       </div>
     </div>

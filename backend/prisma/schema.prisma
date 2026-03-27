@@ -20,11 +20,30 @@ model User {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  departmentId   Int?
+  department     Department?   @relation(fields: [departmentId], references: [id], onDelete: SetNull)
+  studentClassId Int?
+  studentClass   StudentClass? @relation(fields: [studentClassId], references: [id], onDelete: SetNull)
+
   teacherClasses    Class[]        @relation("TeacherClasses")
   studentClasses    ClassStudent[]
   attendanceRecords AttendanceRecord[]
   subjects          Subject[]
   faceDescriptors   FaceDescriptor[]
+}
+
+model Department {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  teachers  User[]
+  createdAt DateTime @default(now())
+}
+
+model StudentClass {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  students  User[]
+  createdAt DateTime @default(now())
 }
 
 model Class {

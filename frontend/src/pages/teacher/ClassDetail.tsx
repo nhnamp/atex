@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
-import { ArrowLeft, UserPlus, Play, ClipboardList, Trash2, X, ScanFace } from 'lucide-react';
+import { ArrowLeft, Play, ClipboardList, ScanFace } from 'lucide-react';
 import toast from 'react-hot-toast';
 import Layout from '../../components/Layout';
 import LoadingSpinner from '../../components/LoadingSpinner';
@@ -13,9 +13,6 @@ const TeacherClassDetail: React.FC = () => {
   const [cls, setCls] = useState<Class | null>(null);
   const [sessions, setSessions] = useState<AttendanceSession[]>([]);
   const [loading, setLoading] = useState(true);
-  const [showAddStudents, setShowAddStudents] = useState(false);
-  const [studentIds, setStudentIds] = useState('');
-  const [addingStudents, setAddingStudents] = useState(false);
   const [startingSession, setStartingSession] = useState(false);
   const [startingFaceSession, setStartingFaceSession] = useState(false);
 
@@ -38,42 +35,7 @@ const TeacherClassDetail: React.FC = () => {
 
   useEffect(() => { fetchData(); }, [id]);
 
-  const handleAddStudents = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const ids = studentIds.split(/[\n,\s]+/).filter((s) => s.trim());
-    if (ids.length === 0) {
-      toast.error('Please enter at least one student ID');
-      return;
-    }
-    setAddingStudents(true);
-    try {
-      const { data } = await api.post(`/classes/${id}/students`, { studentIds: ids });
-      const msg = [];
-      if (data.added.length) msg.push(`Added: ${data.added.join(', ')}`);
-      if (data.notFound.length) msg.push(`Not found: ${data.notFound.join(', ')}`);
-      if (data.alreadyEnrolled.length) msg.push(`Already enrolled: ${data.alreadyEnrolled.join(', ')}`);
-      toast.success(`Processed ${ids.length} IDs. ${data.added.length} added.`);
-      if (data.notFound.length) toast.error(`Not found: ${data.notFound.join(', ')}`);
-      setShowAddStudents(false);
-      setStudentIds('');
-      fetchData();
-    } catch (err: any) {
-      toast.error(err?.response?.data?.error || 'Failed to add students');
-    } finally {
-      setAddingStudents(false);
-    }
-  };
 
-  const handleRemoveStudent = async (studentId: number, name: string) => {
-    if (!confirm(`Remove ${name} from class?`)) return;
-    try {
-      await api.delete(`/classes/${id}/students/${studentId}`);
-      toast.success(`${name} removed`);
-      fetchData();
-    } catch {
-      toast.error('Failed to remove student');
-    }
-  };
 
   const handleStartSession = async () => {
     setStartingSession(true);
@@ -125,12 +87,6 @@ const TeacherClassDetail: React.FC = () => {
               {cls.description && <p className="text-gray-500 mt-1">{cls.description}</p>}
             </div>
             <div className="flex gap-3 flex-wrap">
-              <button
-                onClick={() => setShowAddStudents(true)}
-                className="btn-secondary flex items-center gap-2"
-              >
-                <UserPlus size={16} /> Add Students
-              </button>
               <Link
                 to={`/teacher/classes/${id}/face-enroll`}
                 className="btn-secondary flex items-center gap-2"
@@ -168,13 +124,8 @@ const TeacherClassDetail: React.FC = () => {
             {!cls.students?.length ? (
               <div className="p-8 text-center">
                 <p className="text-gray-400">No students enrolled yet</p>
-                <button
-                  onClick={() => setShowAddStudents(true)}
-                  className="mt-3 btn-secondary text-sm"
-                >
-                  Add Students
-                </button>
-              </div>
+              <p className="text-xs text-gray-400 mt-1">Contact admin to add students</p>
+            </div>
             ) : (
               <div className="divide-y divide-gray-50">
                 {cls.students.map(({ student }) => (
@@ -188,13 +139,7 @@ const TeacherClassDetail: React.FC = () => {
                         <p className="text-xs text-gray-500">{student.username}</p>
                       </div>
                     </div>
-                    <button
-                      onClick={() => handleRemoveStudent(student.id, student.fullName)}
-                      className="text-gray-300 hover:text-red-500 transition-colors"
-                    >
-                      <Trash2 size={15} />
-                    </button>
-                  </div>
+                    </div>
                 ))}
               </div>
             )}
@@ -241,43 +186,6 @@ const TeacherClassDetail: React.FC = () => {
         </div>
       </div>
 
-      {/* Add Students Modal */}
-      {showAddStudents && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40">
-          <div className="bg-white rounded-xl shadow-xl w-full max-w-md p-6">
-            <div className="flex items-center justify-between mb-5">
-              <h2 className="text-lg font-semibold text-gray-900">Add Students</h2>
-              <button onClick={() => setShowAddStudents(false)} className="text-gray-400 hover:text-gray-600">
-                <X size={20} />
-              </button>
-            </div>
-            <form onSubmit={handleAddStudents} className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1.5">
-                  Student IDs
-                </label>
-                <textarea
-                  className="input-field resize-none"
-                  rows={5}
-                  placeholder="Enter 8-digit student IDs, one per line or comma-separated&#10;e.g.&#10;22521000&#10;22521001, 22521002"
-                  value={studentIds}
-                  onChange={(e) => setStudentIds(e.target.value)}
-                  required
-                />
-                <p className="text-xs text-gray-500 mt-1">Separate multiple IDs with commas, spaces, or newlines</p>
-              </div>
-              <div className="flex gap-3">
-                <button type="button" onClick={() => setShowAddStudents(false)} className="btn-secondary flex-1">
-                  Cancel
-                </button>
-                <button type="submit" disabled={addingStudents} className="btn-primary flex-1">
-                  {addingStudents ? 'Adding...' : 'Add Students'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
     </Layout>
   );
 };

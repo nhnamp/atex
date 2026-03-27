@@ -11,6 +11,7 @@ import {
   X,
   GraduationCap,
   CheckSquare,
+  UserPlus,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -28,11 +29,12 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
 
   const adminNavItems: NavItem[] = [
     { label: 'Dashboard', to: '/admin', icon: <LayoutDashboard size={18} /> },
+    { label: 'Courses', to: '/admin/classes', icon: <Users size={18} /> },
   ];
 
   const teacherNavItems: NavItem[] = [
     { label: 'Dashboard', to: '/teacher', icon: <LayoutDashboard size={18} /> },
-    { label: 'My Classes', to: '/teacher/classes', icon: <Users size={18} /> },
+    { label: 'My Courses', to: '/teacher/classes', icon: <Users size={18} /> },
     { label: 'Subjects & Q&A', to: '/teacher/subjects', icon: <BookOpen size={18} /> },
     { label: 'Exam Generator', to: '/teacher/exams', icon: <FileText size={18} /> },
   ];
@@ -62,8 +64,8 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     <div className="min-h-screen bg-gray-50 flex">
       {/* Sidebar */}
       <aside
-        className={`fixed inset-y-0 left-0 z-50 w-64 bg-white border-r border-gray-200 transform transition-transform duration-300 ease-in-out
-          ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:relative md:translate-x-0 md:flex md:flex-col`}
+        className={`fixed inset-y-0 left-0 z-50 w-64 bg-white border-r border-gray-200 transform transition-transform duration-300 ease-in-out flex flex-col
+          ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} md:relative md:translate-x-0`}
       >
         {/* Logo */}
         <div className="flex items-center gap-3 px-6 py-5 border-b border-gray-200">

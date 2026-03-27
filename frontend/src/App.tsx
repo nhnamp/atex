@@ -5,10 +5,10 @@ import ProtectedRoute from './components/ProtectedRoute';
 
 // Auth pages
 import Login from './pages/auth/Login';
-import Register from './pages/auth/Register';
 
 // Admin pages
 import AdminDashboard from './pages/admin/Dashboard';
+import AdminClasses from './pages/admin/Classes';
 
 // Teacher pages
 import TeacherDashboard from './pages/teacher/Dashboard';
@@ -39,11 +39,11 @@ function AppRoutes() {
     <Routes>
       <Route path="/" element={<RootRedirect />} />
       <Route path="/login" element={<Login />} />
-      <Route path="/register" element={<Register />} />
 
       {/* Admin */}
       <Route element={<ProtectedRoute role="ADMIN" />}>
         <Route path="/admin" element={<AdminDashboard />} />
+        <Route path="/admin/classes" element={<AdminClasses />} />
       </Route>
 
       {/* Teacher */}
