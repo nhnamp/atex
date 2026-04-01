@@ -39,7 +39,7 @@ export const createSubject = async (req: AuthRequest, res: Response): Promise<vo
 
 export const updateSubject = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id), 10);
     const subject = await prisma.subject.findUnique({ where: { id } });
 
     if (!subject || subject.teacherId !== req.user!.id) {
@@ -60,7 +60,7 @@ export const updateSubject = async (req: AuthRequest, res: Response): Promise<vo
 
 export const deleteSubject = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id), 10);
     const subject = await prisma.subject.findUnique({ where: { id } });
 
     if (!subject || subject.teacherId !== req.user!.id) {

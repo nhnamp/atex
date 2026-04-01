@@ -75,7 +75,7 @@ export const createClass = async (req: AuthRequest, res: Response): Promise<void
 
 export const getClassById = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id), 10);
     const cls = await prisma.class.findUnique({
       where: { id },
       include: {
@@ -121,7 +121,7 @@ export const getClassById = async (req: AuthRequest, res: Response): Promise<voi
 
 export const updateClass = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id), 10);
     const cls = await prisma.class.findUnique({ where: { id } });
 
     if (!cls) {
@@ -147,7 +147,7 @@ export const updateClass = async (req: AuthRequest, res: Response): Promise<void
 
 export const deleteClass = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id), 10);
     const cls = await prisma.class.findUnique({ where: { id } });
 
     if (!cls) {
@@ -170,7 +170,7 @@ export const deleteClass = async (req: AuthRequest, res: Response): Promise<void
 
 export const addStudents = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const classId = parseInt(req.params.id);
+    const classId = parseInt(String(req.params.id), 10);
     const { studentIds } = req.body as { studentIds: string[] };
 
     if (!studentIds || !Array.isArray(studentIds) || studentIds.length === 0) {
@@ -225,8 +225,8 @@ export const addStudents = async (req: AuthRequest, res: Response): Promise<void
 
 export const removeStudent = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const classId = parseInt(req.params.id);
-    const studentId = parseInt(req.params.studentId);
+    const classId = parseInt(String(req.params.id), 10);
+    const studentId = parseInt(String(req.params.studentId), 10);
 
     const cls = await prisma.class.findUnique({ where: { id: classId } });
     if (!cls) {

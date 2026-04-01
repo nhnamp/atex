@@ -127,7 +127,7 @@ export const createSession = async (req: AuthRequest, res: Response): Promise<vo
 
 export const getSessionsByClass = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const classId = parseInt(req.params.classId);
+    const classId = parseInt(String(req.params.classId), 10);
     const cls = await prisma.class.findUnique({ where: { id: classId } });
 
     if (!cls || cls.teacherId !== req.user!.id) {
@@ -150,7 +150,7 @@ export const getSessionsByClass = async (req: AuthRequest, res: Response): Promi
 
 export const getSessionStatus = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id), 10);
     const session = await prisma.attendanceSession.findUnique({
       where: { id },
       include: { class: true },
@@ -230,7 +230,7 @@ export const getSessionStatus = async (req: AuthRequest, res: Response): Promise
 
 export const endSession = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id), 10);
     const session = await prisma.attendanceSession.findUnique({
       where: { id },
       include: { class: true },
@@ -264,7 +264,7 @@ export const endSession = async (req: AuthRequest, res: Response): Promise<void>
 
 export const submitCode = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const sessionId = parseInt(req.params.id);
+    const sessionId = parseInt(String(req.params.id), 10);
     const { code } = req.body;
     const studentId = req.user!.id;
 
@@ -365,7 +365,7 @@ export const submitCode = async (req: AuthRequest, res: Response): Promise<void>
 
 export const getSessionRecords = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const sessionId = parseInt(req.params.id);
+    const sessionId = parseInt(String(req.params.id), 10);
     const session = await prisma.attendanceSession.findUnique({
       where: { id: sessionId },
       include: { class: true },
@@ -443,7 +443,7 @@ export const getActiveSessionsForStudent = async (req: AuthRequest, res: Respons
 
 export const getStudentAttendanceRecord = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const sessionId = parseInt(req.params.id);
+    const sessionId = parseInt(String(req.params.id), 10);
     const studentId = req.user!.id;
 
     const record = await prisma.attendanceRecord.findUnique({
@@ -518,7 +518,7 @@ export const createFaceSession = async (req: AuthRequest, res: Response): Promis
  */
 export const submitFaceAttendance = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const sessionId = parseInt(req.params.id);
+    const sessionId = parseInt(String(req.params.id), 10);
     const { studentIds } = req.body;
 
     if (!studentIds || !Array.isArray(studentIds) || studentIds.length === 0) {
