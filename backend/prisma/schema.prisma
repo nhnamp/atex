@@ -30,6 +30,10 @@ model User {
   attendanceRecords AttendanceRecord[]
   subjects          Subject[]
   faceDescriptors   FaceDescriptor[]
+  exams             Exam[]         @relation("TeacherExams")
+  gradedSubmissions SubmissionGrade[] @relation("SubmissionGrader")
+  gradingLogs       GradingAuditLog[] @relation("GradingActor")
+  examSubmissions   ExamSubmission[] @relation("StudentSubmissions")
 }
 
 model Department {
@@ -57,6 +61,7 @@ model Class {
 
   students ClassStudent[]
   sessions AttendanceSession[]
+  examSessions ExamSession[]
 }
 
 model ClassStudent {
@@ -106,18 +111,145 @@ model Subject {
   updatedAt DateTime @updatedAt
 
   questions Question[]
+  learningOutcomes LearningOutcome[]
+  exams Exam[]
 }
 
 model Question {
   id        Int      @id @default(autoincrement())
   subjectId Int
   subject   Subject  @relation(fields: [subjectId], references: [id], onDelete: Cascade)
-  type      String   // MULTIPLE_CHOICE | ESSAY | TRUE_FALSE
+  type      String   // MULTIPLE_CHOICE | ESSAY
   content   String
   answer    String
   options   String?  // JSON: ["Option A","Option B","Option C","Option D"] for MC
+  status    String   @default("ACTIVE") // ACTIVE | ARCHIVED
+  topic     String?
+  difficulty String  @default("MEDIUM") // EASY | MEDIUM | HARD
+  rubric    String?
+  learningOutcomeId Int?
+  learningOutcome LearningOutcome? @relation(fields: [learningOutcomeId], references: [id], onDelete: SetNull)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  examQuestions ExamQuestion[]
+}
+
+model LearningOutcome {
+  id        Int      @id @default(autoincrement())
+  subjectId Int
+  subject   Subject  @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  code      String
+  description String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  questions Question[]
+
+  @@unique([subjectId, code])
+}
+
+model Exam {
+  id          Int      @id @default(autoincrement())
+  subjectId   Int
+  subject     Subject  @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  teacherId   Int
+  teacher     User     @relation("TeacherExams", fields: [teacherId], references: [id])
+  title       String
+  examType    String   @default("MIDTERM")
+  examDate    DateTime?
+  durationMinutes Int  @default(60)
+  status      String   @default("DRAFT") // DRAFT | READY | ARCHIVED
+  requirements String  @default("{}") // JSON structure for distribution and filters
+  scannablePages Int   @default(1) @map("scannable_pages")
+  randomSeed  String?
+  version     Int      @default(1)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  questions   ExamQuestion[]
+  sessions    ExamSession[]
+}
+
+model ExamQuestion {
+  examId      Int
+  exam        Exam     @relation(fields: [examId], references: [id], onDelete: Cascade)
+  questionId  Int
+  question    Question @relation(fields: [questionId], references: [id])
+  position    Int
+  points      Float    @default(1)
+  createdAt   DateTime @default(now())
+
+  @@id([examId, questionId])
+  @@unique([examId, position])
+}
+
+model ExamSession {
+  id          Int      @id @default(autoincrement())
+  examId      Int
+  exam        Exam     @relation(fields: [examId], references: [id], onDelete: Cascade)
+  classId     Int
+  class       Class    @relation(fields: [classId], references: [id])
+  status      String   @default("DRAFT") // DRAFT | ONGOING | GRADING | COMPLETED
+  startedAt   DateTime?
+  endedAt     DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  submissions ExamSubmission[]
+}
+
+model ExamSubmission {
+  id             Int      @id @default(autoincrement())
+  sessionId      Int
+  session        ExamSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  studentId      Int
+  student        User     @relation("StudentSubmissions", fields: [studentId], references: [id])
+  scanFiles      String   @default("[]") // JSON array of file names
+  objectiveAnswers String @default("{}") // JSON answers by question id
+  essayAnswers   String   @default("{}") // JSON essay text by question id
+  status         String   @default("SUBMITTED") // SUBMITTED | GRADED | REVIEWED | FINALIZED
+  aiScore        Float?
+  finalScore     Float?
+  feedback       String?
+  submittedAt    DateTime @default(now())
+  gradedAt       DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  grades         SubmissionGrade[]
+  auditLogs      GradingAuditLog[]
+
+  @@unique([sessionId, studentId])
+}
+
+model SubmissionGrade {
+  id            Int      @id @default(autoincrement())
+  submissionId  Int
+  submission    ExamSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  graderId      Int
+  grader        User     @relation("SubmissionGrader", fields: [graderId], references: [id])
+  method        String   @default("AI") // AI | MANUAL
+  objectiveScore Float   @default(0)
+  essayScore    Float    @default(0)
+  totalScore    Float    @default(0)
+  rubricVersion String?
+  promptLog     String?
+  responseLog   String?
+  createdAt     DateTime @default(now())
+}
+
+model GradingAuditLog {
+  id            Int      @id @default(autoincrement())
+  submissionId  Int
+  submission    ExamSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  actorId       Int
+  actor         User     @relation("GradingActor", fields: [actorId], references: [id])
+  action        String
+  note          String?
+  beforeScore   Float?
+  afterScore    Float?
+  createdAt     DateTime @default(now())
 }
 
 model FaceDescriptor {

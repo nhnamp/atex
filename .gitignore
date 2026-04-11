@@ -9,3 +9,5 @@ dist/
 *.log
 prisma/dev.db
 prisma/dev.db-journal
+backend/uploads/scans/*
+!backend/uploads/scans/.gitkeep

@@ -75,7 +75,7 @@ const TeacherDashboard: React.FC = () => {
               {[
                 { label: 'Create New Class', to: '/teacher/classes', icon: <Users size={16} /> },
                 { label: 'Manage Subjects & Questions', to: '/teacher/subjects', icon: <BookOpen size={16} /> },
-                { label: 'Generate AI Exam', to: '/teacher/exams', icon: <FileText size={16} /> },
+                { label: 'Build Exam & Grade', to: '/teacher/exams', icon: <FileText size={16} /> },
               ].map((action) => (
                 <Link
                   key={action.to}

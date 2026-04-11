@@ -36,7 +36,8 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     { label: 'Dashboard', to: '/teacher', icon: <LayoutDashboard size={18} /> },
     { label: 'My Courses', to: '/teacher/classes', icon: <Users size={18} /> },
     { label: 'Subjects & Q&A', to: '/teacher/subjects', icon: <BookOpen size={18} /> },
-    { label: 'Exam Generator', to: '/teacher/exams', icon: <FileText size={18} /> },
+    { label: 'Exam Builder', to: '/teacher/exams', icon: <FileText size={18} /> },
+    { label: 'Session Management', to: '/teacher/exam-sessions', icon: <ClipboardList size={18} /> },
   ];
 
   const studentNavItems: NavItem[] = [

@@ -160,7 +160,13 @@ export const deleteClass = async (req: AuthRequest, res: Response): Promise<void
       return;
     }
 
-    await prisma.class.delete({ where: { id } });
+    await prisma.$transaction(async (tx) => {
+      await tx.examSession.deleteMany({ where: { classId: id } });
+      await tx.attendanceSession.deleteMany({ where: { classId: id } });
+      await tx.classStudent.deleteMany({ where: { classId: id } });
+      await tx.class.delete({ where: { id } });
+    });
+
     res.json({ message: 'Class deleted' });
   } catch (error) {
     console.error(error);

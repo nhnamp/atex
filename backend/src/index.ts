@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createServer } from 'http';
 import { Server as SocketServer } from 'socket.io';
+import { PrismaClient } from '@prisma/client';
 
 import authRoutes from './routes/auth.routes';
 import adminRoutes from './routes/admin.routes';
@@ -14,6 +15,7 @@ import examRoutes from './routes/exam.routes';
 import faceRoutes from './routes/face.routes';
 
 dotenv.config();
+const prisma = new PrismaClient();
 
 const app = express();
 const httpServer = createServer(app);
@@ -33,6 +35,7 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+app.use('/uploads', express.static('uploads'));
 
 // Make io available in controllers
 app.set('io', io);
@@ -87,10 +90,36 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
 });
 
 const PORT = process.env.PORT || 5000;
-httpServer.listen(PORT, () => {
-  console.log(`\n🚀 Server running on http://localhost:${PORT}`);
-  console.log(`📡 Socket.IO enabled`);
-  console.log(`🗄️  Database: SQLite (Prisma)\n`);
-});
+
+const normalizeLegacyQuestionDifficulty = async (): Promise<void> => {
+  await prisma.$executeRawUnsafe(`
+    UPDATE "Question"
+    SET "difficulty" = CASE
+      WHEN UPPER(TRIM(CAST("difficulty" AS TEXT))) IN ('1', 'EASY') THEN 'EASY'
+      WHEN UPPER(TRIM(CAST("difficulty" AS TEXT))) IN ('2', '3', 'MEDIUM') THEN 'MEDIUM'
+      WHEN UPPER(TRIM(CAST("difficulty" AS TEXT))) IN ('4', '5', 'HARD') THEN 'HARD'
+      ELSE 'MEDIUM'
+    END
+    WHERE "difficulty" IS NULL
+      OR UPPER(TRIM(CAST("difficulty" AS TEXT))) NOT IN ('EASY', 'MEDIUM', 'HARD')
+      OR UPPER(TRIM(CAST("difficulty" AS TEXT))) IN ('1', '2', '3', '4', '5');
+  `);
+};
+
+const bootstrap = async () => {
+  try {
+    await normalizeLegacyQuestionDifficulty();
+    httpServer.listen(PORT, () => {
+      console.log(`\n🚀 Server running on http://localhost:${PORT}`);
+      console.log(`📡 Socket.IO enabled`);
+      console.log(`🗄️  Database: SQLite (Prisma)\n`);
+    });
+  } catch (error) {
+    console.error('Failed during server bootstrap:', error);
+    process.exit(1);
+  }
+};
+
+void bootstrap();
 
 export { io };

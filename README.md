@@ -1,6 +1,6 @@
 # NT208 – Student Attendance System 🎓
 
-A full-stack MVP for student attendance management with AI-powered exam generation.
+A full-stack MVP for student attendance management and paper-exam grading workflow.
 
 ## Features
 
@@ -8,8 +8,9 @@ A full-stack MVP for student attendance management with AI-powered exam generati
 - **Teacher account approval**: Admin must approve teacher accounts
 - **Class management**: Create classes, add students by student ID
 - **Live attendance sessions**: 3-code rolling system with 10s countdown per code
-- **Subject & Question Bank**: Multiple choice, Essay, True/False
-- **AI Exam Generator**: Gemini API selects questions → exports `.docx`
+- **Subject & Question Bank**: Multiple choice + Essay with EASY/MEDIUM/HARD difficulty
+- **Paper Exam Builder**: Generate exam draft from question bank and print `.docx`
+- **Paper Scan + Auto Grading**: OMR for MCQ, AI grading for essay, report review before publish
 - **Minimalist UI**: White & blue design with TailwindCSS
 
 ---
@@ -42,7 +43,7 @@ cd ../frontend && npm install
 ```bash
 cd backend
 cp .env.example .env
-# Edit .env and add your GEMINI_API_KEY
+# Edit .env and add your GEMINI_API_KEY + Cloudinary credentials for scan upload
 ```
 
 ### 3. Set up database
@@ -91,13 +92,17 @@ npm run dev
 ### Teacher
 1. **Classes** → Create a class, add students by 8-digit IDs
 2. **Start Attendance** → Opens live session with rolling 6-digit codes (3 rounds × 10 seconds)
-3. **Subjects** → Create subjects, manage question banks (MC / Essay / True-False)
-4. **Exam Generator** → Select subject, set question counts → AI generates a `.docx` exam file
+3. **Subjects** → Create subjects, outcomes, and question bank (MC / Essay)
+4. **Create Exam + Assign Class** → Build draft from question bank and create a paper exam session for a class
+5. **Run Paper Test in Classroom** → Print exam, students do paper answers, no online answer submission in this stage
+6. **Scan Papers in Session Management** → Capture paper scans per student, store scan evidence, then run OMR + AI grading
+7. **Review Report and Confirm** → Review image proofs and component scores, adjust/regrade if needed, then confirm report to publish
 
 ### Student
 1. Dashboard shows enrolled classes and active sessions
 2. Open an active session → enter the 6-digit code shown on teacher's screen
 3. Submit all 3 codes correctly to be marked **Present**
+4. Exam results appear only after teacher confirms session report and publishes finalized scores
 
 ---
 
@@ -116,16 +121,41 @@ Student must submit correct C1, C2, C3 → marked PRESENT
 
 ---
 
+## Paper Exam Workflow
+
+1. Teacher creates exam draft from question bank and assigns class for paper test.
+2. Teacher prints exam and students do the test on paper in classroom.
+3. Teacher scans each answer sheet in Session Management.
+4. MCQ is scored by OMR template; essay is scored by AI against answer/rubric.
+5. System builds a report with scans, warnings, and scores for manual review.
+6. Teacher confirms report to finalize and publish scores to student portal.
+
 ## AI Exam Generation
 
 1. Teacher picks a subject and specifies requirements:
-   - e.g. 10 total (5 MC, 3 Essay, 2 True/False)
-2. Backend sends question bank + requirements to **Gemini API**
-3. Gemini returns selected question IDs (diverse, balanced)
-4. `docx` library formats them into a Word document
-5. Auto-downloads in the browser
+   - e.g. 10 total (5 MC, 5 Essay)
+   - Set difficulty ratios for MCQ and Essay independently (EASY/MEDIUM/HARD)
+2. Backend selects questions with deterministic rule-based distribution (no online student answering flow).
+3. `docx` library formats the draft into a Word document for printing.
 
-> If Gemini API key is not set, falls back to random selection.
+## Scan Upload (Cloudinary)
+
+1. Create a Cloudinary account and get `cloud_name`, `api_key`, `api_secret`.
+2. Add `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET` in `backend/.env`.
+3. Optional upload limits (defaults shown):
+   - `EXAM_MOBILE_SCAN_MAX_FILES=20`
+   - `EXAM_SUBMISSION_SCAN_MAX_FILES=20`
+   - `EXAM_BULK_SCAN_MAX_FILES=100`
+   - `EXAM_MISSING_PAGE_MAX_FILES=20`
+4. Restart backend server.
+5. In teacher flow:
+   - Select a draft, review exam preview, then use Start Test block (under preview) to pick class and start session
+   - Optional: click Create Mobile Link and open on phone browser
+   - Click Start Scan and capture each student sheet
+   - Click AI Start Grading
+   - Review report and click Confirm & Publish
+
+> Cloudinary credentials are required for scan upload and merged PDF storage in this workflow.
 
 ---
 

@@ -6,7 +6,7 @@ import { io as socketIO, Socket } from 'socket.io-client';
 import Layout from '../../components/Layout';
 import LoadingSpinner from '../../components/LoadingSpinner';
 import api from '../../api';
-import { Class, AttendanceSession } from '../../types';
+import { Class, AttendanceSession, StudentPublishedExamResult } from '../../types';
 import { useAuth } from '../../contexts/AuthContext';
 
 const StudentDashboard: React.FC = () => {
@@ -15,17 +15,20 @@ const StudentDashboard: React.FC = () => {
   const socketRef = useRef<Socket | null>(null);
   const [classes, setClasses] = useState<Class[]>([]);
   const [activeSessions, setActiveSessions] = useState<AttendanceSession[]>([]);
+  const [publishedResults, setPublishedResults] = useState<StudentPublishedExamResult[]>([]);
   const [loading, setLoading] = useState(true);
 
   const fetchData = async () => {
     setLoading(true);
     try {
-      const [classRes, sessionRes] = await Promise.all([
+      const [classRes, sessionRes, resultRes] = await Promise.all([
         api.get<Class[]>('/classes/student/enrolled'),
         api.get<AttendanceSession[]>('/attendance/sessions/student/active'),
+        api.get<StudentPublishedExamResult[]>('/exams/results/me'),
       ]);
       setClasses(classRes.data);
       setActiveSessions(sessionRes.data);
+      setPublishedResults(resultRes.data);
     } catch {
       toast.error('Failed to load data');
     } finally {
@@ -156,6 +159,32 @@ const StudentDashboard: React.FC = () => {
                   </div>
                   <div className="text-xs text-gray-500 border-t border-gray-100 pt-3">
                     <span className="font-medium">Teacher:</span> {cls.teacher?.fullName}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div>
+          <h2 className="text-lg font-semibold text-gray-900 mb-3">Published Exam Results</h2>
+          {publishedResults.length === 0 ? (
+            <div className="card p-6 text-center">
+              <p className="text-gray-500">No finalized exam results published yet.</p>
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {publishedResults.map((item) => (
+                <div key={item.submissionId} className="card p-4 flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-gray-900">{item.examTitle}</p>
+                    <p className="text-xs text-gray-500">
+                      {item.className} • Published {new Date(item.publishedAt).toLocaleString()}
+                    </p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-xs text-gray-500">Final Score</p>
+                    <p className="text-lg font-bold text-green-700">{item.finalScore ?? 0}</p>
                   </div>
                 </div>
               ))}
