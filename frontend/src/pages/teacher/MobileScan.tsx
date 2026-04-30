@@ -58,6 +58,68 @@ type MobileScanUploadResponse = {
   }>;
 };
 
+type ViewfinderVariant = 'omr' | 'identityEssay' | 'essayPage' | 'generic';
+
+type ViewfinderZone = {
+  id: string;
+  top: string;
+  left: string;
+  width: string;
+  height: string;
+  label?: string;
+};
+
+const VIEWFINDER_ZONES: Record<ViewfinderVariant, ViewfinderZone[]> = {
+  omr: [
+    { id: 'header', top: '3%', left: '8%', width: '84%', height: '8%', label: 'HEADER' },
+    { id: 'identity', top: '13%', left: '8%', width: '54%', height: '16%', label: 'INFO' },
+    { id: 'mssv', top: '13%', left: '66%', width: '26%', height: '20%', label: 'MSSV' },
+    { id: 'instructions', top: '31%', left: '8%', width: '54%', height: '12%', label: 'INSTRUCTIONS' },
+    { id: 'omr', top: '48%', left: '8%', width: '84%', height: '44%', label: 'OMR GRID' },
+  ],
+  identityEssay: [
+    { id: 'header', top: '3%', left: '8%', width: '84%', height: '8%', label: 'HEADER' },
+    { id: 'identity', top: '13%', left: '8%', width: '54%', height: '16%', label: 'INFO' },
+    { id: 'mssv', top: '13%', left: '66%', width: '26%', height: '20%', label: 'MSSV' },
+    { id: 'instructions', top: '31%', left: '8%', width: '54%', height: '12%', label: 'INSTRUCTIONS' },
+    { id: 'essay', top: '48%', left: '8%', width: '84%', height: '44%', label: 'ESSAY AREA' },
+  ],
+  essayPage: [
+    { id: 'essay-header', top: '4%', left: '8%', width: '84%', height: '10%', label: 'QUESTION HEADER' },
+    { id: 'essay-body', top: '18%', left: '8%', width: '84%', height: '68%', label: 'ANSWER AREA' },
+    { id: 'essay-footer', top: '88%', left: '8%', width: '84%', height: '6%', label: 'END LINE' },
+  ],
+  generic: [],
+};
+
+const ViewfinderOverlay: React.FC<{ variant: ViewfinderVariant }> = ({ variant }) => {
+  const zones = VIEWFINDER_ZONES[variant];
+
+  return (
+    <div className="absolute inset-0 pointer-events-none">
+      <div className="absolute inset-[4%] rounded-lg border border-white/40" />
+      {zones.map((zone) => (
+        <div
+          key={zone.id}
+          className="absolute rounded-md border border-dashed border-white/50 bg-white/5"
+          style={{
+            top: zone.top,
+            left: zone.left,
+            width: zone.width,
+            height: zone.height,
+          }}
+        >
+          {zone.label && (
+            <span className="absolute left-1 top-1 text-[10px] uppercase tracking-wide text-white/70">
+              {zone.label}
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+};
+
 const publicApi = axios.create({
   baseURL: '/api',
   headers: { 'Content-Type': 'application/json' },
@@ -135,6 +197,14 @@ const TeacherMobileScan: React.FC = () => {
     return mapped ? String(mapped) : buildFallbackPassPurpose(passIndex);
   };
 
+  const viewfinderVariant = useMemo<ViewfinderVariant>(() => {
+    const purpose = getPassPurpose(activePassIndex).toUpperCase();
+    if (purpose.includes('IDENTITY_ESSAY')) return 'identityEssay';
+    if (purpose.includes('ESSAY')) return 'essayPage';
+    if (purpose.includes('OMR')) return 'omr';
+    return 'generic';
+  }, [activePassIndex, context]);
+
   const loadContext = async () => {
     if (!token) {
       setLoading(false);
@@ -180,8 +250,9 @@ const TeacherMobileScan: React.FC = () => {
         stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: { ideal: 'environment' },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
+            width: { ideal: 720 },
+            height: { ideal: 1280 },
+            aspectRatio: { ideal: 210 / 297 },
           },
         });
       } catch {
@@ -443,8 +514,19 @@ const TeacherMobileScan: React.FC = () => {
             <p className="text-xs text-amber-700">{getCameraSupportIssue()}</p>
           )}
 
-          <div className={`rounded-xl border-2 overflow-hidden ${captureReady ? 'border-green-500' : 'border-red-400'}`}>
-            <video ref={cameraVideoRef} autoPlay playsInline muted className="w-full bg-black" />
+          <div
+            className={`rounded-2xl border-2 overflow-hidden bg-black ${captureReady ? 'border-green-500' : 'border-red-400'}`}
+          >
+            <div className="relative w-full aspect-[210/297]">
+              <video
+                ref={cameraVideoRef}
+                autoPlay
+                playsInline
+                muted
+                className="absolute inset-0 h-full w-full object-cover"
+              />
+              <ViewfinderOverlay variant={viewfinderVariant} />
+            </div>
           </div>
 
           <p className={`text-xs ${captureReady ? 'text-green-700' : 'text-amber-700'}`}>{captureHint}</p>
