@@ -46,7 +46,6 @@ export const getQuestionsBySubject = async (req: AuthRequest, res: Response): Pr
           ? {
               OR: [
                 { content: { contains: search } },
-                { topic: { contains: search } },
                 { answer: { contains: search } },
               ],
             }
@@ -75,7 +74,6 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
       answer,
       options,
       status,
-      topic,
       difficulty,
       learningOutcomeId,
       rubric,
@@ -111,7 +109,6 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
         answer,
         options: options ? JSON.stringify(options) : null,
         status: status || 'ACTIVE',
-        topic: topic || null,
         difficulty: normalizeDifficulty(difficulty),
         learningOutcomeId: learningOutcomeId ? parseInt(String(learningOutcomeId), 10) : null,
         rubric: rubric || null,
@@ -138,7 +135,7 @@ export const updateQuestion = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const { type, content, answer, options, status, topic, difficulty, learningOutcomeId, rubric } = req.body;
+    const { type, content, answer, options, status, difficulty, learningOutcomeId, rubric } = req.body;
     const updated = await prisma.question.update({
       where: { id },
       data: {
@@ -147,7 +144,6 @@ export const updateQuestion = async (req: AuthRequest, res: Response): Promise<v
         answer: answer ?? question.answer,
         options: options ? JSON.stringify(options) : question.options,
         status: status ?? question.status,
-        topic: topic ?? question.topic,
         difficulty: difficulty ? normalizeDifficulty(difficulty) : question.difficulty,
         learningOutcomeId:
           learningOutcomeId === null
@@ -231,7 +227,6 @@ export const importQuestionsFromExcel = async (req: AuthRequest, res: Response):
       const type = normalizeQuestionType(String(row.type || row.questionType || ''));
       const outcomeCode = String(row.learningOutcomeCode || row.outcomeCode || '').trim().toUpperCase();
       const difficulty = normalizeDifficulty(row.difficulty || 'MEDIUM');
-      const topic = String(row.topic || '').trim();
       const rubric = String(row.rubric || '').trim();
 
       if (!content || !answer || !type) {
@@ -279,7 +274,6 @@ export const importQuestionsFromExcel = async (req: AuthRequest, res: Response):
           answer,
           options: type === 'MULTIPLE_CHOICE' ? JSON.stringify(options) : null,
           difficulty,
-          topic: topic || null,
           rubric: type === 'ESSAY' ? rubric || null : null,
           learningOutcomeId,
           status: 'ACTIVE',

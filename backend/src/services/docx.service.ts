@@ -34,6 +34,7 @@ type RenderQuestion = {
   question: string;
   content: string;
   score: string;
+  essay_score: string;
   outcomes_text: string;
   marker_code: string;
   marker_label: string;
@@ -114,6 +115,7 @@ const resolveTemplatePath = (templateFileName: string): string => {
   }
 
   const candidates = [
+    path.resolve(__dirname, '../../../template', templateFileName),
     path.join(process.cwd(), '..', 'template', templateFileName),
     path.join(process.cwd(), 'template', templateFileName),
   ];
@@ -184,19 +186,23 @@ const buildAggregatedOutcomesText = (questions: Question[]): string => {
   return parts.join('\n');
 };
 
-const toRenderableQuestion = (question: Question, index: number): RenderQuestion => ({
-  question_id: question.id,
-  index: index + 1,
-  title: `Question ${index + 1}`,
-  question: sanitizeMultiline(question.content),
-  content: sanitizeMultiline(question.content),
-  score: '1.00',
-  outcomes_text: buildOutcomesText(question),
-  marker_code: `${question.type === 'MULTIPLE_CHOICE' ? 'MCQ' : 'ESSAY'}_${question.id}`,
-  marker_label: `Mã câu: ${question.type === 'MULTIPLE_CHOICE' ? 'MCQ' : 'ESSAY'}_${question.id}`,
-  answer_start_marker: `BẮT ĐẦU TRẢ LỜI CÂU ${question.id}`,
-  answer_end_marker: `KẾT THÚC TRẢ LỜI CÂU ${question.id}`,
-});
+const toRenderableQuestion = (question: Question, index: number, points?: number): RenderQuestion => {
+  const resolvedPoints = Number.isFinite(points) && points! > 0 ? points! : 1;
+  return {
+    question_id: question.id,
+    index: index + 1,
+    title: `Question ${index + 1}`,
+    question: sanitizeMultiline(question.content),
+    content: sanitizeMultiline(question.content),
+    score: resolvedPoints.toFixed(2),
+    essay_score: resolvedPoints.toFixed(2),
+    outcomes_text: buildOutcomesText(question),
+    marker_code: `${question.type === 'MULTIPLE_CHOICE' ? 'MCQ' : 'ESSAY'}_${question.id}`,
+    marker_label: `Mã câu: ${question.type === 'MULTIPLE_CHOICE' ? 'MCQ' : 'ESSAY'}_${question.id}`,
+    answer_start_marker: `BẮT ĐẦU TRẢ LỜI CÂU ${question.id}`,
+    answer_end_marker: `KẾT THÚC TRẢ LỜI CÂU ${question.id}`,
+  };
+};
 
 const REFERENCE_WIDTH = 2480;
 const REFERENCE_HEIGHT = 3508;
@@ -567,16 +573,16 @@ const buildOutcomeMappingTableText = (mcqs: Question[], essays: Question[]): str
   return [header, divider, ...body].join('\n');
 };
 
-const mapEssaysForTemplate = (essays: Question[]): RenderEssay[] => {
+const mapEssaysForTemplate = (essays: Question[], pointsMap?: Map<number, number>): RenderEssay[] => {
   return essays.map((question, index) => ({
-    ...toRenderableQuestion(question, index),
+    ...toRenderableQuestion(question, index, pointsMap?.get(question.id)),
     title: `Essay ${index + 1}`,
     question: sanitizeMultiline(question.content),
     content: sanitizeMultiline(question.content),
   }));
 };
 
-const mapMcqsForTemplate = (mcqs: Question[]): RenderMcq[] => {
+const mapMcqsForTemplate = (mcqs: Question[], pointsMap?: Map<number, number>): RenderMcq[] => {
   return mcqs.map((question, index) => {
     const options = parseOptions(question.options);
     const optionA = options[0] || '';
@@ -585,7 +591,7 @@ const mapMcqsForTemplate = (mcqs: Question[]): RenderMcq[] => {
     const optionD = options[3] || '';
 
     return {
-      ...toRenderableQuestion(question, index),
+      ...toRenderableQuestion(question, index, pointsMap?.get(question.id)),
       title: `MCQ ${index + 1}`,
       question: sanitizeMultiline(question.content),
       content: sanitizeMultiline(question.content),
@@ -615,15 +621,20 @@ const generateTemplateExamDocx = (
   subject: string,
   duration: number,
   mcqs: Question[],
-  essays: Question[]
+  essays: Question[],
+  pointsMap?: Map<number, number>
 ): Buffer => {
   const hasMcq = mcqs.length > 0;
   const examCode = `EX-${Date.now().toString().slice(-8)}`;
-  const mappedMcqs = mapMcqsForTemplate(mcqs);
-  const mappedEssays = mapEssaysForTemplate(essays);
+  const mappedMcqs = mapMcqsForTemplate(mcqs, pointsMap);
+  const mappedEssays = mapEssaysForTemplate(essays, pointsMap);
   const firstEssayQuestions = mappedEssays.slice(0, 1);
   const remainingEssayQuestions = mappedEssays.slice(1);
   const outcomesText = buildOutcomeMappingTableText(mcqs, essays);
+
+  // Compute section totals for template placeholders
+  const mcqFullScore = mappedMcqs.reduce((acc, q) => acc + Number(q.score), 0);
+  const essayFullScore = mappedEssays.reduce((acc, q) => acc + Number(q.score), 0);
 
   if (hasMcq) {
     return renderDocxTemplate('template-omr-essay-ai-scan.docx', {
@@ -633,8 +644,13 @@ const generateTemplateExamDocx = (
       student_order: '',
       student_name: '',
       student_id: '',
+      mcq_fullscore: mcqFullScore.toFixed(2),
+      essay_fullscore: essayFullScore.toFixed(2),
       mcqs: mappedMcqs,
       essays: mappedEssays,
+      essay_questions: mappedEssays,
+      first_essay_questions: firstEssayQuestions,
+      remaining_essay_questions: remainingEssayQuestions,
       outcomes_text: outcomesText,
     });
   }
@@ -646,6 +662,8 @@ const generateTemplateExamDocx = (
     student_order: '',
     student_name: '',
     student_id: '',
+    mcq_fullscore: '0.00',
+    essay_fullscore: essayFullScore.toFixed(2),
     mcqs: [],
     essays: mappedEssays,
     essay_questions: mappedEssays,
@@ -740,18 +758,20 @@ const renderDocxTemplate = (templateFileName: string, data: Record<string, unkno
 export const generateEssayExamDocx = async (
   subject: string,
   duration: number,
-  essayQuestions: Question[]
+  essayQuestions: Question[],
+  pointsMap?: Map<number, number>
 ): Promise<Buffer> => {
-  return generateTemplateExamDocx(subject, duration, [], essayQuestions);
+  return generateTemplateExamDocx(subject, duration, [], essayQuestions, pointsMap);
 };
 
 export const generateMcqEssayExamDocx = async (
   subject: string,
   duration: number,
   mcqs: Question[],
-  essays: Question[]
+  essays: Question[],
+  pointsMap?: Map<number, number>
 ): Promise<Buffer> => {
-  return generateTemplateExamDocx(subject, duration, mcqs, essays);
+  return generateTemplateExamDocx(subject, duration, mcqs, essays, pointsMap);
 };
 
 export const generateAnswerKeyDocx = async (
@@ -808,6 +828,9 @@ export const generateAnswerKeyDocx = async (
 
   const templateFile = hasMcq ? 'template-omr-essay-ai-scan.docx' : 'template-full-essay-ai-scan.docx';
 
+  const mcqFullScore = mappedMcqs.reduce((acc, q) => acc + Number(q.score), 0);
+  const essayFullScore = mappedEssays.reduce((acc, q) => acc + Number(q.score), 0);
+
   return renderDocxTemplate(templateFile, {
     subject: `${sanitizeMultiline(subject)} — ANSWER KEY`,
     duration: String(duration),
@@ -815,6 +838,8 @@ export const generateAnswerKeyDocx = async (
     student_order: 'ANSWER KEY',
     student_name: 'STANDARD OUTPUT',
     student_id: '---',
+    mcq_fullscore: mcqFullScore.toFixed(2),
+    essay_fullscore: essayFullScore.toFixed(2),
     essay_questions: mappedEssays,
     first_essay_questions: firstEssayQuestions,
     remaining_essay_questions: remainingEssayQuestions,

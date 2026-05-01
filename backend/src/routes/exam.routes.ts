@@ -73,6 +73,7 @@ router.get('/builder/:examId/preview', requireRole('TEACHER'), getExamPreview);
 router.patch('/builder/:examId/configuration', requireRole('TEACHER'), updateExamConfiguration);
 router.patch('/builder/:examId/reorder', requireRole('TEACHER'), reorderExamQuestions);
 router.patch('/builder/:examId/questions/:questionId/replace', requireRole('TEACHER'), replaceExamQuestion);
+router.patch('/builder/:examId/questions/:questionId/points', requireRole('TEACHER'), async (req, res, next) => { try { const mod = await import('../controllers/exam.controller'); return mod.updateExamQuestionPoints(req, res); } catch (e) { next(e); } });
 router.get('/builder/:examId/export', requireRole('TEACHER'), exportExamDocx);
 router.get('/builder/:examId/export-answer-key', requireRole('TEACHER'), exportExamAnswerKey);
 router.post('/builder/:examId/sessions', requireRole('TEACHER'), createExamSession);

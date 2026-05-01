@@ -392,3 +392,199 @@ Output JSON format:
     }
   }
 };
+
+/**
+ * Determines how many students to group in one Gemini request based on essay count.
+ * Target: 8-10 images per request.
+ * e.g. 4 essays → each student has ~4 pages → batch 2 students (8 images)
+ *      3 essays → each student has ~3 pages → batch 3 students (9 images)
+ *      5 essays → each student has ~5 pages → batch 2 students (10 images)
+ *      2 essays → each student has ~2 pages → batch 4 students (8 images)
+ */
+export const computeMultiStudentBatchSize = (essayQuestionCount: number, pagesPerStudent: number): number => {
+  if (pagesPerStudent <= 0) return 1;
+  // Target between 8-10 total images per request
+  const targetImages = 10;
+  const batchSize = Math.max(1, Math.floor(targetImages / pagesPerStudent));
+  // Cap at 5 students per batch to keep prompt manageable
+  return Math.min(batchSize, 5);
+};
+
+export interface MultiStudentBatchInput {
+  studentLabel: string; // e.g. "Student 1" or student ID for correlation
+  scanPaths: string[];
+}
+
+export interface MultiStudentBatchResult {
+  studentLabel: string;
+  fullName: string | null;
+  studentCode: string | null;
+  essayAnswers: Record<string, string>;
+  essayResults: EssayGradingResult[];
+  warnings: string[];
+}
+
+export const extractAndGradeMultiStudentBatch = async (
+  students: MultiStudentBatchInput[],
+  essayQuestions: SubmissionBatchEssayQuestion[],
+  scannablePages: number,
+  passPurposeByIndex?: Record<string, string>,
+  layoutBlueprint?: ScanLayoutBlueprint,
+): Promise<MultiStudentBatchResult[]> => {
+  if (!config.geminiApiKey) {
+    throw new Error('Gemini API key not configured');
+  }
+
+  if (students.length === 0) {
+    return [];
+  }
+
+  const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
+  const cleanupHandlers: Array<() => void> = [];
+  const imageParts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
+  const preprocessedWarnings: string[] = [];
+
+  // Build image manifest describing which images belong to which student
+  const imageManifest: Array<{ studentLabel: string; imageIndex: number; pageOfStudent: number }> = [];
+  let globalImageIndex = 0;
+
+  try {
+    for (const student of students) {
+      for (let pageIdx = 0; pageIdx < student.scanPaths.length; pageIdx++) {
+        const scanPath = student.scanPaths[pageIdx];
+        if (!fs.existsSync(scanPath)) {
+          throw new Error(`Scan file not found: ${scanPath}`);
+        }
+
+        const preprocessed = await preprocessScanForAnalysis(scanPath);
+        cleanupHandlers.push(preprocessed.cleanup);
+
+        if (preprocessed.warnings.length > 0) {
+          preprocessedWarnings.push(
+            ...preprocessed.warnings.map((w) => `[${student.studentLabel} - Page ${pageIdx + 1}] ${w}`)
+          );
+        }
+
+        const ext = path.extname(preprocessed.processedPath).toLowerCase();
+        const mimeType = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
+        const imageBase64 = fs.readFileSync(preprocessed.processedPath).toString('base64');
+
+        imageParts.push({ inlineData: { mimeType, data: imageBase64 } });
+        imageManifest.push({
+          studentLabel: student.studentLabel,
+          imageIndex: globalImageIndex,
+          pageOfStudent: pageIdx + 1,
+        });
+        globalImageIndex++;
+      }
+    }
+
+    const studentLabels = students.map((s) => s.studentLabel);
+
+    const prompt = `Bạn là AI chấm bài thi từ ảnh quét của NHIỀU sinh viên cùng lúc.
+
+Tổng số ảnh: ${imageParts.length}
+Số sinh viên: ${students.length}
+Mỗi sinh viên có ${scannablePages} trang.
+
+Phân bổ ảnh theo sinh viên:
+${imageManifest.map((m) => `  Ảnh ${m.imageIndex + 1}: ${m.studentLabel} - Trang ${m.pageOfStudent}`).join('\n')}
+
+Mục tiêu cho MỖI sinh viên:
+1. Nhận diện họ tên và MSSV từ trang đầu tiên của sinh viên đó.
+2. Trích xuất câu trả lời tự luận và chấm điểm theo rubric.
+
+Thông tin bài thi:
+${JSON.stringify(
+      {
+        scannablePages,
+        passPurposeByIndex: passPurposeByIndex || {},
+        layoutBlueprint: layoutBlueprint || {},
+        essayQuestions,
+      },
+      null,
+      2
+    )}
+
+Ràng buộc bắt buộc:
+1. Trả về DUY NHẤT JSON hợp lệ, không markdown, không giải thích.
+2. Không bịa dữ liệu. Nếu không đọc được thì trả null.
+3. score phải trong khoảng [0, maxScore] cho mỗi câu.
+4. Nếu ảnh mờ hoặc khó đọc, ghi vào warnings.
+
+Output JSON format (mảng kết quả cho từng sinh viên):
+{
+  "students": [
+    {
+      "studentLabel": "${studentLabels[0]}",
+      "fullName": "... hoặc null",
+      "studentCode": "... hoặc null",
+      "essayAnswers": { "34": "..." },
+      "essayResults": [
+        {
+          "questionId": 34,
+          "score": 0.75,
+          "maxScore": 1,
+          "feedback": "..."
+        }
+      ],
+      "warnings": ["..."]
+    }
+  ]
+}`;
+
+    const rawText = await generateGeminiText(model, [...imageParts, prompt]);
+    const parsed = parseModelJson<{
+      students?: Array<{
+        studentLabel?: string;
+        fullName?: string | null;
+        studentCode?: string | null;
+        essayAnswers?: Record<string, unknown>;
+        essayResults?: unknown;
+        warnings?: unknown;
+      }>;
+    }>(rawText);
+
+    const essayQuestionMaxScore = new Map<number, number>(
+      essayQuestions.map((q) => [q.questionId, Math.max(0, Number(q.maxScore) || 0)])
+    );
+
+    const resultsArray = Array.isArray(parsed?.students) ? parsed.students : [];
+
+    // Map results back to students by label or index
+    return students.map((student, idx) => {
+      const match = resultsArray.find((r) => r.studentLabel === student.studentLabel) || resultsArray[idx];
+
+      if (!match) {
+        return {
+          studentLabel: student.studentLabel,
+          fullName: null,
+          studentCode: null,
+          essayAnswers: {},
+          essayResults: [],
+          warnings: [...preprocessedWarnings.filter((w) => w.includes(student.studentLabel)), 'No AI result returned for this student'],
+        };
+      }
+
+      const modelWarnings = Array.isArray(match.warnings)
+        ? match.warnings.map((w) => String(w || '').trim()).filter(Boolean)
+        : [];
+
+      return {
+        studentLabel: student.studentLabel,
+        fullName: match.fullName ? String(match.fullName).trim() : null,
+        studentCode: match.studentCode ? String(match.studentCode).trim() : null,
+        essayAnswers: normalizeEssayAnswers(match.essayAnswers),
+        essayResults: normalizeEssayResults(match.essayResults, essayQuestionMaxScore),
+        warnings: [...new Set([
+          ...preprocessedWarnings.filter((w) => w.includes(student.studentLabel)),
+          ...modelWarnings,
+        ])],
+      };
+    });
+  } finally {
+    for (const cleanup of cleanupHandlers) {
+      cleanup();
+    }
+  }
+};

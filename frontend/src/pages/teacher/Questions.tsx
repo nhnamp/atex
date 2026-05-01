@@ -15,7 +15,6 @@ interface QuestionForm {
   answer: string;
   options: string[];
   status: 'ACTIVE' | 'ARCHIVED';
-  topic: string;
   difficulty: 'EASY' | 'MEDIUM' | 'HARD';
   learningOutcomeId: string;
   rubric: string;
@@ -27,7 +26,6 @@ const EMPTY_FORM: QuestionForm = {
   answer: '',
   options: ['', '', '', ''],
   status: 'ACTIVE',
-  topic: '',
   difficulty: 'MEDIUM',
   learningOutcomeId: '',
   rubric: '',
@@ -89,7 +87,6 @@ const TeacherQuestions: React.FC = () => {
       answer: q.answer,
       options: q.options ? JSON.parse(q.options) : ['', '', '', ''],
       status: q.status || 'ACTIVE',
-      topic: q.topic || '',
       difficulty: q.difficulty || 'MEDIUM',
       learningOutcomeId: q.learningOutcomeId ? String(q.learningOutcomeId) : '',
       rubric: q.rubric || '',
@@ -108,7 +105,6 @@ const TeacherQuestions: React.FC = () => {
       answer: form.answer,
       subjectId: parseInt(subjectId, 10),
       status: form.status,
-      topic: form.topic,
       difficulty: form.difficulty,
       learningOutcomeId: form.learningOutcomeId ? parseInt(form.learningOutcomeId, 10) : null,
       rubric: form.rubric,
@@ -246,7 +242,6 @@ const TeacherQuestions: React.FC = () => {
                         <span className="text-xs text-gray-400">#{idx + 1}</span>
                         <span className="badge badge-blue">{TYPE_LABELS[q.type]}</span>
                         <span className="badge badge-gray">Difficulty {q.difficulty || 'MEDIUM'}</span>
-                        {q.topic && <span className="badge badge-yellow">{q.topic}</span>}
                         {q.learningOutcome?.code && <span className="badge badge-green">{q.learningOutcome.code}</span>}
                         <span className={`badge ${q.status === 'ARCHIVED' ? 'badge-red' : 'badge-green'}`}>{q.status || 'ACTIVE'}</span>
                       </div>
@@ -332,11 +327,6 @@ const TeacherQuestions: React.FC = () => {
                     <option value="ARCHIVED">ARCHIVED</option>
                   </select>
                 </div>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1.5">Topic</label>
-                <input className="input-field" value={form.topic} onChange={(e) => setForm({ ...form, topic: e.target.value })} placeholder="Topic label" />
               </div>
 
               <div>

@@ -8,6 +8,61 @@ import { BulkUploadResponse, BuiltExam, ExamScanEntry, ExamSession, ExamSubmissi
 
 type TabKey = 'AI_GRADING' | 'REPORT' | 'EXAM_VIEW';
 
+type ViewfinderVariant = 'omr' | 'identityEssay' | 'essayPage' | 'generic';
+type ViewfinderZone = {
+  id: string;
+  top: string;
+  left: string;
+  width: string;
+  height: string;
+  label?: string;
+};
+
+const VIEWFINDER_ZONES: Record<ViewfinderVariant, ViewfinderZone[]> = {
+  omr: [
+    { id: 'header', top: '3%', left: '8%', width: '84%', height: '8%', label: 'HEADER' },
+    { id: 'identity', top: '13%', left: '8%', width: '54%', height: '16%', label: 'INFO' },
+    { id: 'mssv', top: '13%', left: '66%', width: '26%', height: '20%', label: 'MSSV' },
+    { id: 'instructions', top: '31%', left: '8%', width: '54%', height: '12%', label: 'INSTRUCTIONS' },
+    { id: 'omr', top: '48%', left: '8%', width: '84%', height: '44%', label: 'OMR GRID' },
+  ],
+  identityEssay: [
+    { id: 'header', top: '3%', left: '8%', width: '84%', height: '8%', label: 'HEADER' },
+    { id: 'identity', top: '13%', left: '8%', width: '54%', height: '16%', label: 'INFO' },
+    { id: 'mssv', top: '13%', left: '66%', width: '26%', height: '20%', label: 'MSSV' },
+    { id: 'instructions', top: '31%', left: '8%', width: '54%', height: '12%', label: 'INSTRUCTIONS' },
+    { id: 'essay', top: '48%', left: '8%', width: '84%', height: '44%', label: 'ESSAY AREA' },
+  ],
+  essayPage: [
+    { id: 'essay-header', top: '4%', left: '8%', width: '84%', height: '10%', label: 'QUESTION HEADER' },
+    { id: 'essay-body', top: '18%', left: '8%', width: '84%', height: '68%', label: 'ANSWER AREA' },
+    { id: 'essay-footer', top: '88%', left: '8%', width: '84%', height: '6%', label: 'END LINE' },
+  ],
+  generic: [],
+};
+
+const ViewfinderOverlay: React.FC<{ variant: ViewfinderVariant }> = ({ variant }) => {
+  const zones = VIEWFINDER_ZONES[variant];
+  return (
+    <div className="absolute inset-0 pointer-events-none">
+      <div className="absolute inset-[4%] rounded-lg border border-white/40" />
+      {zones.map((zone) => (
+        <div
+          key={zone.id}
+          className="absolute rounded-md border border-dashed border-white/50 bg-white/5"
+          style={{ top: zone.top, left: zone.left, width: zone.width, height: zone.height }}
+        >
+          {zone.label && (
+            <span className="absolute left-1 top-1 text-[10px] uppercase tracking-wide text-white/70">
+              {zone.label}
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+};
+
 type ExamScanBlueprintConfig = {
   scannablePages?: number;
   passPurposeByIndex?: Record<string, string>;
@@ -169,6 +224,14 @@ const TeacherSessionManagement: React.FC = () => {
     if (purpose.startsWith('PAGE_')) return `Pass ${passIndex}: Additional Page`;
     return `Pass ${passIndex}`;
   };
+
+  const viewfinderVariant = useMemo<ViewfinderVariant>(() => {
+    const purpose = getPassPurpose(activePassIndex).toUpperCase();
+    if (purpose.includes('IDENTITY_ESSAY')) return 'identityEssay';
+    if (purpose.includes('ESSAY')) return 'essayPage';
+    if (purpose.includes('OMR')) return 'omr';
+    return 'generic';
+  }, [activePassIndex, passPurposeByIndex]);
 
   const parseSubmissionFeedback = (submission: ExamSubmission): SubmissionFeedbackPayload => {
     const toNumberOrNull = (value: unknown): number | null => {
@@ -685,7 +748,7 @@ const TeacherSessionManagement: React.FC = () => {
   const gradeAI = async (submissionId: number) => {
     try {
       await api.post(`/exams/submissions/${submissionId}/grade-ai`, { useScanExtraction: true });
-      toast.success('AI grading completed');
+      toast.success('Batch AI grading completed');
       if (selectedSessionId) fetchSessionDetails(selectedSessionId);
     } catch {
       toast.error('Failed to grade with AI');
@@ -697,7 +760,7 @@ const TeacherSessionManagement: React.FC = () => {
     try {
       const { data } = await api.post(`/exams/sessions/${selectedSessionId}/complete-scanning`, {});
       setWorkflowSummary(data);
-      toast.success(`Graded ${data.gradedCount || 0}/${data.totalSubmissions || 0} submissions`);
+      toast.success(`Batch graded ${data.gradedCount || 0}/${data.totalSubmissions || 0} submissions`);
       await fetchSessionDetails(selectedSessionId);
       await fetchSessions();
       setTab('REPORT');
@@ -739,7 +802,7 @@ const TeacherSessionManagement: React.FC = () => {
       link.download = `exam_session_${selectedExam.id}.docx`;
       link.click();
       window.URL.revokeObjectURL(url);
-      toast.success('Exam exported');
+      toast.success('Exam exported (.docx template)');
     } catch {
       toast.error('Failed to export exam');
     }
@@ -755,7 +818,7 @@ const TeacherSessionManagement: React.FC = () => {
       link.download = `answer_key_${selectedExam.id}.docx`;
       link.click();
       window.URL.revokeObjectURL(url);
-      toast.success('Answer key exported');
+      toast.success('Answer key exported (.docx template)');
     } catch {
       toast.error('Failed to export answer key');
     }
@@ -1008,7 +1071,7 @@ const TeacherSessionManagement: React.FC = () => {
       <div className="space-y-6">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Session Management</h1>
-          <p className="text-gray-500 mt-1">Manage grading, reports, and exam view for active sessions</p>
+          <p className="text-gray-500 mt-1">Manage scanning, batch AI auto-grading, reports, and exam view for active sessions</p>
         </div>
 
         <div className="card p-4">
@@ -1065,7 +1128,7 @@ const TeacherSessionManagement: React.FC = () => {
         {tab === 'AI_GRADING' && (
           <div className="card p-5 space-y-3">
             <div className="flex items-center justify-between gap-2">
-              <h2 className="font-semibold text-gray-900">AI Grading and Manual Review</h2>
+              <h2 className="font-semibold text-gray-900">Batch AI Grading and Manual Review</h2>
               <div className="flex gap-2 flex-wrap">
                 <button className="btn-secondary text-xs" onClick={generateMobileScanLink} disabled={!selectedSessionId}>
                   Create Mobile Link
@@ -1079,14 +1142,14 @@ const TeacherSessionManagement: React.FC = () => {
                     }
                     setWorkflowSummary(null);
                     void openCameraForAutoScan();
-                    toast.success('Scan mode started in auto-detect mode.');
+                    toast.success('Scan mode started in auto-match mode.');
                   }}
                   disabled={!selectedSessionId || submissions.length === 0}
                 >
                   Start Scan
                 </button>
                 <button className="btn-secondary text-xs" onClick={completeScanningAndAutoGrade} disabled={!selectedSessionId}>
-                  AI Start Grading
+                  Start Batch AI Grading
                 </button>
                 <button className="btn-secondary text-xs" onClick={fetchIssuesReport} disabled={!selectedSessionId || issuesLoading}>
                   <AlertTriangle size={14} className="inline mr-1" />
@@ -1095,7 +1158,7 @@ const TeacherSessionManagement: React.FC = () => {
               </div>
             </div>
             <p className="text-xs text-gray-600">
-              Upload Full Set requires exactly {getTotalPasses()} image(s) per student. Hard-to-read pages are flagged by the server and must be re-uploaded immediately.
+              Upload Full Set requires exactly {getTotalPasses()} image(s) per student. Hard-to-read pages are flagged by the server and must be re-uploaded immediately. The backend uses batch processing to grade all pages of a submission in a single optimized AI call.
             </p>
 
             {/* Bulk Upload Section */}
@@ -1103,7 +1166,7 @@ const TeacherSessionManagement: React.FC = () => {
               <div className="flex items-center justify-between gap-2">
                 <div>
                   <p className="text-sm font-medium text-primary-800">Bulk Upload (All Students)</p>
-                  <p className="text-xs text-primary-600">Upload all exam images at once. Images are grouped by {getTotalPasses()} pages per student. Gemini OCR auto-classifies each set to the correct student.</p>
+                  <p className="text-xs text-primary-600">Upload all exam images in sequential order. The system groups images by {getTotalPasses()} pages per student and matches students using the identity/OMR block on page 1 of each set.</p>
                 </div>
                 <label className={`btn-primary text-xs cursor-pointer whitespace-nowrap ${bulkUploading ? 'opacity-50 pointer-events-none' : ''}`}>
                   <Upload size={14} className="inline mr-1" />
@@ -1124,7 +1187,7 @@ const TeacherSessionManagement: React.FC = () => {
               {bulkUploading && (
                 <div className="flex items-center gap-2">
                   <span className="animate-spin rounded-full h-4 w-4 border-b-2 border-primary-600" />
-                  <p className="text-xs text-primary-700">Processing and classifying images with Gemini AI...</p>
+                  <p className="text-xs text-primary-700">Extracting student identity from page 1 and matching sets...</p>
                 </div>
               )}
             </div>
@@ -1246,7 +1309,10 @@ const TeacherSessionManagement: React.FC = () => {
                 <div className="grid lg:grid-cols-3 gap-3">
                   <div className="lg:col-span-2">
                     <div className={`rounded-xl border-2 overflow-hidden ${captureReady ? 'border-green-500' : 'border-red-400'}`}>
-                      <video ref={cameraVideoRef} autoPlay playsInline muted className="w-full bg-black" />
+                      <div className="relative w-full aspect-[210/297] bg-black">
+                        <video ref={cameraVideoRef} autoPlay playsInline muted className="absolute inset-0 w-full h-full object-cover" />
+                        <ViewfinderOverlay variant={viewfinderVariant} />
+                      </div>
                     </div>
                     <div className="mt-2 flex items-center justify-between">
                       <p className={`text-xs ${captureReady ? 'text-green-700' : 'text-amber-700'}`}>{captureHint}</p>
@@ -1261,7 +1327,7 @@ const TeacherSessionManagement: React.FC = () => {
                       </div>
                     </div>
                     <p className="text-xs text-gray-600 mt-2">
-                      {activeSubmission ? getPassTitle(activePassIndex) : 'Auto detect student from paper'} / Total passes: {getTotalPasses()}
+                      {activeSubmission ? getPassTitle(activePassIndex) : 'Auto match student from page 1'} / Total passes: {getTotalPasses()}
                     </p>
                     {/* Page progress indicator */}
                     <div className="flex gap-1 mt-2">
@@ -1304,7 +1370,7 @@ const TeacherSessionManagement: React.FC = () => {
                           </div>
                         </>
                       ) : (
-                        <p className="text-xs text-gray-500">Auto mode is active. AI will identify student from each scanned page set.</p>
+                        <p className="text-xs text-gray-500">Auto mode is active. The system matches the student from page 1 of each scanned set.</p>
                       )}
                     </div>
                   </div>
@@ -1370,7 +1436,7 @@ const TeacherSessionManagement: React.FC = () => {
                             }}
                           />
                         </label>
-                        <button className="btn-secondary text-xs" onClick={() => gradeAI(item.id)}>AI Grade</button>
+                        <button className="btn-secondary text-xs" onClick={() => gradeAI(item.id)}>Batch AI Grade</button>
                         <button
                           className="btn-secondary text-xs"
                           onClick={() => handleRegrade(item.id)}

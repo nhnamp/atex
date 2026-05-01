@@ -502,7 +502,7 @@ const TeacherMobileScan: React.FC = () => {
             }}
             disabled={!context || context.students.length === 0}
           >
-            <option value="">-- Auto detect by Gemini --</option>
+            <option value="">-- Auto match from scan --</option>
             {context?.students.map((item) => (
               <option key={item.studentId} value={item.studentId}>
                 {item.student.fullName} ({item.student.username}) • scans: {item.scanCount}
@@ -533,7 +533,7 @@ const TeacherMobileScan: React.FC = () => {
           <p className="text-xs text-gray-600">
             {activeStudent
               ? `${activeStudent.student.fullName} • Pass ${activePassIndex}/${totalPasses}`
-              : `Auto mode • Pass ${activePassIndex}/${totalPasses} (Gemini identifies student from sheet)`}
+              : `Auto mode • Pass ${activePassIndex}/${totalPasses} (auto match from page 1 identity block)`}
           </p>
 
           <div className="grid grid-cols-2 gap-2">
@@ -576,7 +576,7 @@ const TeacherMobileScan: React.FC = () => {
                   setActivePassIndex(1);
                 }}
               >
-                Reset to Auto Detect
+                Reset to Auto Match
               </button>
             </div>
           </div>

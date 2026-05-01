@@ -124,7 +124,6 @@ model Question {
   answer    String
   options   String?  // JSON: ["Option A","Option B","Option C","Option D"] for MC
   status    String   @default("ACTIVE") // ACTIVE | ARCHIVED
-  topic     String?
   difficulty String  @default("MEDIUM") // EASY | MEDIUM | HARD
   rubric    String?
   learningOutcomeId Int?

@@ -5,7 +5,10 @@ import {
   extractAndGradeSubmissionFromScansBatch,
   extractStudentIdentityFromScan,
   getGeminiErrorStatusCode,
+  computeMultiStudentBatchSize,
+  extractAndGradeMultiStudentBatch,
 } from '../services/gemini.service';
+import type { MultiStudentBatchInput } from '../services/gemini.service';
 import {
   buildExamScanBlueprint,
   ExamScanBlueprint,
@@ -69,6 +72,20 @@ const normalizePositiveInt = (value: unknown, fallback: number): number => {
   return fallback;
 };
 
+/**
+ * Returns true if the exam has any session in ONGOING or GRADING status.
+ * Used to block edits to the exam structure once scanning/grading has begun.
+ */
+const hasActiveSessionsForExam = async (examId: number): Promise<boolean> => {
+  const count = await prisma.examSession.count({
+    where: {
+      examId,
+      status: { in: ['ONGOING', 'GRADING'] },
+    },
+  });
+  return count > 0;
+};
+
 const normalizeStoredScanBlueprint = (
   rawBlueprint: Partial<ExamScanBlueprint> | undefined,
   fallback: ExamScanBlueprint
@@ -117,6 +134,27 @@ const resolveExpectedScannablePages = (
     : passPlan.essayQuestionIds.length;
 
   return inferredByRule > 0 ? inferredByRule : 1;
+};
+
+const deleteEmptyDraftExams = async (tx: any, teacherId: number): Promise<void> => {
+  const draftExams = await tx.exam.findMany({
+    where: { teacherId, status: 'DRAFT' },
+    select: { id: true },
+  });
+
+  if (draftExams.length === 0) return;
+
+  const draftIds = draftExams.map((item: { id: number }) => item.id);
+  const draftIdsWithSessions = await tx.examSession.findMany({
+    where: { examId: { in: draftIds } },
+    select: { examId: true },
+  });
+  const protectedIds = new Set(draftIdsWithSessions.map((item: { examId: number }) => item.examId));
+  const deletableIds = draftIds.filter((id: number) => !protectedIds.has(id));
+
+  if (deletableIds.length > 0) {
+    await tx.exam.deleteMany({ where: { id: { in: deletableIds } } });
+  }
 };
 
 const MOBILE_SCAN_SCOPE = 'exam_mobile_scan';
@@ -1121,8 +1159,17 @@ const validateRequirements = (requirements: ExamRequirements): string | null => 
   if (requirements.difficultyDistribution) {
     const mc = requirements.difficultyDistribution.multipleChoice;
     const essayDist = requirements.difficultyDistribution.essay;
-    const sumMc = mc.easy + mc.medium + mc.hard;
-    const sumEssay = essayDist.easy + essayDist.medium + essayDist.hard;
+
+    if (!mc || !essayDist) {
+      return 'difficultyDistribution must include multipleChoice and essay ratios';
+    }
+
+    const sumMc = Number(mc.easy) + Number(mc.medium) + Number(mc.hard);
+    const sumEssay = Number(essayDist.easy) + Number(essayDist.medium) + Number(essayDist.hard);
+
+    if (!Number.isFinite(sumMc) || !Number.isFinite(sumEssay)) {
+      return 'Difficulty ratio values must be valid numbers';
+    }
 
     if (multipleChoice > 0 && sumMc !== 100) {
       return 'Difficulty ratio for multipleChoice must sum to 100% when multipleChoice > 0';
@@ -1379,10 +1426,14 @@ const pickQuestionsByRequirements = (
   requirements: ExamRequirements,
   randomSeed: string
 ) => {
-  const ratios = requirements.difficultyDistribution || {
-    multipleChoice: defaultRatios,
-    essay: defaultRatios,
-  };
+  const ratios = requirements.difficultyDistribution
+    && requirements.difficultyDistribution.multipleChoice
+    && requirements.difficultyDistribution.essay
+    ? requirements.difficultyDistribution
+    : {
+      multipleChoice: defaultRatios,
+      essay: defaultRatios,
+    };
 
   const filteredPool = allQuestions;
 
@@ -1399,24 +1450,26 @@ const pickQuestionsByRequirements = (
   if (essay.length < requirements.essay) {
     throw new Error(`Not enough ESSAY questions (need ${requirements.essay}, have ${essay.length})`);
   }
-  const selected = [
-    ...pickByOutcomeRatioAndDifficulty(
-      mc,
-      requirements.multipleChoice,
-      ratios.multipleChoice,
-      outcomeRatios,
-      `${randomSeed}:mc`
-    ),
-    ...pickByOutcomeRatioAndDifficulty(
-      essay,
-      requirements.essay,
-      ratios.essay,
-      outcomeRatios,
-      `${randomSeed}:essay`
-    ),
-  ];
+  const mcSelected = pickByOutcomeRatioAndDifficulty(
+    mc,
+    requirements.multipleChoice,
+    ratios.multipleChoice,
+    outcomeRatios,
+    `${randomSeed}:mc`
+  );
+  const essaySelected = pickByOutcomeRatioAndDifficulty(
+    essay,
+    requirements.essay,
+    ratios.essay,
+    outcomeRatios,
+    `${randomSeed}:essay`
+  );
 
-  return seededShuffle(selected, `${randomSeed}:final`);
+  // Shuffle within each section but keep sections separated (MCQ first, then Essay)
+  const mcShuffled = seededShuffle(mcSelected, `${randomSeed}:mc:final`);
+  const essayShuffled = seededShuffle(essaySelected, `${randomSeed}:essay:final`);
+
+  return [...mcShuffled, ...essayShuffled];
 };
 
 export const createExamDraft = async (req: AuthRequest, res: Response): Promise<void> => {
@@ -1507,12 +1560,7 @@ export const createExamDraft = async (req: AuthRequest, res: Response): Promise<
     };
 
     const created = await prisma.$transaction(async (tx) => {
-      await tx.exam.deleteMany({
-        where: {
-          teacherId: req.user!.id,
-          status: 'DRAFT',
-        },
-      });
+      await deleteEmptyDraftExams(tx as unknown as PrismaClient, req.user!.id);
 
       const exam = await tx.exam.create({
         data: {
@@ -1528,13 +1576,29 @@ export const createExamDraft = async (req: AuthRequest, res: Response): Promise<
         },
       });
 
+      // Determine sectionPoints: defaults to 7 for MCQ and 3 for Essay
+      const sectionPoints = (requirements && (requirements as any).sectionPoints)
+        ? (requirements as any).sectionPoints
+        : { multipleChoice: 7, essay: 3 };
+
+      const mcqCount = selectedQuestions.filter((sq) => sq.type === 'MULTIPLE_CHOICE').length;
+      const essayCount = selectedQuestions.filter((sq) => sq.type === 'ESSAY').length;
+
       await tx.examQuestion.createMany({
-        data: selectedQuestions.map((q, idx) => ({
-          examId: exam.id,
-          questionId: q.id,
-          position: idx + 1,
-          points: 1,
-        })),
+        data: selectedQuestions.map((q, idx) => {
+          const isMcq = q.type === 'MULTIPLE_CHOICE';
+          const totalObjective = mcqCount > 0 ? Number(sectionPoints.multipleChoice ?? 7) : 0;
+          const totalEssay = mcqCount > 0 ? Number(sectionPoints.essay ?? 3) : Number(sectionPoints.essay ?? 10);
+          const pts = isMcq
+            ? mcqCount > 0 ? Number((totalObjective / mcqCount).toFixed(4)) : 0
+            : essayCount > 0 ? Number((totalEssay / essayCount).toFixed(4)) : 0;
+          return {
+            examId: exam.id,
+            questionId: q.id,
+            position: idx + 1,
+            points: pts,
+          };
+        }),
       });
 
       return tx.exam.findUnique({
@@ -1697,6 +1761,11 @@ export const updateExamConfiguration = async (req: AuthRequest, res: Response): 
       return;
     }
 
+    if (await hasActiveSessionsForExam(examId)) {
+      res.status(409).json({ error: 'Cannot modify exam while sessions are ONGOING or GRADING.' });
+      return;
+    }
+
     const existingRequirements = parseExamRequirements(exam.requirements);
     const fallbackBlueprint = buildFallbackScanBlueprintFromQuestions(exam.questions);
     const resolvedScanBlueprint = normalizeStoredScanBlueprint(
@@ -1740,6 +1809,57 @@ export const updateExamConfiguration = async (req: AuthRequest, res: Response): 
       },
     });
 
+    // If sectionPoints changed in provided requirements, redistribute points evenly across questions
+    try {
+      const incomingReq = requirements as ExamRequirements | undefined;
+      if (incomingReq && (incomingReq as any).sectionPoints) {
+        const sectionPoints = (incomingReq as any).sectionPoints as { multipleChoice?: number; essay?: number };
+
+        const questions = updated.questions || [];
+        const mcq = questions.filter((q) => q.question.type === 'MULTIPLE_CHOICE');
+        const essayQ = questions.filter((q) => q.question.type === 'ESSAY');
+
+        const mcqCount = mcq.length;
+        const essayCount = essayQ.length;
+
+        const totalObjective = mcqCount > 0 ? Number(sectionPoints.multipleChoice ?? 7) : 0;
+        const totalEssay = mcqCount > 0 ? Number(sectionPoints.essay ?? 3) : Number(sectionPoints.essay ?? 10);
+
+        await prisma.$transaction(async (tx) => {
+          if (mcqCount > 0) {
+            const per = Number((totalObjective / mcqCount).toFixed(4));
+            await Promise.all(
+              mcq.map((item) =>
+                tx.examQuestion.update({ where: { examId_questionId: { examId: updated.id, questionId: item.questionId } }, data: { points: per } })
+              )
+            );
+          }
+          if (essayCount > 0) {
+            const per = Number((totalEssay / essayCount).toFixed(4));
+            await Promise.all(
+              essayQ.map((item) =>
+                tx.examQuestion.update({ where: { examId_questionId: { examId: updated.id, questionId: item.questionId } }, data: { points: per } })
+              )
+            );
+          }
+          await tx.exam.update({ where: { id: updated.id }, data: { version: { increment: 1 } } });
+        });
+
+        // reload updated exam
+        const reloaded = await prisma.exam.findUnique({
+          where: { id: updated.id },
+          include: {
+            subject: { select: { id: true, name: true } },
+            questions: { include: { question: true }, orderBy: { position: 'asc' } },
+          },
+        });
+        res.json(reloaded);
+        return;
+      }
+    } catch (e) {
+      console.error('Failed to redistribute points after configuration update', e);
+    }
+
     res.json(updated);
   } catch (error) {
     console.error('Update exam configuration error:', error);
@@ -1767,6 +1887,11 @@ export const reorderExamQuestions = async (req: AuthRequest, res: Response): Pro
       return;
     }
 
+    if (await hasActiveSessionsForExam(examId)) {
+      res.status(409).json({ error: 'Cannot reorder questions while sessions are ONGOING or GRADING.' });
+      return;
+    }
+
     const existingIds = exam.questions.map((item) => item.questionId).sort((a, b) => a - b);
     const incomingIds = [...orderedQuestionIds].sort((a, b) => a - b);
     if (JSON.stringify(existingIds) !== JSON.stringify(incomingIds)) {
@@ -1774,14 +1899,27 @@ export const reorderExamQuestions = async (req: AuthRequest, res: Response): Pro
       return;
     }
 
-    await prisma.$transaction(
-      orderedQuestionIds.map((questionId, index) =>
-        prisma.examQuestion.update({
-          where: { examId_questionId: { examId, questionId } },
-          data: { position: index + 1 },
-        })
-      )
-    );
+    const offset = exam.questions.length;
+
+    await prisma.$transaction(async (tx) => {
+      await Promise.all(
+        exam.questions.map((item) =>
+          tx.examQuestion.update({
+            where: { examId_questionId: { examId, questionId: item.questionId } },
+            data: { position: item.position + offset },
+          })
+        )
+      );
+
+      await Promise.all(
+        orderedQuestionIds.map((questionId, index) =>
+          tx.examQuestion.update({
+            where: { examId_questionId: { examId, questionId } },
+            data: { position: index + 1 },
+          })
+        )
+      );
+    });
 
     const updated = await prisma.exam.findUnique({
       where: { id: examId },
@@ -1804,12 +1942,10 @@ export const replaceExamQuestion = async (req: AuthRequest, res: Response): Prom
   try {
     const examId = toInt(req.params.examId);
     const questionId = toInt(req.params.questionId);
-    const { replacementQuestionId } = req.body as { replacementQuestionId: number };
-
-    if (!replacementQuestionId) {
-      res.status(400).json({ error: 'replacementQuestionId is required' });
-      return;
-    }
+    const { replacementQuestionId, autoReplace } = req.body as {
+      replacementQuestionId?: number;
+      autoReplace?: boolean;
+    };
 
     const exam = await prisma.exam.findUnique({
       where: { id: examId },
@@ -1820,20 +1956,55 @@ export const replaceExamQuestion = async (req: AuthRequest, res: Response): Prom
       return;
     }
 
+    if (await hasActiveSessionsForExam(examId)) {
+      res.status(409).json({ error: 'Cannot replace questions while sessions are ONGOING or GRADING.' });
+      return;
+    }
+
     const existingQuestion = exam.questions.find((item) => item.questionId === questionId);
     if (!existingQuestion) {
       res.status(404).json({ error: 'Question not found in exam' });
       return;
     }
 
-    const replacement = await prisma.question.findUnique({ where: { id: Number(replacementQuestionId) } });
-    if (!replacement || replacement.subjectId !== exam.subjectId || replacement.type === undefined) {
-      res.status(400).json({ error: 'Replacement question is invalid' });
+    const currentQuestion = await prisma.question.findUnique({ where: { id: questionId } });
+    if (!currentQuestion) {
+      res.status(404).json({ error: 'Question not found' });
       return;
     }
 
-    const currentQuestion = await prisma.question.findUnique({ where: { id: questionId } });
-    if (!currentQuestion || currentQuestion.type !== replacement.type) {
+    let replacement = replacementQuestionId
+      ? await prisma.question.findUnique({ where: { id: Number(replacementQuestionId) } })
+      : null;
+
+    if (!replacement && autoReplace) {
+      const usedQuestionIds = exam.questions.map((item) => item.questionId);
+      const candidates = await prisma.question.findMany({
+        where: {
+          subjectId: exam.subjectId,
+          type: currentQuestion.type,
+          difficulty: currentQuestion.difficulty,
+          learningOutcomeId: currentQuestion.learningOutcomeId,
+          status: 'ACTIVE',
+          id: { notIn: usedQuestionIds },
+        },
+        orderBy: { createdAt: 'desc' },
+      });
+
+      if (candidates.length === 0) {
+        res.status(404).json({ error: 'No replacement question matches the current question type, difficulty, and learning outcome.' });
+        return;
+      }
+
+      replacement = candidates[Math.floor(Math.random() * candidates.length)] || null;
+    }
+
+    if (!replacement) {
+      res.status(400).json({ error: 'replacementQuestionId or autoReplace is required' });
+      return;
+    }
+
+    if (replacement.subjectId !== exam.subjectId || currentQuestion.type !== replacement.type) {
       res.status(400).json({ error: 'Replacement question must have the same question type' });
       return;
     }
@@ -1843,7 +2014,7 @@ export const replaceExamQuestion = async (req: AuthRequest, res: Response): Prom
       await tx.examQuestion.create({
         data: {
           examId,
-          questionId: replacementQuestionId,
+          questionId: replacement.id,
           position: existingQuestion.position,
           points: existingQuestion.points,
         },
@@ -1864,6 +2035,54 @@ export const replaceExamQuestion = async (req: AuthRequest, res: Response): Prom
   } catch (error) {
     console.error('Replace exam question error:', error);
     res.status(500).json({ error: 'Failed to replace question' });
+  }
+};
+
+export const updateExamQuestionPoints = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const examId = toInt(req.params.examId);
+    const questionId = toInt(req.params.questionId);
+    const { points } = req.body as { points?: number };
+
+    if (points === undefined || Number.isNaN(Number(points))) {
+      res.status(400).json({ error: 'points is required' });
+      return;
+    }
+
+    const exam = await prisma.exam.findUnique({ where: { id: examId }, include: { questions: true } });
+    if (!exam || exam.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Exam not found' });
+      return;
+    }
+
+    if (await hasActiveSessionsForExam(examId)) {
+      res.status(409).json({ error: 'Cannot modify points while sessions are ONGOING or GRADING.' });
+      return;
+    }
+
+    const existing = exam.questions.find((q) => q.questionId === questionId);
+    if (!existing) {
+      res.status(404).json({ error: 'Question not found in exam' });
+      return;
+    }
+
+    await prisma.$transaction(async (tx) => {
+      await tx.examQuestion.update({
+        where: { examId_questionId: { examId, questionId } },
+        data: { points: Number(points) },
+      });
+      await tx.exam.update({ where: { id: examId }, data: { version: { increment: 1 } } });
+    });
+
+    const updated = await prisma.exam.findUnique({
+      where: { id: examId },
+      include: { questions: { include: { question: true }, orderBy: { position: 'asc' } }, subject: true },
+    });
+
+    res.json(updated);
+  } catch (error) {
+    console.error('Update question points error:', error);
+    res.status(500).json({ error: 'Failed to update question points' });
   }
 };
 
@@ -1889,6 +2108,12 @@ export const exportExamDocx = async (req: AuthRequest, res: Response): Promise<v
     const questionList = exam.questions.map((item) => item.question);
     const essayQuestions = questionList.filter((item) => item.type === 'ESSAY');
     const mcqQuestions = questionList.filter((item) => item.type === 'MULTIPLE_CHOICE');
+
+    // Build points map from ExamQuestion rows for accurate docx rendering
+    const pointsMap = new Map<number, number>();
+    for (const eq of exam.questions) {
+      pointsMap.set(eq.questionId, eq.points);
+    }
 
     const parsedRequirements = parseExamRequirements(exam.requirements);
     const regeneratedBlueprint = buildExamScanBlueprint(mcqQuestions, essayQuestions, {
@@ -1920,8 +2145,8 @@ export const exportExamDocx = async (req: AuthRequest, res: Response): Promise<v
     });
 
     const docBuffer = mcqQuestions.length === 0
-      ? await generateEssayExamDocx(exam.subject.name, exam.durationMinutes, essayQuestions)
-      : await generateMcqEssayExamDocx(exam.subject.name, exam.durationMinutes, mcqQuestions, essayQuestions);
+      ? await generateEssayExamDocx(exam.subject.name, exam.durationMinutes, essayQuestions, pointsMap)
+      : await generateMcqEssayExamDocx(exam.subject.name, exam.durationMinutes, mcqQuestions, essayQuestions, pointsMap);
 
     const filename = `exam_${exam.subject.name.replace(/\s+/g, '_')}_${exam.id}_v${exam.version}.docx`;
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
@@ -2304,12 +2529,7 @@ export const cloneExamToDraft = async (req: AuthRequest, res: Response): Promise
     }
 
     const created = await prisma.$transaction(async (tx) => {
-      await tx.exam.deleteMany({
-        where: {
-          teacherId: req.user!.id,
-          status: 'DRAFT',
-        },
-      });
+      await deleteEmptyDraftExams(tx as unknown as PrismaClient, req.user!.id);
 
       const exam = await tx.exam.create({
         data: {
@@ -3344,13 +3564,26 @@ export const completeScanningAndAutoGrade = async (req: AuthRequest, res: Respon
 
     const session = await prisma.examSession.findUnique({
       where: { id: sessionId },
-      include: { exam: true },
+      include: {
+        exam: {
+          include: {
+            questions: {
+              include: { question: true },
+              orderBy: { position: 'asc' },
+            },
+          },
+        },
+      },
     });
 
     if (!session || session.exam.teacherId !== req.user!.id) {
       res.status(404).json({ error: 'Session not found' });
       return;
     }
+
+    const scanBlueprint = resolveExamScanBlueprint(session.exam.questions, session.exam.requirements);
+    const passPlan = buildScanPassPlan(session.exam.questions, scanBlueprint);
+    const expectedPages = resolveExpectedScannablePages(session.exam.scannablePages, passPlan, scanBlueprint);
 
     const submissions = await prisma.examSubmission.findMany({
       where: { sessionId },
@@ -3362,6 +3595,20 @@ export const completeScanningAndAutoGrade = async (req: AuthRequest, res: Respon
         },
       },
     });
+
+    const essayExamQuestions = session.exam.questions.filter((item) => item.question.type === 'ESSAY');
+    const mcqExamQuestions = session.exam.questions.filter((item) => item.question.type === 'MULTIPLE_CHOICE');
+
+    const essayQuestionsForGemini = essayExamQuestions.map((item) => ({
+      questionId: item.question.id,
+      questionContent: item.question.content,
+      expectedAnswer: item.question.answer,
+      rubric: item.question.rubric,
+      maxScore: item.points,
+    }));
+
+    // Determine batch size: target 8-10 images per Gemini request
+    const batchSize = computeMultiStudentBatchSize(essayExamQuestions.length, expectedPages);
 
     let gradedCount = 0;
     let failedCount = 0;
@@ -3380,88 +3627,17 @@ export const completeScanningAndAutoGrade = async (req: AuthRequest, res: Respon
       error?: string;
     }> = [];
 
+    // Separate submissions with scans from those without
+    type GradableSubmission = {
+      submission: typeof submissions[0];
+      scanEntries: ScanEntry[];
+    };
+
+    const gradableSubmissions: GradableSubmission[] = [];
     for (const submission of submissions) {
-      try {
-        const gradingReq = {
-          ...req,
-          params: { ...req.params, submissionId: String(submission.id) },
-          body: {
-            useScanExtraction: true,
-          },
-        } as unknown as AuthRequest;
-
-        const capture: { statusCode: number; payload: unknown } = { statusCode: 200, payload: null };
-        const gradingRes = {
-          status(code: number) {
-            capture.statusCode = code;
-            return this;
-          },
-          json(payload: unknown) {
-            capture.payload = payload;
-            return this;
-          },
-        } as unknown as Response;
-
-        await gradeSubmissionWithAI(gradingReq, gradingRes);
-
-        if (capture.statusCode >= 400) {
-          failedCount += 1;
-          results.push({
-            submissionId: submission.id,
-            studentId: submission.student.id,
-            studentName: submission.student.fullName,
-            studentCode: submission.student.username,
-            objectiveScore: 0,
-            essayScore: 0,
-            totalScore: 0,
-            warnings: [],
-            status: 'FAILED',
-            error: (capture.payload as { error?: string })?.error || 'Grading failed',
-          });
-          continue;
-        }
-
-        const gradedPayload = capture.payload as {
-          finalScore?: number | null;
-          feedback?: string | null;
-          grades?: Array<{ objectiveScore: number; essayScore: number; totalScore: number }>;
-        };
-
-        const latestGrade = gradedPayload?.grades?.[0];
-        let feedbackWarnings: string[] = [];
-        let feedbackIdentityCheck: { nameMatch: boolean; codeMatch: boolean } | null = null;
-        try {
-          const parsedFeedback = JSON.parse(gradedPayload?.feedback || '{}') as {
-            warnings?: string[];
-            identityCheck?: { nameMatch: boolean; codeMatch: boolean };
-          };
-          feedbackWarnings = Array.isArray(parsedFeedback.warnings) ? parsedFeedback.warnings : [];
-          feedbackIdentityCheck = parsedFeedback.identityCheck || null;
-        } catch {
-          feedbackWarnings = [];
-        }
-
-        gradedCount += 1;
-        if (feedbackIdentityCheck) {
-          identityCheckedCount += 1;
-          if (!feedbackIdentityCheck.nameMatch || !feedbackIdentityCheck.codeMatch) {
-            identityMismatchCount += 1;
-          }
-        }
-
-        results.push({
-          submissionId: submission.id,
-          studentId: submission.student.id,
-          studentName: submission.student.fullName,
-          studentCode: submission.student.username,
-          objectiveScore: latestGrade?.objectiveScore || 0,
-          essayScore: latestGrade?.essayScore || 0,
-          totalScore: latestGrade?.totalScore || gradedPayload.finalScore || 0,
-          warnings: feedbackWarnings,
-          status: 'GRADED',
-        });
-      } catch (error) {
-        failedCount += 1;
+      const scanEntries = parseScanEntries(submission.scanFiles || '[]');
+      if (scanEntries.length === 0) {
+        // No scans → mark failed immediately
         results.push({
           submissionId: submission.id,
           studentId: submission.student.id,
@@ -3472,8 +3648,337 @@ export const completeScanningAndAutoGrade = async (req: AuthRequest, res: Respon
           totalScore: 0,
           warnings: [],
           status: 'FAILED',
-          error: (error as Error).message,
+          error: 'No scan files uploaded',
         });
+        failedCount += 1;
+        continue;
+      }
+      gradableSubmissions.push({ submission, scanEntries });
+    }
+
+    // Process OMR first (per-student, as it uses OpenCV locally)
+    const omrResultsBySubmissionId = new Map<number, Record<string, string>>();
+    const omrObjectiveScoreBySubmissionId = new Map<number, number>();
+
+    if (mcqExamQuestions.length > 0) {
+      for (const { submission, scanEntries } of gradableSubmissions) {
+        try {
+          const firstScan = scanEntries.sort((a, b) => {
+            const ai = Number(a.passIndex) || 999;
+            const bi = Number(b.passIndex) || 999;
+            return ai - bi;
+          })[0];
+          const scanPath = await resolveScanPath(firstScan);
+          const preprocessed = await preprocessScanForAnalysis(scanPath);
+          try {
+            const detection = await detectDocumentForOmr(preprocessed.processedPath);
+            const omrTemplate = scanBlueprint.omrTemplate;
+            if (omrTemplate) {
+              const calibrated = calibrateOmrTemplate(omrTemplate, detection);
+              const detected = await detectMarkedOptions(preprocessed.processedPath, calibrated);
+              omrResultsBySubmissionId.set(submission.id, detected);
+
+              let objectiveScore = 0;
+              for (const eq of mcqExamQuestions) {
+                const submitted = (detected[String(eq.question.id)] || '').trim().toLowerCase();
+                const expected = (eq.question.answer || '').trim().toLowerCase();
+                if (submitted && submitted === expected) objectiveScore += eq.points;
+              }
+              omrObjectiveScoreBySubmissionId.set(submission.id, objectiveScore);
+            }
+          } finally {
+            preprocessed.cleanup();
+          }
+          if (path.basename(scanPath).startsWith('scan_tmp_')) {
+            fs.unlink(scanPath, () => undefined);
+          }
+        } catch (omrError) {
+          // OMR failure is non-fatal; score stays 0 for objective
+          omrObjectiveScoreBySubmissionId.set(submission.id, 0);
+        }
+      }
+    }
+
+    // Process essay grading in multi-student batches
+    if (essayExamQuestions.length > 0) {
+      for (let i = 0; i < gradableSubmissions.length; i += batchSize) {
+        const batch = gradableSubmissions.slice(i, i + batchSize);
+
+        // Prepare scan paths for each student in this batch
+        const batchInputs: MultiStudentBatchInput[] = [];
+        const batchSubmissions: typeof batch = [];
+
+        for (const item of batch) {
+          try {
+            const orderedScans = [...item.scanEntries].sort((a, b) => {
+              const ai = Number(a.passIndex) || 999;
+              const bi = Number(b.passIndex) || 999;
+              return ai - bi;
+            });
+
+            const scanPaths: string[] = [];
+            for (const entry of orderedScans) {
+              scanPaths.push(await resolveScanPath(entry));
+            }
+
+            const normalizedScannablePages = normalizePositiveInt(scanBlueprint?.scannablePages, scanPaths.length);
+            const gradingScanPaths = scanPaths.slice(0, normalizedScannablePages);
+
+            batchInputs.push({
+              studentLabel: `SUB_${item.submission.id}`,
+              scanPaths: gradingScanPaths,
+            });
+            batchSubmissions.push(item);
+          } catch (prepError) {
+            failedCount += 1;
+            results.push({
+              submissionId: item.submission.id,
+              studentId: item.submission.student.id,
+              studentName: item.submission.student.fullName,
+              studentCode: item.submission.student.username,
+              objectiveScore: omrObjectiveScoreBySubmissionId.get(item.submission.id) || 0,
+              essayScore: 0,
+              totalScore: omrObjectiveScoreBySubmissionId.get(item.submission.id) || 0,
+              warnings: [],
+              status: 'FAILED',
+              error: (prepError as Error).message,
+            });
+          }
+        }
+
+        if (batchInputs.length === 0) continue;
+
+        try {
+          const batchResults = await extractAndGradeMultiStudentBatch(
+            batchInputs,
+            essayQuestionsForGemini,
+            expectedPages,
+            passPlan.passPurposeByIndex as Record<string, string>,
+            scanBlueprint as any,
+          );
+
+          for (let j = 0; j < batchSubmissions.length; j++) {
+            const sub = batchSubmissions[j].submission;
+            const result = batchResults[j];
+            const objectiveScore = omrObjectiveScoreBySubmissionId.get(sub.id) || 0;
+            const essayScore = result ? result.essayResults.reduce((acc, r) => acc + r.score, 0) : 0;
+            const totalScore = Number((objectiveScore + essayScore).toFixed(2));
+
+            const objectiveAnswers = omrResultsBySubmissionId.get(sub.id) || {};
+            const essayAnswers = result?.essayAnswers || {};
+            const essayResults = result?.essayResults || [];
+            const warnings = result?.warnings || [];
+            const extractedIdentity = result ? { fullName: result.fullName, studentCode: result.studentCode } : null;
+
+            let identityCheck: { nameMatch: boolean; codeMatch: boolean } | null = null;
+            if (extractedIdentity) {
+              const expectedName = (sub.student.fullName || '').trim().toLowerCase();
+              const expectedCode = normalizeStudentCode(sub.student.username);
+              const foundName = (extractedIdentity.fullName || '').trim().toLowerCase();
+              const foundCode = normalizeStudentCode(extractedIdentity.studentCode);
+              identityCheck = {
+                nameMatch: !!foundName && expectedName.includes(foundName),
+                codeMatch: !!foundCode && expectedCode === foundCode,
+              };
+              identityCheckedCount += 1;
+              if (!identityCheck.nameMatch || !identityCheck.codeMatch) {
+                identityMismatchCount += 1;
+                warnings.push('Student identity extracted from scan does not fully match enrollment data');
+              }
+            }
+
+            const feedbackPayload = {
+              identity: extractedIdentity,
+              identityCheck,
+              objectiveScore,
+              essayScore,
+              totalScore,
+              objectiveAnswers,
+              essayAnswers,
+              essayResults,
+              aiComments: essayResults.length > 0 ? 'Đã chấm trắc nghiệm bằng OMR cục bộ và tự luận bằng AI (multi-student batch).' : null,
+              warnings: [...new Set(warnings)],
+              scanBlueprint: { scannablePages: scanBlueprint.scannablePages, passPurposeByIndex: scanBlueprint.passPurposeByIndex },
+            };
+
+            try {
+              await prisma.$transaction(async (tx) => {
+                await tx.submissionGrade.create({
+                  data: {
+                    submissionId: sub.id,
+                    graderId: req.user!.id,
+                    method: 'AI',
+                    objectiveScore,
+                    essayScore,
+                    totalScore,
+                    rubricVersion: `exam-v${session.exam.version}`,
+                    responseLog: JSON.stringify(feedbackPayload),
+                  },
+                });
+                await tx.gradingAuditLog.create({
+                  data: {
+                    submissionId: sub.id,
+                    actorId: req.user!.id,
+                    action: 'AI_GRADED',
+                    beforeScore: null,
+                    afterScore: totalScore,
+                    note: JSON.stringify({ batchMode: 'multi_student', batchSize: batchInputs.length }),
+                  },
+                });
+                await tx.examSubmission.update({
+                  where: { id: sub.id },
+                  data: {
+                    objectiveAnswers: JSON.stringify(objectiveAnswers),
+                    essayAnswers: JSON.stringify(essayAnswers),
+                    aiScore: totalScore,
+                    finalScore: totalScore,
+                    status: 'GRADED',
+                    gradedAt: new Date(),
+                    feedback: JSON.stringify(feedbackPayload),
+                  },
+                });
+              });
+
+              gradedCount += 1;
+              results.push({
+                submissionId: sub.id,
+                studentId: sub.student.id,
+                studentName: sub.student.fullName,
+                studentCode: sub.student.username,
+                objectiveScore,
+                essayScore,
+                totalScore,
+                warnings,
+                status: 'GRADED',
+              });
+            } catch (dbError) {
+              failedCount += 1;
+              results.push({
+                submissionId: sub.id,
+                studentId: sub.student.id,
+                studentName: sub.student.fullName,
+                studentCode: sub.student.username,
+                objectiveScore: 0,
+                essayScore: 0,
+                totalScore: 0,
+                warnings: [],
+                status: 'FAILED',
+                error: (dbError as Error).message,
+              });
+            }
+          }
+        } catch (batchError) {
+          // If the entire batch fails, fall back to individual grading
+          for (const item of batchSubmissions) {
+            try {
+              const gradingReq = {
+                ...req,
+                params: { ...req.params, submissionId: String(item.submission.id) },
+                body: { useScanExtraction: true },
+              } as unknown as AuthRequest;
+              const capture: { statusCode: number; payload: unknown } = { statusCode: 200, payload: null };
+              const gradingRes = {
+                status(code: number) { capture.statusCode = code; return this; },
+                json(payload: unknown) { capture.payload = payload; return this; },
+              } as unknown as Response;
+              await gradeSubmissionWithAI(gradingReq, gradingRes);
+
+              if (capture.statusCode >= 400) {
+                failedCount += 1;
+                results.push({
+                  submissionId: item.submission.id,
+                  studentId: item.submission.student.id,
+                  studentName: item.submission.student.fullName,
+                  studentCode: item.submission.student.username,
+                  objectiveScore: 0, essayScore: 0, totalScore: 0,
+                  warnings: [], status: 'FAILED',
+                  error: (capture.payload as { error?: string })?.error || 'Grading failed',
+                });
+              } else {
+                gradedCount += 1;
+                const payload = capture.payload as { finalScore?: number | null; grades?: Array<{ objectiveScore: number; essayScore: number; totalScore: number }> };
+                const grade = payload?.grades?.[0];
+                results.push({
+                  submissionId: item.submission.id,
+                  studentId: item.submission.student.id,
+                  studentName: item.submission.student.fullName,
+                  studentCode: item.submission.student.username,
+                  objectiveScore: grade?.objectiveScore || 0,
+                  essayScore: grade?.essayScore || 0,
+                  totalScore: grade?.totalScore || payload?.finalScore || 0,
+                  warnings: [], status: 'GRADED',
+                });
+              }
+            } catch (fallbackError) {
+              failedCount += 1;
+              results.push({
+                submissionId: item.submission.id,
+                studentId: item.submission.student.id,
+                studentName: item.submission.student.fullName,
+                studentCode: item.submission.student.username,
+                objectiveScore: 0, essayScore: 0, totalScore: 0,
+                warnings: [], status: 'FAILED',
+                error: (fallbackError as Error).message,
+              });
+            }
+          }
+        }
+      }
+    } else {
+      // No essay questions - just OMR scoring
+      for (const { submission } of gradableSubmissions) {
+        const objectiveScore = omrObjectiveScoreBySubmissionId.get(submission.id) || 0;
+        const objectiveAnswers = omrResultsBySubmissionId.get(submission.id) || {};
+
+        try {
+          await prisma.$transaction(async (tx) => {
+            await tx.submissionGrade.create({
+              data: {
+                submissionId: submission.id,
+                graderId: req.user!.id,
+                method: 'AI',
+                objectiveScore,
+                essayScore: 0,
+                totalScore: objectiveScore,
+                responseLog: JSON.stringify({ objectiveAnswers }),
+              },
+            });
+            await tx.examSubmission.update({
+              where: { id: submission.id },
+              data: {
+                objectiveAnswers: JSON.stringify(objectiveAnswers),
+                aiScore: objectiveScore,
+                finalScore: objectiveScore,
+                status: 'GRADED',
+                gradedAt: new Date(),
+                feedback: JSON.stringify({ objectiveScore, totalScore: objectiveScore, objectiveAnswers }),
+              },
+            });
+          });
+          gradedCount += 1;
+          results.push({
+            submissionId: submission.id,
+            studentId: submission.student.id,
+            studentName: submission.student.fullName,
+            studentCode: submission.student.username,
+            objectiveScore,
+            essayScore: 0,
+            totalScore: objectiveScore,
+            warnings: [],
+            status: 'GRADED',
+          });
+        } catch (err) {
+          failedCount += 1;
+          results.push({
+            submissionId: submission.id,
+            studentId: submission.student.id,
+            studentName: submission.student.fullName,
+            studentCode: submission.student.username,
+            objectiveScore: 0, essayScore: 0, totalScore: 0,
+            warnings: [], status: 'FAILED',
+            error: (err as Error).message,
+          });
+        }
       }
     }
 
@@ -3486,11 +3991,12 @@ export const completeScanningAndAutoGrade = async (req: AuthRequest, res: Respon
     });
 
     res.json({
-      message: 'Scanning completed and auto grading executed',
+      message: `Scanning completed. ${gradedCount} graded (batch size: ${batchSize} students/request), ${failedCount} failed.`,
       gradedCount,
       failedCount,
       identityCheckedCount,
       identityMismatchCount,
+      batchSize,
       totalSubmissions: submissions.length,
       reportUrl: `/api/exams/sessions/${sessionId}/report`,
       reportExportUrl: `/api/exams/sessions/${sessionId}/report/export`,

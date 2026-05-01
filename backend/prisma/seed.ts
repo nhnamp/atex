@@ -126,6 +126,9 @@ async function main() {
     where: { subjectId: subject.id },
     orderBy: { code: 'asc' },
   });
+  const outcomeMap = new Map(outcomes.map((item) => [item.code, item.id]));
+
+  const essayOutcomeCodes = ['G1.1', 'G1.2', 'G2.1', 'G2.2', 'G3.1'];
 
   const sampleQuestions = [
     {
@@ -151,6 +154,8 @@ async function main() {
       answer:
         'Symmetric encryption uses the same key for encryption and decryption, while asymmetric encryption uses a public key for encryption and a private key for decryption.',
       options: null,
+      learningOutcomeCode: 'G1.1',
+      difficulty: 'EASY',
     },
     {
       type: 'ESSAY',
@@ -158,6 +163,8 @@ async function main() {
       answer:
         'The three main phases are: 1) Reconnaissance (information gathering), 2) Exploitation (finding and exploiting vulnerabilities), 3) Reporting (documenting findings and recommendations).',
       options: null,
+      learningOutcomeCode: 'G2.1',
+      difficulty: 'MEDIUM',
     },
     {
       type: 'MULTIPLE_CHOICE',
@@ -193,12 +200,246 @@ async function main() {
       content: 'Analyze zero-trust network architecture and explain how it differs from perimeter-based security.',
       answer: 'A complete answer should cover identity-centric controls, continuous verification, micro-segmentation, and policy-driven access.',
       options: null,
+      learningOutcomeCode: 'G2.2',
+      difficulty: 'HARD',
     },
     {
       type: 'ESSAY',
       content: 'Design an incident response plan for ransomware in a university network.',
       answer: 'A complete answer should include detection, isolation, communication, backup restoration, forensics, and lessons learned.',
       options: null,
+      learningOutcomeCode: 'G3.1',
+      difficulty: 'HARD',
+    },
+    {
+      type: 'ESSAY',
+      content: 'Explain why multi-factor authentication is more secure than password-only authentication in a networked environment.',
+      answer: 'A complete answer should explain that MFA combines independent factors, reduces the impact of stolen passwords, and adds resistance to phishing and credential reuse attacks.',
+      options: null,
+      learningOutcomeCode: 'G1.2',
+      difficulty: 'EASY',
+    },
+    {
+      type: 'ESSAY',
+      content: 'Discuss the role of network segmentation in reducing the impact of malware outbreaks.',
+      answer: 'A complete answer should describe how segmentation limits lateral movement, isolates critical systems, supports least privilege, and makes containment and monitoring easier.',
+      options: null,
+      learningOutcomeCode: 'G2.2',
+      difficulty: 'MEDIUM',
+    },
+    {
+      type: 'ESSAY',
+      content: 'Describe the security risks of using public Wi-Fi and present practical ways to mitigate them.',
+      answer: 'A complete answer should mention eavesdropping, rogue access points, session hijacking, and recommend VPN use, HTTPS, disabling auto-join, and avoiding sensitive transactions on untrusted networks.',
+      options: null,
+      learningOutcomeCode: 'G2.1',
+      difficulty: 'EASY',
+    },
+    {
+      type: 'ESSAY',
+      content: 'Explain how access control lists and firewall rules work together to protect internal network resources.',
+      answer: 'A complete answer should explain that ACLs restrict traffic at specific devices or interfaces while firewall rules enforce broader policy, and both help filter unauthorized access by source, destination, protocol, and port.',
+      options: null,
+      learningOutcomeCode: 'G1.2',
+      difficulty: 'MEDIUM',
+    },
+    {
+      type: 'ESSAY',
+      content: 'Compare symmetric encryption and hashing, and explain when each should be used in network security.',
+      answer: 'A complete answer should distinguish reversible encryption from one-way hashing, then note that encryption protects confidentiality while hashing supports integrity checks, password storage, and message verification.',
+      options: null,
+      learningOutcomeCode: 'G1.1',
+      difficulty: 'EASY',
+    },
+    {
+      type: 'ESSAY',
+      content: 'Propose a secure policy for managing remote access for employees in a company network.',
+      answer: 'A complete answer should include VPN or zero-trust access, strong authentication, device compliance checks, least privilege, logging, and periodic review of access rights.',
+      options: null,
+      learningOutcomeCode: 'G2.2',
+      difficulty: 'HARD',
+    },
+  ];
+
+  const additionalEssayQuestions: Array<{
+    content: string;
+    answer: string;
+    difficulty: 'EASY' | 'MEDIUM' | 'HARD';
+    learningOutcomeCode: string;
+  }> = [
+    {
+      content: 'Explain the purpose of network security policies in an organization.',
+      answer: 'A complete answer should explain that policies define acceptable use, roles, enforcement expectations, and provide a baseline for consistent protection of systems and data.',
+      difficulty: 'EASY',
+      learningOutcomeCode: 'G1.1',
+    },
+    {
+      content: 'Describe how strong password policies contribute to network security.',
+      answer: 'A complete answer should mention password length, complexity, reuse prevention, periodic review, and how these reduce the chance of unauthorized access.',
+      difficulty: 'EASY',
+      learningOutcomeCode: 'G1.2',
+    },
+    {
+      content: 'Explain the difference between confidentiality, integrity, and availability.',
+      answer: 'A complete answer should define confidentiality as preventing unauthorized disclosure, integrity as preventing unauthorized alteration, and availability as ensuring systems and data remain accessible when needed.',
+      difficulty: 'EASY',
+      learningOutcomeCode: 'G1.1',
+    },
+    {
+      content: 'Discuss why keeping network devices updated is important for security.',
+      answer: 'A complete answer should explain that updates patch known vulnerabilities, improve stability, and reduce the attack surface available to adversaries.',
+      difficulty: 'EASY',
+      learningOutcomeCode: 'G2.1',
+    },
+    {
+      content: 'Explain the role of authentication in preventing unauthorized access.',
+      answer: 'A complete answer should describe how authentication verifies identity before access is granted and helps stop attackers from impersonating legitimate users.',
+      difficulty: 'EASY',
+      learningOutcomeCode: 'G1.2',
+    },
+    {
+      content: 'Describe what a security incident is and give one example.',
+      answer: 'A complete answer should define a security incident as an event that threatens confidentiality, integrity, or availability, and give an example such as malware infection or unauthorized login.',
+      difficulty: 'EASY',
+      learningOutcomeCode: 'G3.1',
+    },
+    {
+      content: 'Explain how least privilege improves network security.',
+      answer: 'A complete answer should describe limiting each user or service to only the permissions required, reducing damage from mistakes and compromised accounts.',
+      difficulty: 'EASY',
+      learningOutcomeCode: 'G1.2',
+    },
+    {
+      content: 'Describe how logging helps administrators detect suspicious network activity.',
+      answer: 'A complete answer should explain that logs provide evidence of access, errors, and unusual patterns, helping teams investigate incidents and identify threats faster.',
+      difficulty: 'EASY',
+      learningOutcomeCode: 'G3.1',
+    },
+    {
+      content: 'Explain why encryption is useful when transmitting sensitive information over a network.',
+      answer: 'A complete answer should state that encryption prevents attackers from reading intercepted data and protects confidentiality during transmission.',
+      difficulty: 'EASY',
+      learningOutcomeCode: 'G1.1',
+    },
+    {
+      content: 'Describe one common way attackers exploit weak network authentication.',
+      answer: 'A complete answer should explain attacks such as brute force, password spraying, or credential stuffing and why weak authentication makes them effective.',
+      difficulty: 'EASY',
+      learningOutcomeCode: 'G2.1',
+    },
+    {
+      content: 'Analyze how a defense-in-depth strategy reduces the impact of a single security failure.',
+      answer: 'A complete answer should explain that multiple layers of controls slow attackers, create backup barriers, and limit damage when one control fails.',
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'G2.2',
+    },
+    {
+      content: 'Discuss the benefits and limitations of using antivirus software in a networked environment.',
+      answer: 'A complete answer should note that antivirus can detect known malware and reduce risk, but it cannot catch every attack and must be combined with other controls.',
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'G2.1',
+    },
+    {
+      content: 'Explain how a VPN protects remote communication between users and a company network.',
+      answer: 'A complete answer should mention encrypted tunnels, protection on untrusted networks, and how VPNs help secure traffic while users are offsite.',
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'G1.1',
+    },
+    {
+      content: 'Describe how access reviews help maintain security in large organizations.',
+      answer: 'A complete answer should explain that access reviews verify permissions remain appropriate, remove excessive rights, and reduce risk from outdated accounts.',
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'G1.2',
+    },
+    {
+      content: 'Explain how threat intelligence can support faster incident detection and response.',
+      answer: 'A complete answer should describe using known indicators, attacker patterns, and external reporting to improve detection and guide containment decisions.',
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'G3.1',
+    },
+    {
+      content: 'Compare centralized authentication with local authentication in a network environment.',
+      answer: 'A complete answer should describe how centralized authentication simplifies control, auditing, and account management, while local authentication is harder to manage at scale.',
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'G1.2',
+    },
+    {
+      content: 'Discuss the role of secure configuration baselines for servers and workstations.',
+      answer: 'A complete answer should explain that baselines reduce unnecessary services, standardize protections, and make deviations easier to detect and correct.',
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'G2.2',
+    },
+    {
+      content: 'Explain why segmentation between user networks and server networks is important.',
+      answer: 'A complete answer should describe how separation reduces lateral movement, protects critical assets, and allows different security controls for different zones.',
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'G2.2',
+    },
+    {
+      content: 'Describe how security awareness training can reduce the success of phishing attacks.',
+      answer: 'A complete answer should explain that training helps users recognize suspicious messages, verify requests, and avoid unsafe clicks or credential submission.',
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'G3.1',
+    },
+    {
+      content: 'Analyze the security implications of allowing bring-your-own-device access to internal systems.',
+      answer: 'A complete answer should discuss unmanaged devices, data leakage, inconsistent patching, and the need for device posture checks and access restrictions.',
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'G2.1',
+    },
+    {
+      content: 'Propose an effective incident containment strategy after detecting malware on one workstation.',
+      answer: 'A complete answer should include isolating the infected host, preserving evidence, identifying spread, revoking suspicious access, and monitoring nearby systems.',
+      difficulty: 'HARD',
+      learningOutcomeCode: 'G3.1',
+    },
+    {
+      content: 'Evaluate how zero trust architecture changes the way access decisions are made.',
+      answer: 'A complete answer should explain continuous verification, context-aware access, and minimizing implicit trust between users, devices, and resources.',
+      difficulty: 'HARD',
+      learningOutcomeCode: 'G2.2',
+    },
+    {
+      content: 'Design a secure response process for handling a suspected data breach in a networked system.',
+      answer: 'A complete answer should include detection, escalation, isolation, evidence collection, communication, recovery, and post-incident review.',
+      difficulty: 'HARD',
+      learningOutcomeCode: 'G3.1',
+    },
+    {
+      content: 'Explain how attackers can bypass weak segmentation and why layered controls are still necessary.',
+      answer: 'A complete answer should mention pivoting through allowed paths, exploiting misconfigurations, and the need for authentication, monitoring, and strict policy enforcement.',
+      difficulty: 'HARD',
+      learningOutcomeCode: 'G2.1',
+    },
+    {
+      content: 'Assess the risks of storing sensitive credentials in plain text within internal applications.',
+      answer: 'A complete answer should explain that plain text storage exposes credentials to anyone who gains access, increases compromise impact, and should be replaced with hashing or secure secret storage.',
+      difficulty: 'HARD',
+      learningOutcomeCode: 'G1.1',
+    },
+    {
+      content: 'Propose a full recovery plan after a ransomware attack on a small enterprise network.',
+      answer: 'A complete answer should cover system isolation, backup validation, restoration order, credential resets, communication, and lessons learned to prevent recurrence.',
+      difficulty: 'HARD',
+      learningOutcomeCode: 'G3.1',
+    },
+    {
+      content: 'Discuss how a security operations team can prioritize alerts during a large-scale incident.',
+      answer: 'A complete answer should explain triage by severity, asset criticality, confidence, and blast radius, while coordinating investigation and containment efforts.',
+      difficulty: 'HARD',
+      learningOutcomeCode: 'G3.1',
+    },
+    {
+      content: 'Analyze why role-based access control is easier to govern than ad hoc permission assignment.',
+      answer: 'A complete answer should describe how roles standardize permissions, simplify audits, reduce privilege sprawl, and make administrative review easier.',
+      difficulty: 'HARD',
+      learningOutcomeCode: 'G1.2',
+    },
+    {
+      content: 'Evaluate the security trade-offs of allowing external access to internal services over the internet.',
+      answer: 'A complete answer should discuss convenience versus exposure, the need for strong authentication, network filtering, monitoring, and minimizing publicly reachable services.',
+      difficulty: 'HARD',
+      learningOutcomeCode: 'G2.2',
     },
   ];
 
@@ -212,11 +453,50 @@ async function main() {
 
     if (!existing) {
       await prisma.question.create({
-        data: { ...q, subjectId: subject.id, learningOutcomeId: outcomes[0]?.id ?? null, difficulty: 'MEDIUM' },
+        data: {
+          subjectId: subject.id,
+          type: q.type,
+          content: q.content,
+          answer: q.answer,
+          options: q.options,
+          difficulty: q.difficulty ?? 'MEDIUM',
+          learningOutcomeId: q.type === 'ESSAY' ? outcomeMap.get(q.learningOutcomeCode || '') ?? null : outcomes[0]?.id ?? null,
+          rubric: q.type === 'ESSAY' ? null : undefined,
+          status: 'ACTIVE',
+        },
       });
     }
   }
   console.log(`✅ Created ${sampleQuestions.length} sample questions`);
+
+  const essayQuestionsToCreate = additionalEssayQuestions;
+
+  for (const [index, essay] of essayQuestionsToCreate.entries()) {
+    const existing = await prisma.question.findFirst({
+      where: {
+        subjectId: subject.id,
+        content: essay.content,
+      },
+    });
+
+    if (existing) continue;
+
+    await prisma.question.create({
+      data: {
+        subjectId: subject.id,
+        type: 'ESSAY',
+        content: essay.content,
+        answer: essay.answer,
+        options: null,
+        status: 'ACTIVE',
+        difficulty: essay.difficulty,
+        learningOutcomeId: outcomeMap.get(essay.learningOutcomeCode) ?? null,
+        rubric: `Assess against ${essay.learningOutcomeCode}.`,
+      },
+    });
+  }
+
+  console.log(`✅ Added ${essayQuestionsToCreate.length} additional essay questions`);
 
   // Normalize existing MCQ answers to A/B/C/D if historical data stored answer text.
   const existingMcqs = await prisma.question.findMany({
@@ -264,40 +544,28 @@ async function main() {
       content: string;
       answer: string;
       options: string | null;
-      topic: string;
       difficulty: 'EASY' | 'MEDIUM' | 'HARD';
       learningOutcomeId: number | null;
       rubric: string | null;
       status: 'ACTIVE';
     }> = [];
 
-    const topics = [
-      'Network Security',
-      'Authentication',
-      'Cryptography',
-      'Threat Detection',
-      'Incident Response',
-      'Access Control',
-    ];
-
     for (let i = 0; i < toCreate; i++) {
       const outcome = outcomes[i % outcomes.length];
-      const topic = topics[i % topics.length];
       const difficulty = i % 10 < 5 ? 'EASY' : i % 10 < 9 ? 'MEDIUM' : 'HARD';
 
       if (i % 2 === 0) {
         generatedQuestions.push({
           subjectId: subject.id,
           type: 'MULTIPLE_CHOICE',
-          content: `MCQ ${i + 1}: In ${topic}, which control is the best fit for scenario ${i + 1}?`,
+          content: `MCQ ${i + 1}: Which control is the best fit for scenario ${i + 1}?`,
           answer: 'B',
           options: JSON.stringify([
-            `Distractor for ${topic} scenario ${i + 1} - A`,
-            `Recommended control for ${topic} scenario ${i + 1}`,
-            `Partially correct control for ${topic} scenario ${i + 1}`,
-            `Irrelevant control for ${topic} scenario ${i + 1}`,
+            `Distractor for scenario ${i + 1} - A`,
+            `Recommended control for scenario ${i + 1}`,
+            `Partially correct control for scenario ${i + 1}`,
+            `Irrelevant control for scenario ${i + 1}`,
           ]),
-          topic,
           difficulty,
           learningOutcomeId: outcome?.id ?? null,
           rubric: null,
@@ -307,10 +575,9 @@ async function main() {
         generatedQuestions.push({
           subjectId: subject.id,
           type: 'ESSAY',
-          content: `Essay ${i + 1}: Analyze an incident in ${topic} and propose mitigation strategy ${i + 1}.`,
+          content: `Essay ${i + 1}: Analyze a security incident and propose mitigation strategy ${i + 1}.`,
           answer: 'A complete answer should explain root cause, impact, mitigation steps, and verification plan.',
           options: null,
-          topic,
           difficulty,
           learningOutcomeId: outcome?.id ?? null,
           rubric: 'Score by: technical accuracy (0.4), mitigation quality (0.4), communication clarity (0.2).',

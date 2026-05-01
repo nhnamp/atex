@@ -76,7 +76,6 @@ export interface Question {
   answer: string;
   options?: string | null; // JSON string
   status?: 'ACTIVE' | 'ARCHIVED';
-  topic?: string | null;
   difficulty?: 'EASY' | 'MEDIUM' | 'HARD';
   rubric?: string | null;
   learningOutcomeId?: number | null;
@@ -88,6 +87,7 @@ export interface ExamRequirements {
   total: number;
   multipleChoice: number;
   essay: number;
+  sectionPoints?: { multipleChoice?: number; essay?: number };
   difficultyDistribution?: {
     multipleChoice: { easy: number; medium: number; hard: number };
     essay: { easy: number; medium: number; hard: number };
