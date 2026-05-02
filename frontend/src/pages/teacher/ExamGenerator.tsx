@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Sparkles, Download, BookOpen, AlertCircle, Eye, GripVertical, X, Search, RefreshCw } from 'lucide-react';
 import toast from 'react-hot-toast';
 import Layout from '../../components/Layout';
@@ -8,6 +8,7 @@ import { BuiltExam, Class, ExamRequirements, ExamSession, LearningOutcome, Quest
 
 const TeacherExamGenerator: React.FC = () => {
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const [subjects, setSubjects] = useState<Subject[]>([]);
   const [classes, setClasses] = useState<Class[]>([]);
   const [exams, setExams] = useState<BuiltExam[]>([]);
@@ -64,7 +65,17 @@ const TeacherExamGenerator: React.FC = () => {
         setSubjects(subjectRes.data);
         setClasses(classRes.data);
         setExams(latestDrafts);
-        if (latestDrafts.length > 0) {
+        const requestedExamId = Number.parseInt(searchParams.get('examId') || '', 10);
+        const requestedClassId = Number.parseInt(searchParams.get('classId') || '', 10);
+
+        if (Number.isFinite(requestedClassId) && requestedClassId > 0) {
+          setSelectedClassId(String(requestedClassId));
+        }
+
+        if (Number.isFinite(requestedExamId) && requestedExamId > 0) {
+          setSelectedExamId(requestedExamId);
+          await loadExamDetail(requestedExamId);
+        } else if (latestDrafts.length > 0) {
           setSelectedExamId(latestDrafts[0].id);
         }
         if (subjectRes.data.length > 0) {
@@ -77,12 +88,57 @@ const TeacherExamGenerator: React.FC = () => {
       }
     };
     fetchData();
-  }, []);
+  }, [searchParams]);
 
   const selectedExam = useMemo(
     () => exams.find((item) => item.id === selectedExamId) || null,
     [exams, selectedExamId]
   );
+
+  useEffect(() => {
+    if (!selectedExam) return;
+
+    const parseRequirements = (raw: string): ExamRequirements | null => {
+      try {
+        return JSON.parse(raw) as ExamRequirements;
+      } catch {
+        return null;
+      }
+    };
+
+    const parsedRequirements = parseRequirements(selectedExam.requirements);
+
+    setSelectedSubjectId(String(selectedExam.subjectId));
+    setExamTitle(selectedExam.title);
+    setExamType(selectedExam.examType || 'MIXED');
+    setDurationMinutes(selectedExam.durationMinutes || 60);
+
+    if (parsedRequirements) {
+      setRequirements({
+        total: parsedRequirements.total ?? selectedExam.questions?.length ?? 10,
+        multipleChoice: parsedRequirements.multipleChoice ?? 0,
+        essay: parsedRequirements.essay ?? 0,
+        difficultyDistribution: parsedRequirements.difficultyDistribution ?? {
+          multipleChoice: { easy: 50, medium: 35, hard: 15 },
+          essay: { easy: 50, medium: 35, hard: 15 },
+        },
+      });
+
+      const nextSectionPoints = parsedRequirements.sectionPoints || { multipleChoice: 7, essay: 3 };
+      setSectionPoints({
+        multipleChoice: Number(nextSectionPoints.multipleChoice ?? 7),
+        essay: Number(nextSectionPoints.essay ?? 3),
+      });
+
+      const nextOutcomeRatios: Record<number, number> = {};
+      (parsedRequirements.outcomeRatios || []).forEach((item) => {
+        if (item?.learningOutcomeId) {
+          nextOutcomeRatios[item.learningOutcomeId] = Number(item.ratio || 0);
+        }
+      });
+      setOutcomeRatios(nextOutcomeRatios);
+    }
+  }, [selectedExam]);
 
   useEffect(() => {
     const fetchOutcomes = async () => {
@@ -117,7 +173,13 @@ const TeacherExamGenerator: React.FC = () => {
   const loadExamDetail = async (examId: number) => {
     try {
       const { data } = await api.get<BuiltExam>(`/exams/builder/${examId}`);
-      setExams((prev) => prev.map((item) => (item.id === examId ? data : item)));
+      setExams((prev) => {
+        const exists = prev.some((item) => item.id === examId);
+        if (exists) {
+          return prev.map((item) => (item.id === examId ? data : item));
+        }
+        return [data, ...prev];
+      });
       setSelectedExamId(examId);
     } catch {
       toast.error('Failed to load exam details');
@@ -556,6 +618,7 @@ const TeacherExamGenerator: React.FC = () => {
 
   const selectedSubjectData = subjects.find((s) => s.id === parseInt(selectedSubjectId));
   const totalQuestions = selectedSubjectData?._count?.questions ?? 0;
+  const defaultOutcomeRatio = subjectOutcomes.length > 0 ? 100 / subjectOutcomes.length : 0;
 
   return (
     <Layout>
@@ -668,11 +731,18 @@ const TeacherExamGenerator: React.FC = () => {
           {subjectOutcomes.length > 0 && (
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">Outcome-based Ratio (%)</label>
-              <p className="text-xs text-gray-500 mb-3">Leave all zero to auto split evenly across outcomes.</p>
+              <p className="text-xs text-gray-500 mb-3">
+                {Object.keys(outcomeRatios).length === 0
+                  ? `No manual outcome ratios set. The system will split evenly at ${defaultOutcomeRatio.toFixed(2)}% per outcome.`
+                  : 'Set ratios to total 100%. Leaving some values empty is not recommended.'}
+              </p>
               <div className="space-y-2">
                 {subjectOutcomes.map((outcome) => (
                   <div key={outcome.id} className="border border-gray-200 rounded-md p-2">
                     <p className="text-xs font-medium text-gray-700 mb-2">{outcome.code}</p>
+                    {Object.keys(outcomeRatios).length === 0 && (
+                      <p className="text-[11px] text-gray-500 mb-1">Default: {defaultOutcomeRatio.toFixed(2)}%</p>
+                    )}
                     <div className="grid grid-cols-1 gap-2">
                       <input
                         type="number"
@@ -929,14 +999,25 @@ const TeacherExamGenerator: React.FC = () => {
             ) : (
               <div className="space-y-3">
                 {exams.map((exam) => (
-                  <div key={exam.id} className={`border rounded-lg p-4 ${selectedExamId === exam.id ? 'border-primary-300 bg-primary-50' : 'border-gray-200'}`}>
+                  <div
+                    key={exam.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => loadExamDetail(exam.id)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        void loadExamDetail(exam.id);
+                      }
+                    }}
+                    className={`border rounded-lg p-4 cursor-pointer transition-colors ${selectedExamId === exam.id ? 'border-primary-300 bg-primary-50' : 'border-gray-200 hover:border-primary-200 hover:bg-gray-50'}`}
+                  >
                     <div className="flex flex-wrap items-center gap-2 justify-between">
                       <div>
                         <p className="font-semibold text-gray-900">{exam.title}</p>
                         <p className="text-xs text-gray-500">{exam.subject?.name} • {exam._count?.questions ?? 0} questions • v{exam.version}</p>
                       </div>
-                      <div className="flex gap-2">
-                        <button className="btn-secondary text-xs" onClick={() => loadExamDetail(exam.id)}>Edit Questions</button>
+                      <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
                         <button className="btn-secondary text-xs" onClick={() => handleExport(exam.id)}>Export Exam (.docx)</button>
                         <button className="btn-secondary text-xs" onClick={() => handleExportAnswerKey(exam.id)}>Answer Key</button>
                       </div>
@@ -952,9 +1033,6 @@ const TeacherExamGenerator: React.FC = () => {
                 <div className="flex gap-2 mb-2">
                   <button className="btn-secondary text-xs" onClick={() => loadExamDetail(selectedExam.id)}>
                     <Eye size={14} className="inline mr-1" />View Exam
-                  </button>
-                  <button className="btn-secondary text-xs" onClick={saveExamConfig}>
-                    Save Config
                   </button>
                 </div>
 

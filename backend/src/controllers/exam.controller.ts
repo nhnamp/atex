@@ -2514,6 +2514,7 @@ export const uploadMobileSubmissionScans = async (req: Request, res: Response): 
 export const cloneExamToDraft = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const examId = toInt(req.params.examId);
+    const { title, durationMinutes } = req.body as { title?: string; durationMinutes?: number };
     const source = await prisma.exam.findUnique({
       where: { id: examId },
       include: {
@@ -2535,10 +2536,10 @@ export const cloneExamToDraft = async (req: AuthRequest, res: Response): Promise
         data: {
           subjectId: source.subjectId,
           teacherId: source.teacherId,
-          title: `${source.title} (Copy)`,
+          title: String(title || `${source.title} (Copy)`),
           examType: source.examType,
           examDate: source.examDate,
-          durationMinutes: source.durationMinutes,
+          durationMinutes: Number.isFinite(Number(durationMinutes)) ? Number(durationMinutes) : source.durationMinutes,
           status: 'DRAFT',
           scannablePages: source.scannablePages,
           requirements: source.requirements,
@@ -2571,6 +2572,57 @@ export const cloneExamToDraft = async (req: AuthRequest, res: Response): Promise
   } catch (error) {
     console.error('Clone exam to draft error:', error);
     res.status(500).json({ error: 'Failed to clone exam to draft' });
+  }
+};
+
+export const cloneExamConfigToDraft = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const examId = toInt(req.params.examId);
+    const { title, durationMinutes } = req.body as { title?: string; durationMinutes?: number };
+    const source = await prisma.exam.findUnique({
+      where: { id: examId },
+      include: {
+        questions: {
+          orderBy: { position: 'asc' },
+        },
+      },
+    });
+
+    if (!source || source.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Exam not found' });
+      return;
+    }
+
+    const created = await prisma.$transaction(async (tx) => {
+      await deleteEmptyDraftExams(tx as unknown as PrismaClient, req.user!.id);
+
+      return tx.exam.create({
+        data: {
+          subjectId: source.subjectId,
+          teacherId: source.teacherId,
+          title: String(title || `${source.title} (Config Copy)`),
+          examType: source.examType,
+          examDate: source.examDate,
+          durationMinutes: Number.isFinite(Number(durationMinutes)) ? Number(durationMinutes) : source.durationMinutes,
+          status: 'DRAFT',
+          scannablePages: source.scannablePages,
+          requirements: source.requirements,
+          randomSeed: `${Date.now()}-clone-config-${source.id}`,
+        },
+        include: {
+          subject: { select: { id: true, name: true } },
+          questions: {
+            include: { question: { include: { learningOutcome: true } } },
+            orderBy: { position: 'asc' },
+          },
+        },
+      });
+    });
+
+    res.status(201).json(created);
+  } catch (error) {
+    console.error('Clone exam config to draft error:', error);
+    res.status(500).json({ error: 'Failed to clone exam config to draft' });
   }
 };
 

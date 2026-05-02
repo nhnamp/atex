@@ -1,10 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { AlertTriangle, BarChart3, Camera, CameraOff, CheckCircle2, ClipboardCheck, Download, Eye, RefreshCw, Upload, XCircle } from 'lucide-react';
+import { AlertTriangle, BarChart3, Camera, CameraOff, CheckCircle2, ClipboardCheck, Download, Eye, RefreshCw, Upload, XCircle, Copy, Repeat } from 'lucide-react';
 import Layout from '../../components/Layout';
 import api from '../../api';
-import { BulkUploadResponse, BuiltExam, ExamScanEntry, ExamSession, ExamSubmission, RegradeResponse, SessionIssuesReport } from '../../types';
+import { BulkUploadResponse, BuiltExam, Class, ExamScanEntry, ExamSession, ExamSubmission, LearningOutcome, RegradeResponse, SessionIssuesReport } from '../../types';
 
 type TabKey = 'AI_GRADING' | 'REPORT' | 'EXAM_VIEW';
 
@@ -84,9 +84,25 @@ type SubmissionFeedbackPayload = {
   } | null;
 };
 
+type ExamRequirementsSummary = {
+  total?: number;
+  multipleChoice?: number;
+  essay?: number;
+  difficultyDistribution?: {
+    multipleChoice?: { easy?: number; medium?: number; hard?: number };
+    essay?: { easy?: number; medium?: number; hard?: number };
+  };
+  outcomeRatios?: Array<{
+    learningOutcomeId?: number;
+    ratio?: number;
+  }>;
+};
+
 const TeacherSessionManagement: React.FC = () => {
   const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
   const [sessions, setSessions] = useState<ExamSession[]>([]);
+  const [classes, setClasses] = useState<Class[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
   const [selectedExam, setSelectedExam] = useState<BuiltExam | null>(null);
   const [submissions, setSubmissions] = useState<ExamSubmission[]>([]);
@@ -110,6 +126,12 @@ const TeacherSessionManagement: React.FC = () => {
   const [regradingSubmissionId, setRegradingSubmissionId] = useState<number | null>(null);
   const [expandedSubmissionId, setExpandedSubmissionId] = useState<number | null>(null);
   const [inlineEditScore, setInlineEditScore] = useState<{ submissionId: number; score: string } | null>(null);
+  const [classDialogMode, setClassDialogMode] = useState<'CLONE' | 'REUSE' | null>(null);
+  const [selectedTargetClassId, setSelectedTargetClassId] = useState<string>('');
+  const [transferTitle, setTransferTitle] = useState('');
+  const [transferDuration, setTransferDuration] = useState('');
+  const [transferLoading, setTransferLoading] = useState(false);
+  const [subjectOutcomes, setSubjectOutcomes] = useState<LearningOutcome[]>([]);
 
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const probeCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -126,6 +148,48 @@ const TeacherSessionManagement: React.FC = () => {
     () => submissions.find((item) => item.id === activeSubmissionId) || null,
     [submissions, activeSubmissionId]
   );
+
+  const parsedExamRequirements = useMemo<ExamRequirementsSummary | null>(() => {
+    const raw = selectedExam?.requirements || report?.session?.exam?.requirements;
+    if (typeof raw !== 'string' || !raw.trim()) return null;
+
+    try {
+      return JSON.parse(raw) as ExamRequirementsSummary;
+    } catch {
+      return null;
+    }
+  }, [selectedExam, report]);
+
+  const effectiveOutcomeRatios = useMemo(() => {
+    if (subjectOutcomes.length === 0) return [];
+
+    const configuredRatios = parsedExamRequirements?.outcomeRatios || [];
+    if (configuredRatios.length > 0) {
+      return configuredRatios
+        .filter((item) => Number(item.learningOutcomeId) > 0 && Number(item.ratio) > 0)
+        .map((item) => ({
+          learningOutcomeId: Number(item.learningOutcomeId),
+          ratio: Number(item.ratio),
+        }));
+    }
+
+    const evenRatio = 100 / subjectOutcomes.length;
+    return subjectOutcomes.map((outcome) => ({
+      learningOutcomeId: outcome.id,
+      ratio: evenRatio,
+    }));
+  }, [parsedExamRequirements, subjectOutcomes]);
+
+  const examQuestionStats = useMemo(() => {
+    const questions = selectedExam?.questions || [];
+    const mcq = questions.filter((item) => item.question.type === 'MULTIPLE_CHOICE').length;
+    const essay = questions.filter((item) => item.question.type === 'ESSAY').length;
+
+    return {
+      mcq,
+      essay,
+    };
+  }, [selectedExam]);
 
   const essayQuestionIds = useMemo(
     () => (selectedExam?.questions || []).filter((item) => item.question.type === 'ESSAY').map((item) => item.question.id),
@@ -371,6 +435,18 @@ const TeacherSessionManagement: React.FC = () => {
     }
   };
 
+  const fetchClasses = async () => {
+    try {
+      const { data } = await api.get<Class[]>('/classes');
+      setClasses(data);
+      if (!selectedTargetClassId && data.length > 0) {
+        setSelectedTargetClassId(String(data[0].id));
+      }
+    } catch {
+      toast.error('Failed to load classes');
+    }
+  };
+
   const fetchSessionDetails = async (sessionId: number) => {
     try {
       const [submissionRes, reportRes] = await Promise.all([
@@ -387,6 +463,20 @@ const TeacherSessionManagement: React.FC = () => {
       }
     } catch {
       toast.error('Failed to load session details');
+    }
+  };
+
+  const fetchSubjectOutcomes = async (subjectId?: number) => {
+    if (!subjectId) {
+      setSubjectOutcomes([]);
+      return;
+    }
+
+    try {
+      const { data } = await api.get<LearningOutcome[]>(`/subjects/${subjectId}/outcomes`);
+      setSubjectOutcomes(data);
+    } catch {
+      setSubjectOutcomes([]);
     }
   };
 
@@ -1013,6 +1103,7 @@ const TeacherSessionManagement: React.FC = () => {
 
   useEffect(() => {
     fetchSessions();
+    void fetchClasses();
   }, []);
 
   useEffect(() => {
@@ -1033,6 +1124,10 @@ const TeacherSessionManagement: React.FC = () => {
       fetchSessionDetails(selectedSessionId);
     }
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    void fetchSubjectOutcomes(selectedExam?.subjectId);
+  }, [selectedExam?.subjectId]);
 
   useEffect(() => {
     setActivePassIndex((prev) => Math.min(Math.max(prev, 1), expectedPasses));
@@ -1065,6 +1160,47 @@ const TeacherSessionManagement: React.FC = () => {
       stopCamera();
     };
   }, []);
+
+  const openTransferDialog = (mode: 'CLONE' | 'REUSE') => {
+    if (!selectedExam) return;
+    setClassDialogMode(mode);
+    setTransferTitle(mode === 'CLONE' ? `${selectedExam.title} (Copy)` : `${selectedExam.title} (Config Copy)`);
+    setTransferDuration(String(selectedExam.durationMinutes || 60));
+  };
+
+  const closeTransferDialog = () => {
+    setClassDialogMode(null);
+    setSelectedTargetClassId('');
+    setTransferTitle('');
+    setTransferDuration('');
+    setTransferLoading(false);
+  };
+
+  const executeTransfer = async () => {
+    if (!selectedExam || !selectedTargetClassId || !classDialogMode) {
+      toast.error('Please select a target class');
+      return;
+    }
+
+    setTransferLoading(true);
+    try {
+      const targetClassId = Number(selectedTargetClassId);
+      const endpoint = classDialogMode === 'CLONE'
+        ? `/exams/builder/${selectedExam.id}/clone-draft`
+        : `/exams/builder/${selectedExam.id}/clone-config-draft`;
+      const { data } = await api.post(endpoint, {
+        title: transferTitle.trim() || undefined,
+        durationMinutes: Number.parseInt(transferDuration, 10) || selectedExam.durationMinutes,
+      });
+      toast.success(classDialogMode === 'CLONE' ? 'Exam cloned to a new draft' : 'Exam configuration copied to a new draft');
+      closeTransferDialog();
+      navigate(`/teacher/exams?examId=${data.id}&classId=${targetClassId}`);
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to prepare the draft');
+    } finally {
+      setTransferLoading(false);
+    }
+  };
 
   return (
     <Layout>
@@ -1677,6 +1813,12 @@ const TeacherSessionManagement: React.FC = () => {
             <div className="flex items-center justify-between">
               <h2 className="font-semibold text-gray-900">Session Exam</h2>
               <div className="flex gap-2">
+                <button className="btn-secondary text-xs" onClick={() => openTransferDialog('CLONE')} disabled={!selectedExam}>
+                  <Copy size={14} className="inline mr-1" /> Use This Exam For Another Session
+                </button>
+                <button className="btn-secondary text-xs" onClick={() => openTransferDialog('REUSE')} disabled={!selectedExam}>
+                  <Repeat size={14} className="inline mr-1" /> Use This Config For Another Session
+                </button>
                 <button className="btn-secondary text-xs" onClick={exportExam}>Print Exam</button>
                 <button className="btn-secondary text-xs" onClick={exportAnswerKey}>
                   <Download size={14} className="inline mr-1" />Answer Key
@@ -1686,13 +1828,124 @@ const TeacherSessionManagement: React.FC = () => {
             {!selectedExam || !selectedExam.questions ? (
               <p className="text-sm text-gray-500">No exam loaded.</p>
             ) : (
-              selectedExam.questions.map((item, idx) => (
-                <div key={item.question.id} className="border border-gray-200 rounded-lg p-3">
-                  <p className="text-sm font-medium text-gray-900">Q{idx + 1}. {item.question.content}</p>
-                  <p className="text-xs text-gray-500">{item.question.type}</p>
+              <div className="space-y-4">
+                <div className="grid md:grid-cols-4 gap-3">
+                  <div className="border border-gray-200 rounded-lg p-3">
+                    <p className="text-xs text-gray-500">Multiple Choice</p>
+                    <p className="text-xl font-bold text-blue-700">{examQuestionStats.mcq}</p>
+                  </div>
+                  <div className="border border-gray-200 rounded-lg p-3">
+                    <p className="text-xs text-gray-500">Essay</p>
+                    <p className="text-xl font-bold text-orange-700">{examQuestionStats.essay}</p>
+                  </div>
+                  <div className="border border-gray-200 rounded-lg p-3">
+                    <p className="text-xs text-gray-500">Difficulty Mix</p>
+                    <p className="text-sm font-medium text-gray-900">
+                      MCQ {parsedExamRequirements?.difficultyDistribution?.multipleChoice ? `${parsedExamRequirements.difficultyDistribution.multipleChoice.easy ?? 0}/${parsedExamRequirements.difficultyDistribution.multipleChoice.medium ?? 0}/${parsedExamRequirements.difficultyDistribution.multipleChoice.hard ?? 0}` : 'n/a'}
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      Essay {parsedExamRequirements?.difficultyDistribution?.essay ? `${parsedExamRequirements.difficultyDistribution.essay.easy ?? 0}/${parsedExamRequirements.difficultyDistribution.essay.medium ?? 0}/${parsedExamRequirements.difficultyDistribution.essay.hard ?? 0}` : 'n/a'}
+                    </p>
+                  </div>
+                  <div className="border border-gray-200 rounded-lg p-3">
+                    <p className="text-xs text-gray-500">Outcome Allocation</p>
+                    <p className="text-sm font-medium text-gray-900">{effectiveOutcomeRatios.length > 0 ? `${effectiveOutcomeRatios.length} outcomes` : 'Not configured'}</p>
+                    {effectiveOutcomeRatios.length > 0 && !parsedExamRequirements?.outcomeRatios?.length && (
+                      <p className="text-xs text-gray-500">Default even split applied automatically.</p>
+                    )}
+                  </div>
                 </div>
-              ))
+
+                {effectiveOutcomeRatios.length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {effectiveOutcomeRatios.map((item, idx) => (
+                      <span key={`${item.learningOutcomeId || idx}`} className="rounded-full bg-primary-50 border border-primary-200 px-3 py-1 text-xs text-primary-700">
+                        LO {item.learningOutcomeId ?? idx + 1}: {(Math.round(item.ratio * 100) / 100).toFixed(2)}%
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                <div className="space-y-2">
+                  {selectedExam.questions.map((item, idx) => (
+                    <div key={item.question.id} className="border border-gray-200 rounded-lg p-3">
+                      <p className="text-sm font-medium text-gray-900">Q{idx + 1}. {item.question.content}</p>
+                      <p className="text-xs text-gray-500">{item.question.type}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
             )}
+          </div>
+        )}
+
+        {classDialogMode && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
+            <div className="w-full max-w-lg rounded-xl bg-white p-5 shadow-2xl space-y-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900">
+                    {classDialogMode === 'CLONE' ? 'Clone Exam' : 'Reuse Config'}
+                  </h3>
+                  <p className="text-sm text-gray-500">
+                    {classDialogMode === 'CLONE'
+                      ? 'Choose the target class. The new draft will keep all questions from this session.'
+                      : 'Choose the target class. The new draft will keep the exam structure but start with an empty question list.'}
+                  </p>
+                </div>
+                <button className="btn-secondary text-xs" onClick={closeTransferDialog} disabled={transferLoading}>
+                  Close
+                </button>
+              </div>
+
+              <div className="space-y-2">
+                <label className="block text-sm font-medium text-gray-700">Target class</label>
+                <select
+                  className="input-field"
+                  value={selectedTargetClassId}
+                  onChange={(e) => setSelectedTargetClassId(e.target.value)}
+                  disabled={transferLoading}
+                >
+                  <option value="">-- Select class --</option>
+                  {classes.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="grid md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-700">Exam title</label>
+                  <input
+                    className="input-field"
+                    value={transferTitle}
+                    onChange={(e) => setTransferTitle(e.target.value)}
+                    placeholder="Enter exam title"
+                    disabled={transferLoading}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-700">Duration (minutes)</label>
+                  <input
+                    className="input-field"
+                    type="number"
+                    min={15}
+                    value={transferDuration}
+                    onChange={(e) => setTransferDuration(e.target.value)}
+                    disabled={transferLoading}
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2">
+                <button className="btn-secondary" onClick={closeTransferDialog} disabled={transferLoading}>Cancel</button>
+                <button className="btn-primary" onClick={executeTransfer} disabled={transferLoading || !selectedTargetClassId}>
+                  {transferLoading ? 'Preparing...' : 'Continue to Exam Builder'}
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </div>

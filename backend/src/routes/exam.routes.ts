@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import {
   cloneExamToDraft,
+  cloneExamConfigToDraft,
   completeScanningAndAutoGrade,
   createSessionMobileScanLink,
   createExamDraft,
@@ -68,6 +69,7 @@ router.use(authenticate, requireApproved);
 router.get('/builder', requireRole('TEACHER'), listExams);
 router.post('/builder', requireRole('TEACHER'), createExamDraft);
 router.post('/builder/:examId/clone-draft', requireRole('TEACHER'), cloneExamToDraft);
+router.post('/builder/:examId/clone-config-draft', requireRole('TEACHER'), cloneExamConfigToDraft);
 router.get('/builder/:examId', requireRole('TEACHER'), getExamById);
 router.get('/builder/:examId/preview', requireRole('TEACHER'), getExamPreview);
 router.patch('/builder/:examId/configuration', requireRole('TEACHER'), updateExamConfiguration);
