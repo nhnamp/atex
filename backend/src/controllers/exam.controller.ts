@@ -2593,10 +2593,81 @@ export const cloneExamConfigToDraft = async (req: AuthRequest, res: Response): P
       return;
     }
 
+    // Validate requirements exist on source
+    const parsedReq = parseExamRequirements(source.requirements || '{}') as ExamRequirements;
+    const requirementsError = validateRequirements(parsedReq as ExamRequirements);
+    if (requirementsError) {
+      res.status(400).json({ error: `Invalid requirements on source exam: ${requirementsError}` });
+      return;
+    }
+
     const created = await prisma.$transaction(async (tx) => {
       await deleteEmptyDraftExams(tx as unknown as PrismaClient, req.user!.id);
 
-      return tx.exam.create({
+      const randomSeed = `${Date.now()}-clone-config-${source.id}`;
+
+      // Fetch all candidate questions for the subject
+      const rawQuestions = await tx.question.findMany({
+        where: { subjectId: source.subjectId, status: 'ACTIVE' },
+        select: {
+          id: true,
+          type: true,
+          difficulty: true,
+          learningOutcomeId: true,
+          content: true,
+          answer: true,
+          options: true,
+        },
+      });
+
+      const allQuestions: QuestionPoolItem[] = (rawQuestions || [])
+        .filter((q) => q.type === 'MULTIPLE_CHOICE' || q.type === 'ESSAY')
+        .map((q) => ({ ...q, difficulty: normalizeDifficultyLabel(q.difficulty) }));
+
+      // Pick questions according to requirements (may throw if insufficient)
+      let selectedQuestions: QuestionPoolItem[];
+      try {
+        selectedQuestions = pickQuestionsByRequirements(allQuestions, parsedReq as ExamRequirements, randomSeed);
+      } catch (err) {
+        throw createHttpError(400, (err as Error).message);
+      }
+
+      // Build scan blueprint from the selected questions and normalize scannable pages
+      const scanBlueprint = buildExamScanBlueprint(
+        selectedQuestions
+          .filter((item) => item.type === 'MULTIPLE_CHOICE')
+          .map((item) => ({
+            id: item.id,
+            type: item.type,
+            content: item.content || '',
+            answer: item.answer || '',
+            options: item.options || null,
+          })),
+        selectedQuestions
+          .filter((item) => item.type === 'ESSAY')
+          .map((item) => ({
+            id: item.id,
+            type: item.type,
+            content: item.content || '',
+            answer: item.answer || '',
+            options: item.options || null,
+          }))
+      );
+
+      const normalizedScannablePages = normalizePositiveInt(scanBlueprint.scannablePages, 1);
+
+      // Merge scanBlueprint into requirements to persist
+      const requirementsWithScanBlueprint: ExamRequirements = {
+        ...parsedReq,
+        scannablePages: normalizedScannablePages,
+        scanBlueprint: {
+          ...scanBlueprint,
+          scannablePages: normalizedScannablePages,
+        },
+      };
+
+      // Create exam row with JSON-stringified requirements (same as createExamDraft)
+      const exam = await tx.exam.create({
         data: {
           subjectId: source.subjectId,
           teacherId: source.teacherId,
@@ -2605,10 +2676,39 @@ export const cloneExamConfigToDraft = async (req: AuthRequest, res: Response): P
           examDate: source.examDate,
           durationMinutes: Number.isFinite(Number(durationMinutes)) ? Number(durationMinutes) : source.durationMinutes,
           status: 'DRAFT',
-          scannablePages: source.scannablePages,
-          requirements: source.requirements,
-          randomSeed: `${Date.now()}-clone-config-${source.id}`,
+          scannablePages: normalizedScannablePages,
+          requirements: JSON.stringify(requirementsWithScanBlueprint),
+          randomSeed,
         },
+      });
+
+      // Determine sectionPoints (reuse same logic as createExamDraft)
+      const sectionPoints = (parsedReq && (parsedReq as any).sectionPoints)
+        ? (parsedReq as any).sectionPoints
+        : { multipleChoice: 7, essay: 3 };
+
+      const mcqCount = selectedQuestions.filter((sq) => sq.type === 'MULTIPLE_CHOICE').length;
+      const essayCount = selectedQuestions.filter((sq) => sq.type === 'ESSAY').length;
+
+      await tx.examQuestion.createMany({
+        data: selectedQuestions.map((q, idx) => {
+          const isMcq = q.type === 'MULTIPLE_CHOICE';
+          const totalObjective = mcqCount > 0 ? Number(sectionPoints.multipleChoice ?? 7) : 0;
+          const totalEssay = mcqCount > 0 ? Number(sectionPoints.essay ?? 3) : Number(sectionPoints.essay ?? 10);
+          const pts = isMcq
+            ? mcqCount > 0 ? Number((totalObjective / mcqCount).toFixed(4)) : 0
+            : essayCount > 0 ? Number((totalEssay / essayCount).toFixed(4)) : 0;
+          return {
+            examId: exam.id,
+            questionId: q.id,
+            position: idx + 1,
+            points: pts,
+          };
+        }),
+      });
+
+      return tx.exam.findUnique({
+        where: { id: exam.id },
         include: {
           subject: { select: { id: true, name: true } },
           questions: {
@@ -2621,6 +2721,11 @@ export const cloneExamConfigToDraft = async (req: AuthRequest, res: Response): P
 
     res.status(201).json(created);
   } catch (error) {
+    if ((error as any).statusCode === 400 || (error as any).message) {
+      console.error('Clone exam config to draft error:', error);
+      res.status((error as any).statusCode || 400).json({ error: (error as any).message || 'Failed to clone exam config to draft' });
+      return;
+    }
     console.error('Clone exam config to draft error:', error);
     res.status(500).json({ error: 'Failed to clone exam config to draft' });
   }
