@@ -262,7 +262,10 @@ export const getSessionRecords = async (req: AuthRequest, res: Response): Promis
       },
     });
 
-    const recordMap = new Map(records.map((r: { studentId: number; isPresent: boolean }) => [r.studentId, r]));
+    const recordMap = new Map<number, { isPresent: boolean }>();
+    for (const record of records as { studentId: number; isPresent: boolean }[]) {
+      recordMap.set(record.studentId, { isPresent: record.isPresent });
+    }
     const result = allStudents.map((item: { student: { id: number; username: string; fullName: string } }) => {
       const student = item.student;
       const record = recordMap.get(student.id);
