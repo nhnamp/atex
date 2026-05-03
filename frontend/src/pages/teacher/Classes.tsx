@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { Users, ChevronRight, Trash2 } from 'lucide-react';
+import { Users, ChevronRight } from 'lucide-react';
 import toast from 'react-hot-toast';
 import Layout from '../../components/Layout';
 import LoadingSpinner from '../../components/LoadingSpinner';
@@ -24,17 +24,6 @@ const TeacherClasses: React.FC = () => {
   };
 
   useEffect(() => { fetchClasses(); }, []);
-
-  const handleDelete = async (id: number, name: string) => {
-    if (!confirm(`Delete class "${name}"? This cannot be undone.`)) return;
-    try {
-      await api.delete(`/classes/${id}`);
-      toast.success('Class deleted');
-      fetchClasses();
-    } catch (err: any) {
-      toast.error(err?.response?.data?.error || 'Failed to delete');
-    }
-  };
 
   return (
     <Layout>
@@ -60,12 +49,6 @@ const TeacherClasses: React.FC = () => {
                   <div className="w-10 h-10 rounded-lg bg-primary-100 flex items-center justify-center">
                     <Users size={20} className="text-primary-600" />
                   </div>
-                  <button
-                    onClick={() => handleDelete(cls.id, cls.name)}
-                    className="opacity-0 group-hover:opacity-100 text-gray-400 hover:text-red-500 transition-all"
-                  >
-                    <Trash2 size={16} />
-                  </button>
                 </div>
                 <h3 className="font-semibold text-gray-900 mb-1">{cls.name}</h3>
                 {cls.description && (

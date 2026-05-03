@@ -154,8 +154,7 @@ export const deleteClass = async (req: AuthRequest, res: Response): Promise<void
       res.status(404).json({ error: 'Class not found' });
       return;
     }
-    // Admin can delete any class; teacher only their own
-    if (req.user!.role !== 'ADMIN' && cls.teacherId !== req.user!.id) {
+    if (req.user!.role !== 'ADMIN') {
       res.status(403).json({ error: 'Access denied' });
       return;
     }

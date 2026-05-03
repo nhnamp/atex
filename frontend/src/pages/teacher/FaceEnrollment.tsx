@@ -24,6 +24,7 @@ const FaceEnrollment: React.FC = () => {
   const [enrolling, setEnrolling] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const MAX_PHOTOS = 1;
 
   const fetchStudents = useCallback(async () => {
     try {
@@ -97,10 +98,10 @@ const FaceEnrollment: React.FC = () => {
 
     const newDescriptors = [...capturedDescriptors, Array.from(descriptor)];
     setCapturedDescriptors(newDescriptors);
-    toast.success(`Photo ${newDescriptors.length}/3 captured ✅`);
+    toast.success(`Photo ${newDescriptors.length}/${MAX_PHOTOS} captured ✅`);
 
-    if (newDescriptors.length >= 3) {
-      // Auto-stop camera after 3 captures
+    if (newDescriptors.length >= MAX_PHOTOS) {
+      // Auto-stop camera after reaching capture limit
       stopCamera();
     }
   };
@@ -183,7 +184,7 @@ const FaceEnrollment: React.FC = () => {
                   Enrolling: {selectedStudent.student.fullName}
                 </h2>
                 <p className="text-sm text-gray-500">
-                  {selectedStudent.student.username} — Capture 3 photos from different angles
+                  {selectedStudent.student.username} — Capture 1 photo
                 </p>
               </div>
               <button onClick={handleCancel} className="text-gray-400 hover:text-gray-600">
@@ -208,18 +209,18 @@ const FaceEnrollment: React.FC = () => {
             </div>
 
             <div className="flex items-center gap-4">
-              {capturing && capturedDescriptors.length < 3 && (
+              {capturing && capturedDescriptors.length < MAX_PHOTOS && (
                 <button
                   onClick={handleCapture}
                   disabled={!modelsReady}
                   className="btn-primary flex items-center gap-2"
                 >
                   <Camera size={16} />
-                  Capture Photo ({capturedDescriptors.length}/3)
+                  Capture Photo ({capturedDescriptors.length}/{MAX_PHOTOS})
                 </button>
               )}
 
-              {!capturing && capturedDescriptors.length < 3 && (
+              {!capturing && capturedDescriptors.length < MAX_PHOTOS && (
                 <button onClick={startCamera} className="btn-secondary flex items-center gap-2">
                   <Camera size={16} /> Resume Camera
                 </button>
@@ -238,7 +239,7 @@ const FaceEnrollment: React.FC = () => {
 
               {/* Progress dots */}
               <div className="flex gap-2 ml-auto">
-                {[0, 1, 2].map((i) => (
+                {Array.from({ length: MAX_PHOTOS }).map((_, i) => (
                   <div
                     key={i}
                     className={`w-4 h-4 rounded-full transition-all ${

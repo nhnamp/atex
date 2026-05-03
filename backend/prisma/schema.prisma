@@ -73,6 +73,7 @@ model AttendanceSession {
   id        Int      @id @default(autoincrement())
   classId   Int
   class     Class    @relation(fields: [classId], references: [id])
+  name      String?
   codes     String   // JSON: ["123456","654321","111222"]
   method    String   @default("CODE") // CODE | FACE
   status    String   @default("ACTIVE") // ACTIVE | COMPLETED

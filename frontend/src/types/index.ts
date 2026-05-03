@@ -23,6 +23,7 @@ export interface AttendanceSession {
   id: number;
   classId: number;
   class?: Class;
+  name?: string | null;
   status: 'ACTIVE' | 'COMPLETED';
   method?: 'CODE' | 'FACE';
   startedAt: string;
