@@ -24,14 +24,14 @@ async function cascadeDeleteUser(id: number): Promise<void> {
     if (user.role === 'TEACHER') {
       // For teachers: delete their classes' related data, then classes, then subjects
       const teacherClasses = await tx.class.findMany({ where: { teacherId: id }, select: { id: true } });
-      const classIds = teacherClasses.map(c => c.id);
+      const classIds = teacherClasses.map((c: { id: number }) => c.id);
 
       if (classIds.length > 0) {
         // Delete attendance records of sessions in these classes
         const sessions = await tx.attendanceSession.findMany({
           where: { classId: { in: classIds } }, select: { id: true },
         });
-        const sessionIds = sessions.map(s => s.id);
+        const sessionIds = sessions.map((s: { id: number }) => s.id);
         if (sessionIds.length > 0) {
           await tx.attendanceRecord.deleteMany({ where: { sessionId: { in: sessionIds } } });
         }
@@ -42,7 +42,7 @@ async function cascadeDeleteUser(id: number): Promise<void> {
 
       // Delete subjects and their questions
       const subjects = await tx.subject.findMany({ where: { teacherId: id }, select: { id: true } });
-      const subjectIds = subjects.map(s => s.id);
+      const subjectIds = subjects.map((s: { id: number }) => s.id);
       if (subjectIds.length > 0) {
         await tx.question.deleteMany({ where: { subjectId: { in: subjectIds } } });
         await tx.subject.deleteMany({ where: { teacherId: id } });
