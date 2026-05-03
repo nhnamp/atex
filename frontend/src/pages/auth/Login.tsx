@@ -10,17 +10,21 @@ const Login: React.FC = () => {
   const [form, setForm] = useState({ username: '', password: '' });
   const [showPass, setShowPass] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
+    setErrorMessage('');
     try {
       await login(form.username, form.password);
       toast.success('Welcome back!');
       // navigate based on role happens in App.tsx via redirect
       navigate('/');
     } catch (err: any) {
-      toast.error(err?.response?.data?.error || 'Login failed');
+      const message = err?.response?.data?.error || 'Login failed';
+      setErrorMessage(message);
+      toast.error(message);
     } finally {
       setLoading(false);
     }
@@ -52,7 +56,10 @@ const Login: React.FC = () => {
                 className="input-field"
                 placeholder="Enter your username"
                 value={form.username}
-                onChange={(e) => setForm({ ...form, username: e.target.value })}
+                onChange={(e) => {
+                  setForm({ ...form, username: e.target.value });
+                  if (errorMessage) setErrorMessage('');
+                }}
                 required
               />
             </div>
@@ -67,7 +74,10 @@ const Login: React.FC = () => {
                   className="input-field pr-10"
                   placeholder="Enter your password"
                   value={form.password}
-                  onChange={(e) => setForm({ ...form, password: e.target.value })}
+                  onChange={(e) => {
+                    setForm({ ...form, password: e.target.value });
+                    if (errorMessage) setErrorMessage('');
+                  }}
                   required
                 />
                 <button
@@ -79,6 +89,12 @@ const Login: React.FC = () => {
                 </button>
               </div>
             </div>
+
+            {errorMessage && (
+              <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                {errorMessage}
+              </div>
+            )}
 
             <button
               type="submit"

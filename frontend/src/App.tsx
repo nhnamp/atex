@@ -21,10 +21,12 @@ import TeacherFaceEnrollment from './pages/teacher/FaceEnrollment';
 import TeacherFaceAttendance from './pages/teacher/FaceAttendance';
 import TeacherSessionResults from './pages/teacher/SessionResults';
 import TeacherAttendanceSummary from './pages/teacher/AttendanceSummary';
+import TeacherAccount from './pages/teacher/Account';
 
 // Student pages
 import StudentDashboard from './pages/student/Dashboard';
 import StudentClassDetail from './pages/student/ClassDetail';
+import StudentAccount from './pages/student/Account';
 
 function RootRedirect() {
   const { user, loading } = useAuth();
@@ -59,12 +61,14 @@ function AppRoutes() {
         <Route path="/teacher/subjects" element={<TeacherSubjects />} />
         <Route path="/teacher/subjects/:subjectId/questions" element={<TeacherQuestions />} />
         <Route path="/teacher/exams" element={<TeacherExamGenerator />} />
+        <Route path="/teacher/account" element={<TeacherAccount />} />
       </Route>
 
       {/* Student */}
       <Route element={<ProtectedRoute role="STUDENT" />}>
         <Route path="/student" element={<StudentDashboard />} />
         <Route path="/student/classes/:id" element={<StudentClassDetail />} />
+        <Route path="/student/account" element={<StudentAccount />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />
