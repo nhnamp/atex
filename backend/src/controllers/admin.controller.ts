@@ -1,5 +1,5 @@
 import { Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { Prisma, PrismaClient } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import * as XLSX from 'xlsx';
 import { AuthRequest } from '../middleware/auth';
@@ -8,7 +8,7 @@ const prisma = new PrismaClient();
 
 // ── Helper: cascade-delete a user by cleaning up all relations first ──
 async function cascadeDeleteUser(id: number): Promise<void> {
-  await prisma.$transaction(async (tx) => {
+  await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     const user = await tx.user.findUnique({ where: { id } });
     if (!user) throw new Error('User not found');
 

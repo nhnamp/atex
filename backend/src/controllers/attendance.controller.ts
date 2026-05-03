@@ -51,7 +51,7 @@ export const getClassAttendanceSummary = async (req: AuthRequest, res: Response)
     });
 
     const records = await prisma.attendanceRecord.findMany({
-      where: { sessionId: { in: sessions.map((s) => s.id) } },
+      where: { sessionId: { in: sessions.map((s: { id: number }) => s.id) } },
       select: { sessionId: true, studentId: true, isPresent: true },
     });
 
@@ -60,7 +60,7 @@ export const getClassAttendanceSummary = async (req: AuthRequest, res: Response)
       recordMap.set(`${record.sessionId}:${record.studentId}`, { isPresent: record.isPresent });
     }
 
-    const sessionSummaries = sessions.map((s) => ({
+    const sessionSummaries = sessions.map((s: { id: number; name?: string | null; status: string; startedAt: Date }) => ({
       id: s.id,
       name: (s as { name?: string | null }).name || formatSessionName(s.startedAt),
       status: s.status,
@@ -69,11 +69,12 @@ export const getClassAttendanceSummary = async (req: AuthRequest, res: Response)
 
     const totalLessons = sessions.length;
 
-    const studentSummaries = students.map(({ student }) => {
+    const studentSummaries = students.map((item: { student: { id: number; username: string; fullName: string } }) => {
+      const student = item.student;
       let present = 0;
-      const details = sessions.map((s) => {
+      const details = sessions.map((s: { id: number; status: string }) => {
         const key = `${s.id}:${student.id}`;
-        const record = recordMap.get(key);
+        const record = recordMap.get(key) as { isPresent: boolean } | undefined;
 
         if (s.status === 'ACTIVE') {
           return { sessionId: s.id, status: 'ACTIVE' } as const;
@@ -261,8 +262,9 @@ export const getSessionRecords = async (req: AuthRequest, res: Response): Promis
       },
     });
 
-    const recordMap = new Map(records.map((r) => [r.studentId, r]));
-    const result = allStudents.map(({ student }) => {
+    const recordMap = new Map(records.map((r: { studentId: number; isPresent: boolean }) => [r.studentId, r]));
+    const result = allStudents.map((item: { student: { id: number; username: string; fullName: string } }) => {
+      const student = item.student;
       const record = recordMap.get(student.id);
       return {
         student,
@@ -402,7 +404,7 @@ export const submitFaceAttendance = async (req: AuthRequest, res: Response): Pro
         studentId: { in: studentIds.map((id: number) => parseInt(String(id))) },
       },
     });
-    const enrolledIds = new Set(enrolledStudents.map((e) => e.studentId));
+    const enrolledIds = new Set(enrolledStudents.map((e: { studentId: number }) => e.studentId));
 
     const results: { studentId: number; marked: boolean }[] = [];
 

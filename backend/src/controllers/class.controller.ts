@@ -75,7 +75,7 @@ export const createClass = async (req: AuthRequest, res: Response): Promise<void
 
 export const getClassById = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id));
     const cls = await prisma.class.findUnique({
       where: { id },
       include: {
@@ -105,7 +105,7 @@ export const getClassById = async (req: AuthRequest, res: Response): Promise<voi
     }
 
     if (req.user!.role === 'STUDENT') {
-      const enrolled = cls.students.some((s) => s.studentId === req.user!.id);
+      const enrolled = cls.students.some((s: { studentId: number }) => s.studentId === req.user!.id);
       if (!enrolled) {
         res.status(403).json({ error: 'Access denied' });
         return;
@@ -121,7 +121,7 @@ export const getClassById = async (req: AuthRequest, res: Response): Promise<voi
 
 export const updateClass = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id));
     const cls = await prisma.class.findUnique({ where: { id } });
 
     if (!cls) {
@@ -147,7 +147,7 @@ export const updateClass = async (req: AuthRequest, res: Response): Promise<void
 
 export const deleteClass = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id));
     const cls = await prisma.class.findUnique({ where: { id } });
 
     if (!cls) {
@@ -169,7 +169,7 @@ export const deleteClass = async (req: AuthRequest, res: Response): Promise<void
 
 export const addStudents = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const classId = parseInt(req.params.id);
+    const classId = parseInt(String(req.params.id));
     const { studentIds } = req.body as { studentIds: string[] };
 
     if (!studentIds || !Array.isArray(studentIds) || studentIds.length === 0) {
@@ -224,8 +224,8 @@ export const addStudents = async (req: AuthRequest, res: Response): Promise<void
 
 export const removeStudent = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const classId = parseInt(req.params.id);
-    const studentId = parseInt(req.params.studentId);
+    const classId = parseInt(String(req.params.id));
+    const studentId = parseInt(String(req.params.studentId));
 
     const cls = await prisma.class.findUnique({ where: { id: classId } });
     if (!cls) {
@@ -262,7 +262,7 @@ export const getStudentClasses = async (req: AuthRequest, res: Response): Promis
         },
       },
     });
-    res.json(enrollments.map((e) => e.class));
+    res.json(enrollments.map((e: { class: unknown }) => e.class));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Internal server error' });
@@ -271,7 +271,7 @@ export const getStudentClasses = async (req: AuthRequest, res: Response): Promis
 
 export const addStudentsByClass = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const courseId = parseInt(req.params.id as string);
+    const courseId = parseInt(String(req.params.id));
     const { studentClassId } = req.body;
 
     if (!studentClassId) {

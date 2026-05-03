@@ -50,9 +50,9 @@ export const generateExam = async (req: AuthRequest, res: Response): Promise<voi
     }
 
     // Check availability per type
-    const mcQuestions = allQuestions.filter((q) => q.type === 'MULTIPLE_CHOICE');
-    const essayQuestions = allQuestions.filter((q) => q.type === 'ESSAY');
-    const tfQuestions = allQuestions.filter((q) => q.type === 'TRUE_FALSE');
+    const mcQuestions = allQuestions.filter((q: { type: string }) => q.type === 'MULTIPLE_CHOICE');
+    const essayQuestions = allQuestions.filter((q: { type: string }) => q.type === 'ESSAY');
+    const tfQuestions = allQuestions.filter((q: { type: string }) => q.type === 'TRUE_FALSE');
 
     if (mcQuestions.length < multipleChoice) {
       res.status(400).json({ error: `Not enough multiple choice questions (need ${multipleChoice}, have ${mcQuestions.length})` });
@@ -71,7 +71,7 @@ export const generateExam = async (req: AuthRequest, res: Response): Promise<voi
     let selectedQuestions;
     try {
       const selectedIds = await selectQuestionsWithAI(allQuestions, requirements);
-      selectedQuestions = allQuestions.filter((q) => selectedIds.includes(q.id));
+      selectedQuestions = allQuestions.filter((q: { id: number }) => selectedIds.includes(q.id));
 
       // Fallback if AI doesn't return enough
       if (selectedQuestions.length < total) {

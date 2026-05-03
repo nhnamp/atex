@@ -6,7 +6,7 @@ const prisma = new PrismaClient();
 
 export const getQuestionsBySubject = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const subjectId = parseInt(req.params.subjectId);
+    const subjectId = parseInt(String(req.params.subjectId));
     const subject = await prisma.subject.findUnique({ where: { id: subjectId } });
 
     if (!subject || subject.teacherId !== req.user!.id) {
@@ -40,7 +40,7 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const subject = await prisma.subject.findUnique({ where: { id: parseInt(subjectId) } });
+    const subject = await prisma.subject.findUnique({ where: { id: subjectId } });
     if (!subject || subject.teacherId !== req.user!.id) {
       res.status(404).json({ error: 'Subject not found' });
       return;
@@ -53,7 +53,7 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
 
     const question = await prisma.question.create({
       data: {
-        subjectId: parseInt(subjectId),
+        subjectId,
         type,
         content,
         answer,
@@ -70,7 +70,7 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
 
 export const updateQuestion = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id));
     const question = await prisma.question.findUnique({
       where: { id },
       include: { subject: true },
@@ -101,7 +101,7 @@ export const updateQuestion = async (req: AuthRequest, res: Response): Promise<v
 
 export const deleteQuestion = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(req.params.id);
+    const id = parseInt(String(req.params.id));
     const question = await prisma.question.findUnique({
       where: { id },
       include: { subject: true },

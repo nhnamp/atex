@@ -61,7 +61,7 @@ export const enrollFace = async (req: AuthRequest, res: Response): Promise<void>
  */
 export const getClassDescriptors = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const classId = parseInt(req.params.classId);
+    const classId = parseInt(String(req.params.classId));
 
     // Verify teacher owns this class
     const cls = await prisma.class.findUnique({ where: { id: classId } });
@@ -80,7 +80,7 @@ export const getClassDescriptors = async (req: AuthRequest, res: Response): Prom
       },
     });
 
-    const studentIds = classStudents.map((cs) => cs.student.id);
+    const studentIds = classStudents.map((cs: { student: { id: number } }) => cs.student.id);
 
     // Get all face descriptors for these students
     const allDescriptors = await prisma.faceDescriptor.findMany({
@@ -95,10 +95,10 @@ export const getClassDescriptors = async (req: AuthRequest, res: Response): Prom
       descriptorMap.set(fd.studentId, arr);
     }
 
-    const result = classStudents.map(({ student }) => ({
-      student,
-      descriptors: descriptorMap.get(student.id) || [],
-      enrolled: descriptorMap.has(student.id),
+    const result = classStudents.map((item: { student: { id: number; username: string; fullName: string } }) => ({
+      student: item.student,
+      descriptors: descriptorMap.get(item.student.id) || [],
+      enrolled: descriptorMap.has(item.student.id),
     }));
 
     res.json(result);
@@ -113,7 +113,7 @@ export const getClassDescriptors = async (req: AuthRequest, res: Response): Prom
  */
 export const deleteFaceData = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const studentId = parseInt(req.params.studentId);
+    const studentId = parseInt(String(req.params.studentId));
 
     const deleted = await prisma.faceDescriptor.deleteMany({ where: { studentId } });
 
@@ -133,7 +133,7 @@ export const deleteFaceData = async (req: AuthRequest, res: Response): Promise<v
  */
 export const getFaceStatus = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const studentId = parseInt(req.params.studentId);
+    const studentId = parseInt(String(req.params.studentId));
 
     const count = await prisma.faceDescriptor.count({ where: { studentId } });
 
