@@ -3,7 +3,6 @@ import { PrismaClient } from '@prisma/client';
 import { AuthRequest } from '../middleware/auth';
 import {
   extractAndGradeSubmissionFromScansBatch,
-  extractStudentIdentityFromScan,
   getGeminiErrorStatusCode,
   computeMultiStudentBatchSize,
   extractAndGradeMultiStudentBatch,
@@ -18,7 +17,7 @@ import {
 } from '../services/docx.service';
 import { uploadImageToCloudinary, uploadPdfToCloudinary } from '../services/cloudinary.service';
 import { mergeImagesToPdfBuffer } from '../services/pdf.service';
-import { calibrateOmrTemplate, detectDocumentForOmr, detectMarkedOptions, OmrTemplate } from '../services/omr.service';
+import { calibrateOmrTemplate, detectDocumentForOmr, detectMarkedOptions, extractStudentIdentityFromOmr, OmrTemplate } from '../services/omr.service';
 import { preprocessScanForAnalysis } from '../services/image-preprocess.service';
 import { config } from '../config';
 import jwt from 'jsonwebtoken';
@@ -155,6 +154,14 @@ const deleteEmptyDraftExams = async (tx: any, teacherId: number): Promise<void> 
   if (deletableIds.length > 0) {
     await tx.exam.deleteMany({ where: { id: { in: deletableIds } } });
   }
+};
+
+const sortUploadedScanFiles = (files: Express.Multer.File[]): Express.Multer.File[] => {
+  return [...files].sort((left, right) => {
+    const leftName = String(left.originalname || left.filename || '');
+    const rightName = String(right.originalname || right.filename || '');
+    return leftName.localeCompare(rightName, undefined, { numeric: true, sensitivity: 'base' });
+  });
 };
 
 const MOBILE_SCAN_SCOPE = 'exam_mobile_scan';
@@ -483,6 +490,20 @@ const normalizeStudentCode = (value: unknown): string => {
     .replace(/\s+/g, '');
 };
 
+const matchesStudentCodePattern = (studentCode: string, candidatePattern: string): boolean => {
+  if (!candidatePattern || candidatePattern.length !== studentCode.length) {
+    return false;
+  }
+
+  for (let index = 0; index < candidatePattern.length; index += 1) {
+    const expectedChar = candidatePattern[index];
+    if (expectedChar === '?') continue;
+    if (expectedChar !== studentCode[index]) return false;
+  }
+
+  return true;
+};
+
 const resolveStudentFromIdentity = (
   students: StudentIdentity[],
   identity: { studentCode: string | null; fullName: string | null }
@@ -491,7 +512,10 @@ const resolveStudentFromIdentity = (
   const normalizedName = normalizeIdentityText(identity.fullName);
 
   if (normalizedCode) {
-    const codeMatches = students.filter((student) => normalizeStudentCode(student.username) === normalizedCode);
+    const codeMatches = students.filter((student) => {
+      const studentCode = normalizeStudentCode(student.username);
+      return studentCode === normalizedCode || matchesStudentCodePattern(studentCode, normalizedCode);
+    });
     if (codeMatches.length === 1) {
       return { matched: codeMatches[0], ambiguous: [] };
     }
@@ -2398,7 +2422,7 @@ export const uploadMobileSubmissionScans = async (req: Request, res: Response): 
       }
     } else {
       try {
-        extractedIdentity = await extractStudentIdentityFromScan(files[0].path, scanBlueprint);
+        extractedIdentity = await extractStudentIdentityFromOmr(files[0].path);
       } catch (error) {
         res.status(422).json({
           error: TEACHER_IDENTITY_MESSAGE,
@@ -2819,7 +2843,7 @@ export const uploadSubmissionScans = async (req: AuthRequest, res: Response): Pr
     const rawStudentId = toInt(req.body.studentId);
     const passIndex = Number.isFinite(Number(req.body.passIndex)) ? Number(req.body.passIndex) : undefined;
     const purpose = req.body.purpose ? String(req.body.purpose) : undefined;
-    const files = ((req as AuthRequest & { files?: Express.Multer.File[] }).files || []) as Express.Multer.File[];
+    const files = sortUploadedScanFiles(((req as AuthRequest & { files?: Express.Multer.File[] }).files || []) as Express.Multer.File[]);
 
     if (files.length === 0) {
       res.status(400).json({ error: 'at least one scan file is required' });
@@ -2882,7 +2906,7 @@ export const uploadSubmissionScans = async (req: AuthRequest, res: Response): Pr
       }
 
       try {
-        extractedIdentity = await extractStudentIdentityFromScan(files[0].path, scanBlueprint);
+        extractedIdentity = await extractStudentIdentityFromOmr(files[0].path);
       } catch (error) {
         res.status(422).json({
           error: TEACHER_IDENTITY_MESSAGE,
@@ -4290,7 +4314,7 @@ export const exportExamAnswerKey = async (req: AuthRequest, res: Response): Prom
 export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const sessionId = toInt(req.params.sessionId);
-    const files = ((req as AuthRequest & { files?: Express.Multer.File[] }).files || []) as Express.Multer.File[];
+    const files = sortUploadedScanFiles(((req as AuthRequest & { files?: Express.Multer.File[] }).files || []) as Express.Multer.File[]);
 
     if (files.length === 0) {
       res.status(400).json({ error: 'At least one scan file is required' });
@@ -4335,12 +4359,14 @@ export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Prom
     }
 
     const invalidScans = await collectInvalidScans(files, 1);
-    if (invalidScans.length > 0) {
-      throw createHttpError(422, TEACHER_QUALITY_MESSAGE, {
-        errorCode: 'QUALITY_FAIL',
-        invalidScans,
-        requiresRetake: true,
-      });
+    const invalidScanGroups = new Map<number, InvalidScanDetail[]>();
+    for (const scan of invalidScans) {
+      const passIndex = Number(scan.passIndex);
+      if (!Number.isFinite(passIndex) || passIndex <= 0) continue;
+      const groupIndex = Math.ceil(passIndex / pagesPerStudent);
+      const groupScans = invalidScanGroups.get(groupIndex) || [];
+      groupScans.push(scan);
+      invalidScanGroups.set(groupIndex, groupScans);
     }
 
     await ensureSessionSubmissionRows(sessionId, session.classId);
@@ -4377,7 +4403,7 @@ export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Prom
       studentCode: string;
       submissionId: number;
       pagesAssigned: number;
-      status: 'MATCHED' | 'AMBIGUOUS' | 'UNMATCHED';
+      status: 'MATCHED' | 'AMBIGUOUS' | 'UNMATCHED' | 'QUALITY_FAIL';
       confidence: string;
       warnings: string[];
     };
@@ -4387,40 +4413,61 @@ export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Prom
     let matchedCount = 0;
     let ambiguousCount = 0;
     let unmatchedCount = 0;
+    let qualityFailedCount = 0;
     const usedStudentIds = new Set<number>();
 
-    for (const fileSet of studentSets) {
+    for (const [setIndex, fileSet] of studentSets.entries()) {
       if (fileSet.length === 0) continue;
 
       const firstFile = fileSet[0];
       let resolvedStudentId: number | null = null;
       let extractedIdentity: { fullName: string | null; studentCode: string | null } | null = null;
-      let classificationStatus: 'MATCHED' | 'AMBIGUOUS' | 'UNMATCHED' = 'UNMATCHED';
+      let classificationStatus: 'MATCHED' | 'AMBIGUOUS' | 'UNMATCHED' | 'QUALITY_FAIL' = 'UNMATCHED';
       const classificationWarnings: string[] = [];
+      const groupInvalidScans = invalidScanGroups.get(setIndex + 1) || [];
+
+      if (groupInvalidScans.length > 0) {
+        classificationStatus = 'QUALITY_FAIL';
+        qualityFailedCount += 1;
+        classificationWarnings.push(
+          ...groupInvalidScans.map((scan) => {
+            const reasonText = scan.reasons.join(', ');
+            return `Page ${scan.passIndex || '?'}: ${reasonText}`;
+          })
+        );
+      }
 
       // Try to extract identity from first page
       try {
-        extractedIdentity = await extractStudentIdentityFromScan(firstFile.path, scanBlueprint);
+        extractedIdentity = await extractStudentIdentityFromOmr(firstFile.path);
 
         const availableStudents = studentList.filter((s) => !usedStudentIds.has(s.id));
         const resolved = resolveStudentFromIdentity(availableStudents, extractedIdentity);
 
         if (resolved.matched) {
           resolvedStudentId = resolved.matched.id;
-          classificationStatus = 'MATCHED';
-          matchedCount += 1;
+          if (classificationStatus !== 'QUALITY_FAIL') {
+            classificationStatus = 'MATCHED';
+            matchedCount += 1;
+          }
         } else if (resolved.ambiguous.length > 0) {
-          classificationStatus = 'AMBIGUOUS';
-          ambiguousCount += 1;
+          if (classificationStatus !== 'QUALITY_FAIL') {
+            classificationStatus = 'AMBIGUOUS';
+            ambiguousCount += 1;
+          }
           classificationWarnings.push(`Ambiguous match: ${resolved.ambiguous.map((s) => s.fullName).join(', ')}`);
         } else {
-          classificationStatus = 'UNMATCHED';
-          unmatchedCount += 1;
+          if (classificationStatus !== 'QUALITY_FAIL') {
+            classificationStatus = 'UNMATCHED';
+            unmatchedCount += 1;
+          }
           classificationWarnings.push('No matching student found');
         }
       } catch (error) {
-        classificationStatus = 'UNMATCHED';
-        unmatchedCount += 1;
+        if (classificationStatus !== 'QUALITY_FAIL') {
+          classificationStatus = 'UNMATCHED';
+          unmatchedCount += 1;
+        }
         classificationWarnings.push(mapTeacherFacingErrorMessage(error, TEACHER_IDENTITY_MESSAGE));
       }
 
@@ -4456,7 +4503,7 @@ export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Prom
             studentCode: studentList.find((s) => s.id === resolvedStudentId)?.username || '',
             submissionId: 0,
             pagesAssigned: fileSet.length,
-            status: 'UNMATCHED',
+            status: classificationStatus,
             confidence: 'none',
             warnings: classificationWarnings,
           });
@@ -4483,12 +4530,13 @@ export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Prom
     }
 
     res.status(201).json({
-      message: `Bulk upload completed: ${matchedCount} matched, ${ambiguousCount} ambiguous, ${unmatchedCount} unmatched`,
+      message: `Bulk upload completed: ${matchedCount} matched, ${ambiguousCount} ambiguous, ${qualityFailedCount} quality-failed, ${unmatchedCount} unmatched`,
       totalImages: files.length,
       scannablePagesPerSubmission: pagesPerStudent,
       submissionGroups: studentSubmissionGroups,
       matched: matchedCount,
       ambiguous: ambiguousCount,
+      qualityFailed: qualityFailedCount,
       unmatched: unmatchedCount,
       classifications,
       unmatchedFiles,

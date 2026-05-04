@@ -63,6 +63,10 @@ const ViewfinderOverlay: React.FC<{ variant: ViewfinderVariant }> = ({ variant }
   );
 };
 
+const sortUploadFiles = (files: File[]): File[] => {
+  return [...files].sort((left, right) => left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' }));
+};
+
 type ExamScanBlueprintConfig = {
   scannablePages?: number;
   passPurposeByIndex?: Record<string, string>;
@@ -685,7 +689,7 @@ const TeacherSessionManagement: React.FC = () => {
 
     const files = uploadInput instanceof File
       ? [uploadInput]
-      : Array.from(uploadInput);
+      : sortUploadFiles(Array.from(uploadInput));
 
     if (files.length === 0) {
       toast.error('No file selected');
@@ -919,8 +923,14 @@ const TeacherSessionManagement: React.FC = () => {
     setBulkUploading(true);
     setBulkUploadResult(null);
     try {
+      const expectedPasses = getTotalPasses();
+      if (files.length % expectedPasses !== 0) {
+        toast.error(`Số ảnh phải chia hết cho ${expectedPasses} trang/bài. Bạn đã chọn ${files.length} ảnh.`);
+        return;
+      }
+
       const formData = new FormData();
-      Array.from(files).forEach((file) => formData.append('files', file));
+      sortUploadFiles(Array.from(files)).forEach((file) => formData.append('files', file));
       const { data } = await api.post<BulkUploadResponse>(
         `/exams/sessions/${selectedSessionId}/bulk-upload`,
         formData,
@@ -1264,7 +1274,7 @@ const TeacherSessionManagement: React.FC = () => {
         {tab === 'AI_GRADING' && (
           <div className="card p-5 space-y-3">
             <div className="flex items-center justify-between gap-2">
-              <h2 className="font-semibold text-gray-900">Batch AI Grading and Manual Review</h2>
+              <h2 className="font-semibold text-gray-900">Bulk Upload and OMR-Based Grading</h2>
               <div className="flex gap-2 flex-wrap">
                 <button className="btn-secondary text-xs" onClick={generateMobileScanLink} disabled={!selectedSessionId}>
                   Create Mobile Link
@@ -1285,7 +1295,7 @@ const TeacherSessionManagement: React.FC = () => {
                   Start Scan
                 </button>
                 <button className="btn-secondary text-xs" onClick={completeScanningAndAutoGrade} disabled={!selectedSessionId}>
-                  Start Batch AI Grading
+                  Start Grading
                 </button>
                 <button className="btn-secondary text-xs" onClick={fetchIssuesReport} disabled={!selectedSessionId || issuesLoading}>
                   <AlertTriangle size={14} className="inline mr-1" />
@@ -1294,7 +1304,7 @@ const TeacherSessionManagement: React.FC = () => {
               </div>
             </div>
             <p className="text-xs text-gray-600">
-              Upload Full Set requires exactly {getTotalPasses()} image(s) per student. Hard-to-read pages are flagged by the server and must be re-uploaded immediately. The backend uses batch processing to grade all pages of a submission in a single optimized AI call.
+              Upload Full Set requires exactly {getTotalPasses()} image(s) per student. Page 1 is validated with OMR for identity and quality first; unreadable or ambiguous pages must be re-uploaded or assigned manually before grading starts. Gemini is used only for essay scoring after all sets are valid.
             </p>
 
             {/* Bulk Upload Section */}
@@ -1302,7 +1312,7 @@ const TeacherSessionManagement: React.FC = () => {
               <div className="flex items-center justify-between gap-2">
                 <div>
                   <p className="text-sm font-medium text-primary-800">Bulk Upload (All Students)</p>
-                  <p className="text-xs text-primary-600">Upload all exam images in sequential order. The system groups images by {getTotalPasses()} pages per student and matches students using the identity/OMR block on page 1 of each set.</p>
+                  <p className="text-xs text-primary-600">Upload all exam images in sequential order. The system groups images by {getTotalPasses()} pages per student and reads MSSV from the OMR block on page 1 of each set.</p>
                 </div>
                 <label className={`btn-primary text-xs cursor-pointer whitespace-nowrap ${bulkUploading ? 'opacity-50 pointer-events-none' : ''}`}>
                   <Upload size={14} className="inline mr-1" />
@@ -1323,7 +1333,7 @@ const TeacherSessionManagement: React.FC = () => {
               {bulkUploading && (
                 <div className="flex items-center gap-2">
                   <span className="animate-spin rounded-full h-4 w-4 border-b-2 border-primary-600" />
-                  <p className="text-xs text-primary-700">Extracting student identity from page 1 and matching sets...</p>
+                  <p className="text-xs text-primary-700">Checking page count, quality, and OMR identity on the first page of each set...</p>
                 </div>
               )}
             </div>
@@ -1335,21 +1345,40 @@ const TeacherSessionManagement: React.FC = () => {
                 <div className="flex gap-4 text-xs">
                   <span className="text-green-700">✓ Matched: {bulkUploadResult.matched}</span>
                   <span className="text-amber-700">⚠ Ambiguous: {bulkUploadResult.ambiguous}</span>
+                  <span className="text-red-700">✦ Quality failed: {bulkUploadResult.qualityFailed || 0}</span>
                   <span className="text-red-700">✗ Unmatched: {bulkUploadResult.unmatched}</span>
                   <span className="text-gray-600">Total: {bulkUploadResult.totalImages} images</span>
                 </div>
+                <div className="rounded-md bg-gray-50 border border-gray-100 p-2 text-[11px] text-gray-600">
+                  Green means the first page passed quality checks and OMR read MSSV successfully. Red means the set needs re-upload or manual assignment before grading can begin.
+                </div>
                 {bulkUploadResult.classifications.length > 0 && (
-                  <div className="space-y-1 max-h-40 overflow-auto">
+                  <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-72 overflow-auto pr-1">
                     {bulkUploadResult.classifications.map((cls, idx) => (
-                      <div key={idx} className={`text-xs p-2 rounded border ${
+                      <div key={idx} className={`text-xs p-3 rounded-lg border-l-4 ${
                         cls.status === 'MATCHED' ? 'border-green-200 bg-green-50' :
                         cls.status === 'AMBIGUOUS' ? 'border-amber-200 bg-amber-50' :
                         'border-red-200 bg-red-50'
+                      } ${
+                        cls.status === 'MATCHED' ? 'border-l-green-500' :
+                        cls.status === 'AMBIGUOUS' ? 'border-l-amber-500' :
+                        'border-l-red-500'
                       }`}>
-                        <span className="font-medium">{cls.studentName || 'Unknown'}</span>
-                        <span className="text-gray-500"> ({cls.studentCode})</span>
-                        <span className="ml-2">{cls.pagesAssigned} pages</span>
-                        {cls.warnings.length > 0 && <span className="text-amber-700 ml-2">• {cls.warnings.join(' | ')}</span>}
+                        <div className="flex items-center justify-between gap-2">
+                          <div>
+                            <p className="font-medium text-gray-900">{cls.studentName || 'Unknown'}</p>
+                            <p className="text-gray-500">{cls.studentCode || 'Unknown code'}</p>
+                          </div>
+                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                            cls.status === 'MATCHED' ? 'bg-green-100 text-green-700' :
+                            cls.status === 'AMBIGUOUS' ? 'bg-amber-100 text-amber-700' :
+                            'bg-red-100 text-red-700'
+                          }`}>
+                            {cls.status}
+                          </span>
+                        </div>
+                        <p className="mt-2 text-gray-700">{cls.pagesAssigned} pages</p>
+                        {cls.warnings.length > 0 && <p className="mt-1 text-amber-700">{cls.warnings.join(' | ')}</p>}
                       </div>
                     ))}
                   </div>

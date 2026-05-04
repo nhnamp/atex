@@ -191,7 +191,7 @@ export interface BulkUploadClassificationResult {
   studentCode: string;
   submissionId: number;
   pagesAssigned: number;
-  status: 'MATCHED' | 'AMBIGUOUS' | 'UNMATCHED';
+  status: 'MATCHED' | 'AMBIGUOUS' | 'UNMATCHED' | 'QUALITY_FAIL';
   confidence: string;
   warnings: string[];
 }
@@ -209,6 +209,7 @@ export interface BulkUploadResponse {
   submissionGroups?: BulkUploadSubmissionGroup[];
   matched: number;
   ambiguous: number;
+  qualityFailed?: number;
   unmatched: number;
   classifications: BulkUploadClassificationResult[];
   unmatchedFiles: string[];
