@@ -1,5 +1,5 @@
 {
   "rewrites": [
-    { "source": "/api/:path*", "destination": "https://attendance-9gbt.onrender.com" }
+    { "source": "/api/:path*", "destination": "https://attendance-9gbt.onrender.com/api/:path*" }
   ]
 }
