@@ -4264,11 +4264,17 @@ export const exportExamAnswerKey = async (req: AuthRequest, res: Response): Prom
     const essayQuestions = questionList.filter((item) => item.type === 'ESSAY');
     const mcqQuestions = questionList.filter((item) => item.type === 'MULTIPLE_CHOICE');
 
+    const pointsMap = new Map<number, number>();
+    for (const eq of exam.questions) {
+      pointsMap.set(eq.questionId, Number(eq.points) || 0);
+    }
+
     const docBuffer = await generateAnswerKeyDocx(
       exam.subject.name,
       exam.durationMinutes,
       mcqQuestions,
-      essayQuestions
+      essayQuestions,
+      pointsMap
     );
 
     const filename = `answer_key_${exam.subject.name.replace(/\s+/g, '_')}_${exam.id}_v${exam.version}.docx`;

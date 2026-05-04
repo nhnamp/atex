@@ -107,6 +107,7 @@ export interface ExamScanBlueprint {
 const ALLOWED_TEMPLATE_FILES = new Set([
   'template-omr-essay-ai-scan.docx',
   'template-full-essay-ai-scan.docx',
+  'template-answer-key.docx',
 ]);
 
 const resolveTemplatePath = (templateFileName: string): string => {
@@ -778,73 +779,37 @@ export const generateAnswerKeyDocx = async (
   subject: string,
   duration: number,
   mcqs: Question[],
-  essays: Question[]
+  essays: Question[],
+  pointsMap?: Map<number, number>
 ): Promise<Buffer> => {
   const examCode = 'ANSWER-KEY';
-  const hasMcq = mcqs.length > 0;
+  const templateFile = 'template-answer-key.docx';
 
-  const mappedMcqs: RenderMcq[] = mcqs.map((question, index) => {
-    const options = parseOptions(question.options);
-    const correctAnswer = (question.answer || '').trim().toUpperCase();
-    const optionA = options[0] || '';
-    const optionB = options[1] || '';
-    const optionC = options[2] || '';
-    const optionD = options[3] || '';
-
-    const markOption = (opt: string, label: string): string => {
-      return correctAnswer === label ? `★ ${opt} ✓` : opt;
-    };
-
-    return {
-      ...toRenderableQuestion(question, index),
-      content: `${sanitizeMultiline(question.content)}\n[Correct Answer: ${correctAnswer}]`,
-      options: {
-        A: markOption(optionA, 'A'),
-        B: markOption(optionB, 'B'),
-        C: markOption(optionC, 'C'),
-        D: markOption(optionD, 'D'),
-      },
-      option_a: markOption(optionA, 'A'),
-      option_b: markOption(optionB, 'B'),
-      option_c: markOption(optionC, 'C'),
-      option_d: markOption(optionD, 'D'),
-      optionsA: markOption(optionA, 'A'),
-      optionsB: markOption(optionB, 'B'),
-      optionsC: markOption(optionC, 'C'),
-      optionsD: markOption(optionD, 'D'),
-      'options.A': markOption(optionA, 'A'),
-      'options.B': markOption(optionB, 'B'),
-      'options.C': markOption(optionC, 'C'),
-      'options.D': markOption(optionD, 'D'),
-    };
-  });
-
-  const mappedEssays: RenderEssay[] = essays.map((question, index) => ({
-    ...toRenderableQuestion(question, index),
-    content: `${sanitizeMultiline(question.content)}\n\n--- MODEL ANSWER ---\n${sanitizeMultiline(question.answer)}`,
+  const mappedMcqs = mcqs.map((question, index) => ({
+    index: index + 1,
+    correct_answer: (question.answer || '').trim().toUpperCase(),
+    score: Number(pointsMap?.get(question.id) ?? 1).toFixed(2),
   }));
-  const firstEssayQuestions = mappedEssays.slice(0, 1);
-  const remainingEssayQuestions = mappedEssays.slice(1);
 
-  const templateFile = hasMcq ? 'template-omr-essay-ai-scan.docx' : 'template-full-essay-ai-scan.docx';
+  const mappedEssays = essays.map((question, index) => ({
+    index: index + 1,
+    answer: sanitizeMultiline(question.answer),
+    score: Number(pointsMap?.get(question.id) ?? 1).toFixed(2),
+  }));
 
-  const mcqFullScore = mappedMcqs.reduce((acc, q) => acc + Number(q.score), 0);
-  const essayFullScore = mappedEssays.reduce((acc, q) => acc + Number(q.score), 0);
+  const mcqFullScore = mappedMcqs.reduce((total, question) => total + Number(question.score), 0).toFixed(2);
+  const essayFullScore = mappedEssays.reduce((total, question) => total + Number(question.score), 0).toFixed(2);
 
   return renderDocxTemplate(templateFile, {
     subject: `${sanitizeMultiline(subject)} — ANSWER KEY`,
     duration: String(duration),
     exam_code: examCode,
-    student_order: 'ANSWER KEY',
-    student_name: 'STANDARD OUTPUT',
-    student_id: '---',
-    mcq_fullscore: mcqFullScore.toFixed(2),
-    essay_fullscore: essayFullScore.toFixed(2),
-    essay_questions: mappedEssays,
-    first_essay_questions: firstEssayQuestions,
-    remaining_essay_questions: remainingEssayQuestions,
-    mcqs: hasMcq ? mappedMcqs : [],
+    total_count: mappedMcqs.length + mappedEssays.length,
+    mcq_count: mcqs.length,
+    essay_count: essays.length,
+    mcq_fullscore: mcqFullScore,
+    essay_fullscore: essayFullScore,
+    mcqs: mappedMcqs,
     essays: mappedEssays,
-    outcomes_text: buildAggregatedOutcomesText([...mcqs, ...essays]),
   });
 };
