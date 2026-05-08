@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import PizZip from 'pizzip';
 import Docxtemplater from 'docxtemplater';
+import sharp from 'sharp';
 import {
   AlignmentType,
   BorderStyle,
@@ -116,9 +117,11 @@ const resolveTemplatePath = (templateFileName: string): string => {
   }
 
   const candidates = [
+    // Prefer workspace-level template folder so updates in repository take effect first
+    path.join(process.cwd(), 'template', templateFileName),
+    // Fallbacks for different runtime layouts (compiled JS under backend/dist/...)
     path.resolve(__dirname, '../../../template', templateFileName),
     path.join(process.cwd(), '..', 'template', templateFileName),
-    path.join(process.cwd(), 'template', templateFileName),
   ];
 
   const found = candidates.find((candidate) => fs.existsSync(candidate));
@@ -618,13 +621,13 @@ const mapMcqsForTemplate = (mcqs: Question[], pointsMap?: Map<number, number>): 
   });
 };
 
-const generateTemplateExamDocx = (
+const generateTemplateExamDocx = async (
   subject: string,
   duration: number,
   mcqs: Question[],
   essays: Question[],
   pointsMap?: Map<number, number>
-): Buffer => {
+): Promise<Buffer> => {
   const hasMcq = mcqs.length > 0;
   const examCode = `EX-${Date.now().toString().slice(-8)}`;
   const mappedMcqs = mapMcqsForTemplate(mcqs, pointsMap);
@@ -638,7 +641,8 @@ const generateTemplateExamDocx = (
   const essayFullScore = mappedEssays.reduce((acc, q) => acc + Number(q.score), 0);
 
   if (hasMcq) {
-    return renderDocxTemplate('template-omr-essay-ai-scan.docx', {
+    const blueprint = buildExamScanBlueprint(mcqs, essays);
+    return await renderDocxTemplate('template-omr-essay-ai-scan.docx', {
       subject: sanitizeMultiline(subject),
       duration: String(duration),
       exam_code: examCode,
@@ -653,10 +657,10 @@ const generateTemplateExamDocx = (
       first_essay_questions: firstEssayQuestions,
       remaining_essay_questions: remainingEssayQuestions,
       outcomes_text: outcomesText,
-    });
+    }, { blurOmr: true, blurStudentId: true, blueprint, padding: 8 });
   }
 
-  return renderDocxTemplate('template-full-essay-ai-scan.docx', {
+  return await renderDocxTemplate('template-full-essay-ai-scan.docx', {
     subject: sanitizeMultiline(subject),
     duration: String(duration),
     exam_code: examCode,
@@ -735,7 +739,98 @@ const generateStructuredExamDocx = async (
   return Packer.toBuffer(doc);
 };
 
-const renderDocxTemplate = (templateFileName: string, data: Record<string, unknown>): Buffer => {
+type BlurOptions = {
+  blurOmr?: boolean;
+  blurStudentId?: boolean;
+  blueprint?: ExamScanBlueprint | undefined;
+  padding?: number; // extra padding in reference pixels
+};
+
+const processDocxBufferBlurAreas = async (docxBuffer: Buffer, blueprint: ExamScanBlueprint, options?: { padding?: number }): Promise<Buffer> => {
+  const zip = new PizZip(docxBuffer);
+  const files = Object.keys(zip.files).filter((name) => name.startsWith('word/media/') && /\.(png|jpe?g)$/i.test(name));
+
+  for (const fileName of files) {
+    try {
+      const file = zip.files[fileName];
+      const data = file.asBinary();
+      const imgBuffer = Buffer.from(data, 'binary');
+      const meta = await sharp(imgBuffer).metadata();
+      const imgW = Number(meta.width || 0);
+      const imgH = Number(meta.height || 0);
+      if (!imgW || !imgH) continue;
+
+      // If image appears like a full page scan (approx aspect to reference), process blur
+      const aspectDiff = Math.abs(imgW / imgH - REFERENCE_WIDTH / REFERENCE_HEIGHT);
+      if (aspectDiff > 0.2) continue;
+
+      // compute scale from reference space to actual image
+      const refW = blueprint.omrTemplate?.referenceWidth || REFERENCE_WIDTH;
+      const refH = blueprint.omrTemplate?.referenceHeight || REFERENCE_HEIGHT;
+      const scaleX = imgW / refW;
+      const scaleY = imgH / refH;
+
+      let composites: Array<{ input: Buffer; left: number; top: number }> = [];
+
+      const padding = options?.padding || 8;
+
+      // Blur OMR region (if provided)
+      if (blueprint.omrTemplate && Array.isArray(blueprint.omrTemplate.questions) && blueprint.omrTemplate.questions.length > 0) {
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const q of blueprint.omrTemplate.questions) {
+          for (const b of q.bubbles) {
+            minX = Math.min(minX, b.x);
+            minY = Math.min(minY, b.y);
+            maxX = Math.max(maxX, b.x + (b.width || 0));
+            maxY = Math.max(maxY, b.y + (b.height || 0));
+          }
+        }
+        if (minX < Infinity && minY < Infinity && maxX > -Infinity && maxY > -Infinity) {
+          const left = Math.max(0, Math.floor((minX - padding) * scaleX));
+          const top = Math.max(0, Math.floor((minY - padding) * scaleY));
+          const width = Math.min(imgW - left, Math.ceil((maxX - minX + padding * 2) * scaleX));
+          const height = Math.min(imgH - top, Math.ceil((maxY - minY + padding * 2) * scaleY));
+          if (width > 4 && height > 4) {
+            const region = await sharp(imgBuffer).extract({ left, top, width, height }).resize(Math.max(1, Math.round(width / 8)), Math.max(1, Math.round(height / 8))).blur(2).resize(width, height).png().toBuffer();
+            composites.push({ input: region, left, top });
+          }
+        }
+      }
+
+      // Blur student id region if present in identityPlaceholders
+      if (Array.isArray(blueprint.identityPlaceholders)) {
+        const idPlaceholder = blueprint.identityPlaceholders.find((p) => String(p.key).toLowerCase().includes('student_id') || String(p.key).toLowerCase().includes('studentcode') || String(p.key).toLowerCase().includes('mssv'));
+        if (idPlaceholder && idPlaceholder.region) {
+          const r = idPlaceholder.region;
+          const left = Math.max(0, Math.floor((r.x - padding) * scaleX));
+          const top = Math.max(0, Math.floor((r.y - padding) * scaleY));
+          const width = Math.min(imgW - left, Math.ceil((r.width + padding * 2) * scaleX));
+          const height = Math.min(imgH - top, Math.ceil((r.height + padding * 2) * scaleY));
+          if (width > 4 && height > 4) {
+            const region = await sharp(imgBuffer).extract({ left, top, width, height }).resize(Math.max(1, Math.round(width / 6)), Math.max(1, Math.round(height / 6))).blur(2).resize(width, height).png().toBuffer();
+            composites.push({ input: region, left, top });
+          }
+        }
+      }
+
+      if (composites.length > 0) {
+        let worked = sharp(imgBuffer);
+        worked = worked.composite(composites as any);
+        const outBuf = await worked.toBuffer();
+        zip.file(fileName, outBuf);
+      }
+    } catch (err) {
+      // ignore per-image failures
+    }
+  }
+
+  return Buffer.from(zip.generate({ type: 'nodebuffer' } as any));
+};
+
+const renderDocxTemplate = async (templateFileName: string, data: Record<string, unknown>, blurOptions?: BlurOptions): Promise<Buffer> => {
   const templatePath = resolveTemplatePath(templateFileName);
   const content = fs.readFileSync(templatePath, 'binary');
   const zip = new PizZip(content);
@@ -753,7 +848,17 @@ const renderDocxTemplate = (templateFileName: string, data: Record<string, unkno
     throw new Error(`Failed to render template "${templateFileName}": ${message}`);
   }
 
-  return doc.getZip().generate({ type: 'nodebuffer' }) as Buffer;
+  let generated = doc.getZip().generate({ type: 'nodebuffer' }) as Buffer;
+
+  if (blurOptions && (blurOptions.blurOmr || blurOptions.blurStudentId) && blurOptions.blueprint) {
+    try {
+      generated = await processDocxBufferBlurAreas(generated, blurOptions.blueprint, { padding: blurOptions?.padding || 8 });
+    } catch {
+      // ignore blur failures and return original buffer
+    }
+  }
+
+  return generated;
 };
 
 export const generateEssayExamDocx = async (

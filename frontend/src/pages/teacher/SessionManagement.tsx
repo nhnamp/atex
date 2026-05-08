@@ -67,6 +67,18 @@ const sortUploadFiles = (files: File[]): File[] => {
   return [...files].sort((left, right) => left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' }));
 };
 
+const toScanAccessUrl = (scan: ExamScanEntry): string | undefined => {
+  if (scan.accessUrl) return scan.accessUrl;
+  if (scan.url) return scan.url;
+  if (scan.filename) return `/uploads/scans/${encodeURIComponent(scan.filename)}`;
+  return undefined;
+};
+
+const normalizeScanEntry = (scan: ExamScanEntry): ExamScanEntry => ({
+  ...scan,
+  accessUrl: toScanAccessUrl(scan),
+});
+
 type ExamScanBlueprintConfig = {
   scannablePages?: number;
   passPurposeByIndex?: Record<string, string>;
@@ -125,6 +137,8 @@ const TeacherSessionManagement: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [bulkUploading, setBulkUploading] = useState(false);
   const [bulkUploadResult, setBulkUploadResult] = useState<BulkUploadResponse | null>(null);
+  const bulkUploadClassifications = bulkUploadResult?.classifications ?? [];
+  const bulkUploadDrafts = bulkUploadResult?.drafts ?? [];
   const [issuesReport, setIssuesReport] = useState<SessionIssuesReport | null>(null);
   const [issuesLoading, setIssuesLoading] = useState(false);
   const [regradingSubmissionId, setRegradingSubmissionId] = useState<number | null>(null);
@@ -391,13 +405,7 @@ const TeacherSessionManagement: React.FC = () => {
           }
 
           if (entry && typeof entry === 'object') {
-            const scan = entry as ExamScanEntry;
-            return {
-              ...scan,
-              accessUrl: scan.accessUrl
-                || scan.url
-                || (scan.filename ? `/uploads/scans/${encodeURIComponent(scan.filename)}` : undefined),
-            };
+            return normalizeScanEntry(entry as ExamScanEntry);
           }
 
           return null;
@@ -410,18 +418,9 @@ const TeacherSessionManagement: React.FC = () => {
 
   const resolveScanEntries = (submission: ExamSubmission): ExamScanEntry[] => {
     if (Array.isArray(submission.scanEntries) && submission.scanEntries.length > 0) {
-      return submission.scanEntries.map((scan) => ({
-        ...scan,
-        accessUrl: scan.accessUrl
-          || scan.url
-          || (scan.filename ? `/uploads/scans/${encodeURIComponent(scan.filename)}` : undefined),
-      }));
+      return submission.scanEntries.map(normalizeScanEntry);
     }
     return parseScanEntriesFromRaw(submission.scanFiles);
-  };
-
-  const parseScanCount = (submission: ExamSubmission): number => {
-    return resolveScanEntries(submission).length;
   };
 
   const fetchSessions = async () => {
@@ -936,7 +935,16 @@ const TeacherSessionManagement: React.FC = () => {
         formData,
         { headers: { 'Content-Type': 'multipart/form-data' } }
       );
-      setBulkUploadResult(data);
+      setBulkUploadResult({
+        ...data,
+        matched: data.matched ?? 0,
+        ambiguous: data.ambiguous ?? 0,
+        qualityFailed: data.qualityFailed ?? 0,
+        unmatched: data.unmatched ?? 0,
+        classifications: data.classifications ?? [],
+        unmatchedFiles: data.unmatchedFiles ?? [],
+        drafts: data.drafts ?? [],
+      });
       toast.success(data.message || 'Bulk upload completed');
       await fetchSessionDetails(selectedSessionId);
     } catch (err: any) {
@@ -1352,9 +1360,9 @@ const TeacherSessionManagement: React.FC = () => {
                 <div className="rounded-md bg-gray-50 border border-gray-100 p-2 text-[11px] text-gray-600">
                   Green means the first page passed quality checks and OMR read MSSV successfully. Red means the set needs re-upload or manual assignment before grading can begin.
                 </div>
-                {bulkUploadResult.classifications.length > 0 && (
+                {bulkUploadClassifications.length > 0 && (
                   <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-72 overflow-auto pr-1">
-                    {bulkUploadResult.classifications.map((cls, idx) => (
+                    {bulkUploadClassifications.map((cls, idx) => (
                       <div key={idx} className={`text-xs p-3 rounded-lg border-l-4 ${
                         cls.status === 'MATCHED' ? 'border-green-200 bg-green-50' :
                         cls.status === 'AMBIGUOUS' ? 'border-amber-200 bg-amber-50' :
@@ -1378,13 +1386,41 @@ const TeacherSessionManagement: React.FC = () => {
                           </span>
                         </div>
                         <p className="mt-2 text-gray-700">{cls.pagesAssigned} pages</p>
-                        {cls.warnings.length > 0 && <p className="mt-1 text-amber-700">{cls.warnings.join(' | ')}</p>}
+                        {(cls.warnings ?? []).length > 0 && <p className="mt-1 text-amber-700">{cls.warnings.join(' | ')}</p>}
                       </div>
                     ))}
                   </div>
                 )}
-                {bulkUploadResult.unmatchedFiles.length > 0 && (
-                  <p className="text-xs text-red-600">Unmatched files: {bulkUploadResult.unmatchedFiles.join(', ')}</p>
+                {bulkUploadDrafts.length > 0 && bulkUploadClassifications.length === 0 && (
+                  <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-72 overflow-auto pr-1">
+                    {bulkUploadDrafts.map((draft) => {
+                      let essayPageCount = 0;
+                      try {
+                        const parsed = JSON.parse(draft.essayPagesUrls);
+                        essayPageCount = Array.isArray(parsed) ? parsed.length : 0;
+                      } catch {
+                        essayPageCount = 0;
+                      }
+
+                      return (
+                        <div key={draft.draftId} className="text-xs p-3 rounded-lg border-l-4 border-l-blue-500 border-blue-200 bg-blue-50">
+                          <div className="flex items-center justify-between gap-2">
+                            <div>
+                              <p className="font-medium text-gray-900">Draft #{draft.groupIndex}</p>
+                              <p className="text-gray-500">Front page staged</p>
+                            </div>
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-100 text-blue-700">
+                              {draft.status}
+                            </span>
+                          </div>
+                          <p className="mt-2 text-gray-700">Essay pages: {essayPageCount}</p>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {(bulkUploadResult.unmatchedFiles ?? []).length > 0 && (
+                  <p className="text-xs text-red-600">Unmatched files: {(bulkUploadResult.unmatchedFiles ?? []).join(', ')}</p>
                 )}
               </div>
             )}
@@ -1570,7 +1606,7 @@ const TeacherSessionManagement: React.FC = () => {
               <p className="text-sm text-gray-500">No submissions for this session.</p>
             ) : (
               submissions.map((item) => {
-                const scans = resolveScanEntries(item);
+                const scans = resolveScanEntries(item) || [];
                 const feedback = parseSubmissionFeedback(item);
                 const mergedPdfUrl = feedback.mergedPdfUrl || scans.find((scan) => !!scan.mergedPdfUrl)?.mergedPdfUrl || null;
 
@@ -1582,7 +1618,7 @@ const TeacherSessionManagement: React.FC = () => {
                         <p className="text-xs text-gray-500">
                           Objective: {feedback.objectiveScore ?? '-'} • Essay: {feedback.essayScore ?? '-'} • Total: {feedback.totalScore ?? item.finalScore ?? '-'}
                         </p>
-                        <p className="text-xs text-gray-500">AI: {item.aiScore ?? '-'} • Final: {item.finalScore ?? '-'} • Scans: {parseScanCount(item)}</p>
+                        <p className="text-xs text-gray-500">AI: {item.aiScore ?? '-'} • Final: {item.finalScore ?? '-'} • Scans: {scans?.length ?? 0}</p>
                       </div>
                       <div className="flex gap-2 flex-wrap">
                         <button className="btn-secondary text-xs" onClick={() => void openCameraForSubmission(item)}>
@@ -1620,9 +1656,9 @@ const TeacherSessionManagement: React.FC = () => {
                       </p>
                     )}
 
-                    {scans.length > 0 && (
+                    {scans?.length > 0 && (
                       <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-2">
-                        {scans.map((scan, idx) => {
+                        {scans?.map?.((scan, idx) => {
                           const href = scan.accessUrl || scan.url || (scan.filename ? `/uploads/scans/${encodeURIComponent(scan.filename)}` : '');
                           if (!href) return null;
 
@@ -1700,7 +1736,7 @@ const TeacherSessionManagement: React.FC = () => {
                 <p className="text-sm text-gray-500">No submissions available.</p>
               ) : (
                 (Array.isArray(report?.submissions) ? report.submissions : submissions).map((item: ExamSubmission) => {
-                  const scans = resolveScanEntries(item);
+                  const scans = resolveScanEntries(item) || [];
                   const feedback = parseSubmissionFeedback(item);
                   const mergedPdfUrl = feedback.mergedPdfUrl || scans.find((scan) => !!scan.mergedPdfUrl)?.mergedPdfUrl || null;
                   const isExpanded = expandedSubmissionId === item.id;
@@ -1715,7 +1751,7 @@ const TeacherSessionManagement: React.FC = () => {
                             <span>MCQ: <span className="font-medium text-blue-700">{feedback.objectiveScore ?? '-'}</span></span>
                             <span>Essay: <span className="font-medium text-orange-700">{feedback.essayScore ?? '-'}</span></span>
                             <span>Total: <span className="font-medium text-gray-900">{feedback.totalScore ?? item.finalScore ?? '-'}</span></span>
-                            <span>Scans: {scans.length}</span>
+                            <span>Scans: {scans?.length ?? 0}</span>
                           </div>
                         </div>
                         <div className="flex gap-1.5 flex-wrap">
@@ -1763,11 +1799,11 @@ const TeacherSessionManagement: React.FC = () => {
                             </p>
                           )}
 
-                          {scans.length === 0 ? (
+                          {scans?.length === 0 ? (
                             <p className="text-xs text-gray-500">No scan images available for this submission.</p>
                           ) : (
                             <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
-                              {scans.map((scan, idx) => {
+                              {scans?.map?.((scan, idx) => {
                                 const href = scan.accessUrl || scan.url || (scan.filename ? `/uploads/scans/${encodeURIComponent(scan.filename)}` : '');
                                 if (!href) return null;
 

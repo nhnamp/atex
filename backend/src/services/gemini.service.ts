@@ -98,11 +98,6 @@ export interface EssayGradingResult {
   feedback: string;
 }
 
-export interface ScanIdentityResult {
-  fullName: string | null;
-  studentCode: string | null;
-}
-
 export interface ScanLayoutBlueprint {
   scannablePages?: number;
   hasMcq?: boolean;
@@ -155,60 +150,6 @@ const parseModelJson = <T>(rawText: string): T => {
     .replace(/```\n?/g, '')
     .trim();
   return JSON.parse(cleaned) as T;
-};
-
-export const extractStudentIdentityFromScan = async (
-  scanPath: string,
-  layoutBlueprint?: ScanLayoutBlueprint
-): Promise<ScanIdentityResult> => {
-  if (!config.geminiApiKey) {
-    throw new Error('Gemini API key not configured');
-  }
-
-  if (!fs.existsSync(scanPath)) {
-    throw new Error('Scan file not found');
-  }
-
-  const preprocessed = await preprocessScanForAnalysis(scanPath);
-  const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
-  const ext = path.extname(preprocessed.processedPath).toLowerCase();
-  const mimeType = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
-  const imageBase64 = fs.readFileSync(preprocessed.processedPath).toString('base64');
-
-  const identityPlaceholders = Array.isArray(layoutBlueprint?.identityPlaceholders)
-    ? layoutBlueprint?.identityPlaceholders
-    : [];
-
-  try {
-    const rawText = await generateGeminiText(model, [
-      {
-        inlineData: {
-          mimeType,
-          data: imageBase64,
-        },
-      },
-      `You are extracting student identity from a scanned exam sheet.
-
-  Priority rules:
-  1. Use exam layout placeholders if available.
-  2. Prefer exact student code from identity area over any other numeric text.
-  3. Do not guess. If unreadable, return null.
-
-  Layout blueprint (identity placeholders):
-  ${JSON.stringify(identityPlaceholders, null, 2)}
-
-  Return only valid JSON in this exact format:
-  {"fullName":"... or null","studentCode":"... or null"}`,
-    ]);
-
-    const parsed = parseModelJson<ScanIdentityResult>(rawText);
-    return {
-      fullName: parsed?.fullName ? String(parsed.fullName).trim() : null,
-      studentCode: parsed?.studentCode ? String(parsed.studentCode).trim() : null,
-    };
-  } finally {
-    preprocessed.cleanup();
-  }
 };
 
 const normalizeEssayAnswers = (answers: unknown): Record<string, string> => {
@@ -372,7 +313,7 @@ Output JSON format:
     }>(rawText);
 
     const modelWarnings = Array.isArray(parsed?.warnings)
-      ? parsed.warnings.map((item) => String(item || '').trim()).filter(Boolean)
+      ? parsed.warnings.map((item: unknown) => String(item || '').trim()).filter(Boolean)
       : [];
 
     const essayQuestionMaxScore = new Map<number, number>(
@@ -553,7 +494,7 @@ Output JSON format (mảng kết quả cho từng sinh viên):
 
     // Map results back to students by label or index
     return students.map((student, idx) => {
-      const match = resultsArray.find((r) => r.studentLabel === student.studentLabel) || resultsArray[idx];
+      const match = resultsArray.find((r: { studentLabel?: string }) => r.studentLabel === student.studentLabel) || resultsArray[idx];
 
       if (!match) {
         return {
@@ -567,7 +508,7 @@ Output JSON format (mảng kết quả cho từng sinh viên):
       }
 
       const modelWarnings = Array.isArray(match.warnings)
-        ? match.warnings.map((w) => String(w || '').trim()).filter(Boolean)
+        ? match.warnings.map((w: unknown) => String(w || '').trim()).filter(Boolean)
         : [];
 
       return {

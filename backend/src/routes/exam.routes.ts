@@ -3,6 +3,7 @@ import {
   cloneExamToDraft,
   cloneExamConfigToDraft,
   completeScanningAndAutoGrade,
+  assignDraftScanStudent,
   createSessionMobileScanLink,
   createExamDraft,
   createExamSession,
@@ -15,6 +16,7 @@ import {
   getMobileScanContext,
   getMyPublishedExamResults,
   getExamPreview,
+  listExamDraftScans,
   getSessionIssuesReport,
   getSessionReport,
   getSessionSubmissions,
@@ -32,6 +34,8 @@ import {
   uploadMissingPages,
   uploadMobileSubmissionScans,
   uploadSubmissionScans,
+  reuploadDraftScanFrontPage,
+  startDraftGrading,
 } from '../controllers/exam.controller';
 import { config } from '../config';
 import { authenticate, requireApproved, requireRole } from '../middleware/auth';
@@ -44,9 +48,22 @@ const router = Router();
 const scanStoragePath = path.join(process.cwd(), 'uploads', 'scans');
 fs.mkdirSync(scanStoragePath, { recursive: true });
 
+const tempScanStoragePath = path.join(process.cwd(), 'uploads', 'temp');
+fs.mkdirSync(tempScanStoragePath, { recursive: true });
+
 const upload = multer({
   storage: multer.diskStorage({
     destination: (_req, _file, cb) => cb(null, scanStoragePath),
+    filename: (_req, file, cb) => {
+      const safe = `${Date.now()}-${file.originalname.replace(/\s+/g, '_')}`;
+      cb(null, safe);
+    },
+  }),
+});
+
+const tempUpload = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, tempScanStoragePath),
     filename: (_req, file, cb) => {
       const safe = `${Date.now()}-${file.originalname.replace(/\s+/g, '_')}`;
       cb(null, safe);
@@ -91,7 +108,11 @@ router.get('/sessions/:sessionId/report/export', requireRole('TEACHER'), exportS
 router.post('/sessions/:sessionId/report/finalize', requireRole('TEACHER'), finalizeSessionReport);
 router.post('/sessions/:sessionId/mobile-scan-link', requireRole('TEACHER'), createSessionMobileScanLink);
 router.get('/sessions/:sessionId/issues', requireRole('TEACHER'), getSessionIssuesReport);
-router.post('/sessions/:sessionId/bulk-upload', requireRole('TEACHER'), upload.array('files', bulkScanFileLimit), uploadBulkExamScans);
+router.get('/sessions/:sessionId/draft-scans', requireRole('TEACHER'), listExamDraftScans);
+router.post('/sessions/:sessionId/bulk-upload', requireRole('TEACHER'), tempUpload.array('files', bulkScanFileLimit), uploadBulkExamScans);
+router.post('/sessions/:sessionId/start-grading', requireRole('TEACHER'), startDraftGrading);
+router.patch('/sessions/:sessionId/draft-scans/:draftId/assign-student', requireRole('TEACHER'), assignDraftScanStudent);
+router.patch('/sessions/:sessionId/draft-scans/:draftId/front-page', requireRole('TEACHER'), tempUpload.single('file'), reuploadDraftScanFrontPage);
 
 // Student results (published after report confirmation)
 router.get('/results/me', requireRole('STUDENT'), getMyPublishedExamResults);

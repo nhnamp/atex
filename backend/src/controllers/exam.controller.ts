@@ -164,6 +164,14 @@ const sortUploadedScanFiles = (files: Express.Multer.File[]): Express.Multer.Fil
   });
 };
 
+const sortScanEntriesByPassIndex = (entries: ScanEntry[]): ScanEntry[] => {
+  return [...entries].sort((left, right) => {
+    const leftIndex = Number.isFinite(Number(left.passIndex)) ? Number(left.passIndex) : Number.MAX_SAFE_INTEGER;
+    const rightIndex = Number.isFinite(Number(right.passIndex)) ? Number(right.passIndex) : Number.MAX_SAFE_INTEGER;
+    return leftIndex - rightIndex;
+  });
+};
+
 const MOBILE_SCAN_SCOPE = 'exam_mobile_scan';
 
 type MobileScanTokenPayload = {
@@ -618,39 +626,6 @@ const resolveExamScanBlueprint = (
   return normalizeStoredScanBlueprint(parsedRequirements.scanBlueprint, fallbackBlueprint);
 };
 
-const getMaxPassFromAnchors = (scanBlueprint?: ExamScanBlueprint): number => {
-  const anchors = Array.isArray(scanBlueprint?.markerAnchors) ? scanBlueprint!.markerAnchors : [];
-  let maxPass = 0;
-
-  for (const anchor of anchors) {
-    const passIndex = normalizePositiveInt(anchor?.passIndex, 0);
-    const pageIndex = normalizePositiveInt(anchor?.pageIndex, 0);
-    maxPass = Math.max(maxPass, passIndex, pageIndex);
-  }
-
-  return maxPass;
-};
-
-const getMaxPurposeDrivenPass = (scanBlueprint?: ExamScanBlueprint): number => {
-  const purposes = scanBlueprint?.passPurposeByIndex || {};
-  let maxPass = 0;
-
-  for (const [rawIndex, rawPurpose] of Object.entries(purposes)) {
-    const index = normalizePositiveInt(rawIndex, 0);
-    if (!index) continue;
-
-    const purpose = String(rawPurpose || '').trim();
-    if (!purpose) continue;
-
-    // Ignore placeholder PAGE_n purposes when estimating real page count.
-    if (purpose.toUpperCase() === `PAGE_${index}`) continue;
-
-    maxPass = Math.max(maxPass, index);
-  }
-
-  return maxPass;
-};
-
 const buildScanPassPlan = (
   examQuestions: Array<{ question: { id: number; type: string } }>,
   scanBlueprint?: ExamScanBlueprint
@@ -871,6 +846,10 @@ const persistSubmissionScans = async (params: {
 };
 
 const resolveScanPath = async (entry: ScanEntry): Promise<string> => {
+  if (entry.url && path.isAbsolute(entry.url) && fs.existsSync(entry.url)) {
+    return entry.url;
+  }
+
   if (entry.filename) {
     const localPath = path.join(process.cwd(), 'uploads', 'scans', entry.filename);
     if (fs.existsSync(localPath)) {
@@ -895,6 +874,207 @@ const resolveScanPath = async (entry: ScanEntry): Promise<string> => {
   const tempPath = path.join(process.cwd(), 'uploads', 'scans', tempName);
   fs.writeFileSync(tempPath, buffer);
   return tempPath;
+};
+
+type DraftScanStatus = 'PENDING' | 'VALID' | 'UNIDENTIFIED' | 'BLURRY_ERROR';
+
+type DraftScanRecord = {
+  id: number;
+  sessionId: number;
+  studentId: number | null;
+  status: DraftScanStatus;
+  frontPageUrl: string;
+  essayPagesUrls: unknown;
+  omrResult: unknown;
+};
+
+const DRAFT_SCAN_TEMP_ROOT = path.join(process.cwd(), 'uploads', 'temp');
+const DRAFT_UNIDENTIFIED_CONFIDENCE_THRESHOLD = 0.35;
+
+const toStringArray = (value: unknown): string[] => {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value) as unknown;
+      if (Array.isArray(parsed)) {
+        return parsed.map((item) => String(item || '').trim()).filter(Boolean);
+      }
+    } catch {
+      return value
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+    }
+  }
+
+  return [];
+};
+
+const parseDraftOmrResult = (value: unknown): Record<string, unknown> | null => {
+  if (!value) return null;
+  if (typeof value === 'object') return value as Record<string, unknown>;
+  if (typeof value !== 'string') return null;
+
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+};
+
+const serializeDraftOmrResult = (value: unknown): string | null => {
+  if (value === undefined || value === null) return null;
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return null;
+  }
+};
+
+const getDraftScanPaths = (draft: { frontPageUrl: string; essayPagesUrls: unknown }): string[] => {
+  return [draft.frontPageUrl, ...toStringArray(draft.essayPagesUrls)];
+};
+
+const getDraftTempDirectory = (sessionId: number): string => {
+  return path.join(DRAFT_SCAN_TEMP_ROOT, `session_${sessionId}`);
+};
+
+const removeLocalPaths = async (paths: string[]): Promise<void> => {
+  for (const filePath of paths) {
+    if (filePath && fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        // ignore cleanup failures
+      }
+    }
+  }
+};
+
+const uploadDraftPathToCloudinary = async (filePath: string, label: string, pageIndex: number): Promise<ScanEntry> => {
+  const buffer = await fs.promises.readFile(filePath);
+  const url = await uploadImageToCloudinary(buffer, `${label}_page_${pageIndex}.png`);
+
+  return {
+    source: 'cloudinary',
+    filename: path.basename(filePath),
+    url,
+    passIndex: pageIndex,
+    capturedAt: new Date().toISOString(),
+  };
+};
+
+const chunkArray = <T,>(items: T[], size: number): T[][] => {
+  const chunks: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+};
+
+const updateDraftStatus = async (
+  draftId: number,
+  payload: {
+    status: DraftScanStatus;
+    studentId?: number | null;
+    omrResult?: unknown;
+  }
+): Promise<void> => {
+  await prisma.examDraftScan.update({
+    where: { id: draftId },
+    data: {
+      status: payload.status,
+      studentId: payload.studentId === undefined ? undefined : payload.studentId,
+      omrResult: payload.omrResult === undefined ? undefined : serializeDraftOmrResult(payload.omrResult),
+    },
+  });
+};
+
+const processDraftScanIdentityAsync = async (params: {
+  draftId: number;
+  frontPagePath: string;
+  enrolledStudents: StudentIdentity[];
+}): Promise<void> => {
+  const { draftId, frontPagePath, enrolledStudents } = params;
+
+  try {
+    const identity = await extractStudentIdentityFromOmr(frontPagePath);
+    const warnings = Array.isArray(identity.warnings) ? identity.warnings : [];
+    const blurryFailure = warnings.some((warning) => /warp|opencv|perspective|rectification/i.test(warning));
+
+    if (blurryFailure) {
+      await updateDraftStatus(draftId, {
+        status: 'BLURRY_ERROR',
+        studentId: null,
+        omrResult: {
+          fullName: identity.fullName,
+          studentCode: identity.studentCode,
+          confidence: identity.confidence,
+          warnings,
+        },
+      });
+      return;
+    }
+
+    if ((!identity.studentCode && !identity.fullName) || identity.confidence < DRAFT_UNIDENTIFIED_CONFIDENCE_THRESHOLD) {
+      await updateDraftStatus(draftId, {
+        status: 'UNIDENTIFIED',
+        studentId: null,
+        omrResult: {
+          fullName: identity.fullName,
+          studentCode: identity.studentCode,
+          confidence: identity.confidence,
+          warnings,
+        },
+      });
+      return;
+    }
+
+    const resolved = resolveStudentFromIdentity(enrolledStudents, identity);
+    if (resolved.matched) {
+      await updateDraftStatus(draftId, {
+        status: 'VALID',
+        studentId: resolved.matched.id,
+        omrResult: {
+          fullName: identity.fullName,
+          studentCode: identity.studentCode,
+          confidence: identity.confidence,
+          warnings,
+          matchedStudentId: resolved.matched.id,
+        },
+      });
+      return;
+    }
+
+    await updateDraftStatus(draftId, {
+      status: 'UNIDENTIFIED',
+      studentId: null,
+      omrResult: {
+        fullName: identity.fullName,
+        studentCode: identity.studentCode,
+        confidence: identity.confidence,
+        warnings,
+        ambiguousStudents: resolved.ambiguous.map((student) => ({ id: student.id, fullName: student.fullName, username: student.username })),
+      },
+    });
+  } catch (error) {
+    const message = String((error as Error).message || '');
+    const blurryFailure = /warp|opencv|perspective|rectification|cannot determine working image dimensions/i.test(message);
+
+    await updateDraftStatus(draftId, {
+      status: blurryFailure ? 'BLURRY_ERROR' : 'UNIDENTIFIED',
+      studentId: null,
+      omrResult: {
+        error: message,
+        warnings: [message].filter(Boolean),
+      },
+    });
+  }
 };
 
 const parseAnswerMap = (raw: string | null | undefined): Record<string, string> => {
@@ -991,7 +1171,8 @@ type BatchScanGradingData = {
 const extractBatchScanGradingData = async (
   scanEntries: ScanEntry[],
   examQuestions: SubmissionExamQuestion[],
-  scanBlueprint?: ExamScanBlueprint
+  scanBlueprint?: ExamScanBlueprint,
+  options?: { skipEssayGrading?: boolean }
 ): Promise<BatchScanGradingData> => {
   const orderedScans = [...scanEntries].sort((a, b) => {
     const aIndex = Number.isFinite(Number(a.passIndex)) ? Number(a.passIndex) : Number.MAX_SAFE_INTEGER;
@@ -1085,6 +1266,36 @@ const extractBatchScanGradingData = async (
       }
     }
 
+    const extractedIdentity = await (async () => {
+      try {
+        const identity = await extractStudentIdentityFromOmr(gradingScanPaths[0]);
+        return {
+          fullName: identity.fullName,
+          studentCode: identity.studentCode,
+        };
+      } catch {
+        return { fullName: null, studentCode: null };
+      }
+    })();
+
+    if (options?.skipEssayGrading) {
+      const warnings = [
+        ...new Set(
+          [...preWarnings, ...omrWarnings]
+            .map((item) => String(item || '').trim())
+            .filter(Boolean)
+        ),
+      ];
+
+      return {
+        objectiveAnswers,
+        essayAnswers: {},
+        essayResults: [],
+        warnings,
+        extractedIdentity,
+      };
+    }
+
     const batchResult = await extractAndGradeSubmissionFromScansBatch({
       scanPaths: gradingScanPaths,
       scannablePages: normalizedScannablePages,
@@ -1093,12 +1304,7 @@ const extractBatchScanGradingData = async (
       essayQuestions,
     });
 
-    const extractedIdentity = {
-      fullName: batchResult.fullName,
-      studentCode: batchResult.studentCode,
-    };
-
-    if (!normalizeStudentCode(extractedIdentity.studentCode) && !normalizeIdentityText(extractedIdentity.fullName)) {
+    if (!normalizeStudentCode(batchResult.studentCode) && !normalizeIdentityText(batchResult.fullName)) {
       throw createHttpError(422, TEACHER_IDENTITY_MESSAGE, {
         errorCode: 'IDENTITY_FAIL',
       });
@@ -1151,7 +1357,7 @@ const extractBatchScanGradingData = async (
           questionId: item.questionId,
           score: Number(score.toFixed(2)),
           maxScore: Number(maxScore.toFixed(2)),
-          feedback: String(item.feedback || '').trim().slice(0, 1000),
+          feedback: String(item.feedback || '').trim(),
         };
       })
       .sort((a, b) => a.questionId - b.questionId);
@@ -1161,7 +1367,10 @@ const extractBatchScanGradingData = async (
       essayAnswers,
       essayResults,
       warnings,
-      extractedIdentity,
+      extractedIdentity: {
+        fullName: batchResult.fullName,
+        studentCode: batchResult.studentCode,
+      },
     };
   } finally {
     for (const tempPath of temporaryPaths) {
@@ -2332,16 +2541,19 @@ export const getMobileScanContext = async (req: Request, res: Response): Promise
           passPurposeByIndex: passPlan.passPurposeByIndex,
         },
       },
-      students: submissions.map((submission) => ({
-        submissionId: submission.id,
-        studentId: submission.studentId,
-        student: submission.student,
-        status: submission.status,
-        finalScore: submission.finalScore,
-        scanEntries: parseAccessibleScanEntries(submission.scanFiles || '[]'),
-        scanCount: parseScanEntries(submission.scanFiles || '[]').length,
-        mergedPdfUrl: getMergedPdfUrlFromEntries(parseScanEntries(submission.scanFiles || '[]')),
-      })),
+      students: submissions.map((submission) => {
+        const parsedScans = parseScanEntries(submission.scanFiles || '[]');
+        return {
+          submissionId: submission.id,
+          studentId: submission.studentId,
+          student: submission.student,
+          status: submission.status,
+          finalScore: submission.finalScore,
+          scanEntries: parsedScans.map(toAccessibleScanEntry),
+          scanCount: parsedScans.length,
+          mergedPdfUrl: getMergedPdfUrlFromEntries(parsedScans),
+        };
+      }),
     });
   } catch (error) {
     const httpError = error as HttpError;
@@ -2360,7 +2572,7 @@ export const uploadMobileSubmissionScans = async (req: Request, res: Response): 
     const rawStudentId = toInt(req.body.studentId);
     const passIndex = Number.isFinite(Number(req.body.passIndex)) ? Number(req.body.passIndex) : undefined;
     const purpose = req.body.purpose ? String(req.body.purpose) : undefined;
-    const files = ((req as Request & { files?: Express.Multer.File[] }).files || []) as Express.Multer.File[];
+    const files = sortUploadedScanFiles(((req as Request & { files?: Express.Multer.File[] }).files || []) as Express.Multer.File[]);
 
     if (!token || files.length === 0) {
       res.status(400).json({ error: 'token and at least one scan file are required' });
@@ -3054,6 +3266,7 @@ export const getSessionSubmissions = async (req: AuthRequest, res: Response): Pr
 
     res.json(
       submissions.map((submission) => {
+        const parsedScans = parseScanEntries(submission.scanFiles || '[]');
         const details = extractSubmissionReportDetails({
           feedback: submission.feedback,
           scanFiles: submission.scanFiles,
@@ -3061,8 +3274,8 @@ export const getSessionSubmissions = async (req: AuthRequest, res: Response): Pr
 
         return {
           ...submission,
-          scanEntries: parseAccessibleScanEntries(submission.scanFiles || '[]'),
-          scanCount: parseScanEntries(submission.scanFiles || '[]').length,
+          scanEntries: parsedScans.map(toAccessibleScanEntry),
+          scanCount: parsedScans.length,
           mergedPdfUrl: details.mergedPdfUrl,
           objectiveScore: details.objectiveScore,
           essayScore: details.essayScore,
@@ -3844,11 +4057,7 @@ export const completeScanningAndAutoGrade = async (req: AuthRequest, res: Respon
     if (mcqExamQuestions.length > 0) {
       for (const { submission, scanEntries } of gradableSubmissions) {
         try {
-          const firstScan = scanEntries.sort((a, b) => {
-            const ai = Number(a.passIndex) || 999;
-            const bi = Number(b.passIndex) || 999;
-            return ai - bi;
-          })[0];
+          const firstScan = sortScanEntriesByPassIndex(scanEntries)[0];
           const scanPath = await resolveScanPath(firstScan);
           const preprocessed = await preprocessScanForAnalysis(scanPath);
           try {
@@ -3891,11 +4100,7 @@ export const completeScanningAndAutoGrade = async (req: AuthRequest, res: Respon
 
         for (const item of batch) {
           try {
-            const orderedScans = [...item.scanEntries].sort((a, b) => {
-              const ai = Number(a.passIndex) || 999;
-              const bi = Number(b.passIndex) || 999;
-              return ai - bi;
-            });
+            const orderedScans = sortScanEntriesByPassIndex(item.scanEntries);
 
             const scanPaths: string[] = [];
             for (const entry of orderedScans) {
@@ -4358,19 +4563,6 @@ export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Prom
       return;
     }
 
-    const invalidScans = await collectInvalidScans(files, 1);
-    const invalidScanGroups = new Map<number, InvalidScanDetail[]>();
-    for (const scan of invalidScans) {
-      const passIndex = Number(scan.passIndex);
-      if (!Number.isFinite(passIndex) || passIndex <= 0) continue;
-      const groupIndex = Math.ceil(passIndex / pagesPerStudent);
-      const groupScans = invalidScanGroups.get(groupIndex) || [];
-      groupScans.push(scan);
-      invalidScanGroups.set(groupIndex, groupScans);
-    }
-
-    await ensureSessionSubmissionRows(sessionId, session.classId);
-
     const enrolledStudents = await prisma.classStudent.findMany({
       where: { classId: session.classId },
       select: {
@@ -4384,162 +4576,46 @@ export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Prom
     }
 
     const studentList = enrolledStudents.map((item) => item.student);
+    const draftSets = chunkArray(files, pagesPerStudent);
 
-    // Group every N pages into one student submission package.
-    const studentSets: Express.Multer.File[][] = [];
-    for (let i = 0; i < files.length; i += pagesPerStudent) {
-      studentSets.push(files.slice(i, i + pagesPerStudent));
-    }
-
-    const studentSubmissionGroups = studentSets.map((set, index) => ({
-      groupIndex: index + 1,
-      scannablePages: set.length,
-      files: set.map((file) => file.originalname || file.filename),
-    }));
-
-    type ClassificationResult = {
-      studentId: number;
-      studentName: string;
-      studentCode: string;
-      submissionId: number;
-      pagesAssigned: number;
-      status: 'MATCHED' | 'AMBIGUOUS' | 'UNMATCHED' | 'QUALITY_FAIL';
-      confidence: string;
-      warnings: string[];
-    };
-
-    const classifications: ClassificationResult[] = [];
-    const unmatchedFiles: string[] = [];
-    let matchedCount = 0;
-    let ambiguousCount = 0;
-    let unmatchedCount = 0;
-    let qualityFailedCount = 0;
-    const usedStudentIds = new Set<number>();
-
-    for (const [setIndex, fileSet] of studentSets.entries()) {
-      if (fileSet.length === 0) continue;
-
-      const firstFile = fileSet[0];
-      let resolvedStudentId: number | null = null;
-      let extractedIdentity: { fullName: string | null; studentCode: string | null } | null = null;
-      let classificationStatus: 'MATCHED' | 'AMBIGUOUS' | 'UNMATCHED' | 'QUALITY_FAIL' = 'UNMATCHED';
-      const classificationWarnings: string[] = [];
-      const groupInvalidScans = invalidScanGroups.get(setIndex + 1) || [];
-
-      if (groupInvalidScans.length > 0) {
-        classificationStatus = 'QUALITY_FAIL';
-        qualityFailedCount += 1;
-        classificationWarnings.push(
-          ...groupInvalidScans.map((scan) => {
-            const reasonText = scan.reasons.join(', ');
-            return `Page ${scan.passIndex || '?'}: ${reasonText}`;
-          })
-        );
-      }
-
-      // Try to extract identity from first page
-      try {
-        extractedIdentity = await extractStudentIdentityFromOmr(firstFile.path);
-
-        const availableStudents = studentList.filter((s) => !usedStudentIds.has(s.id));
-        const resolved = resolveStudentFromIdentity(availableStudents, extractedIdentity);
-
-        if (resolved.matched) {
-          resolvedStudentId = resolved.matched.id;
-          if (classificationStatus !== 'QUALITY_FAIL') {
-            classificationStatus = 'MATCHED';
-            matchedCount += 1;
-          }
-        } else if (resolved.ambiguous.length > 0) {
-          if (classificationStatus !== 'QUALITY_FAIL') {
-            classificationStatus = 'AMBIGUOUS';
-            ambiguousCount += 1;
-          }
-          classificationWarnings.push(`Ambiguous match: ${resolved.ambiguous.map((s) => s.fullName).join(', ')}`);
-        } else {
-          if (classificationStatus !== 'QUALITY_FAIL') {
-            classificationStatus = 'UNMATCHED';
-            unmatchedCount += 1;
-          }
-          classificationWarnings.push('No matching student found');
-        }
-      } catch (error) {
-        if (classificationStatus !== 'QUALITY_FAIL') {
-          classificationStatus = 'UNMATCHED';
-          unmatchedCount += 1;
-        }
-        classificationWarnings.push(mapTeacherFacingErrorMessage(error, TEACHER_IDENTITY_MESSAGE));
-      }
-
-      if (resolvedStudentId) {
-        usedStudentIds.add(resolvedStudentId);
-
-        try {
-          const { submission } = await persistSubmissionScans({
+    const drafts = await prisma.$transaction(
+      draftSets.map((fileSet, index) =>
+        prisma.examDraftScan.create({
+          data: {
             sessionId,
-            studentId: resolvedStudentId,
-            files: fileSet,
-            replaceExisting: true,
-            sequentialPasses: true,
-            totalPasses: pagesPerStudent,
-            passPurposeResolver: (passIdx: number) => getScanPassPurpose(passIdx, passPlan),
-          });
+            studentId: null,
+            status: 'PENDING',
+            frontPageUrl: fileSet[0].path,
+            essayPagesUrls: JSON.stringify(fileSet.slice(1).map((file) => file.path)),
+            omrResult: null,
+          },
+        })
+      )
+    );
 
-          classifications.push({
-            studentId: resolvedStudentId,
-            studentName: studentList.find((s) => s.id === resolvedStudentId)?.fullName || '',
-            studentCode: studentList.find((s) => s.id === resolvedStudentId)?.username || '',
-            submissionId: submission.id,
-            pagesAssigned: fileSet.length,
-            status: classificationStatus,
-            confidence: extractedIdentity ? 'high' : 'low',
-            warnings: classificationWarnings,
-          });
-        } catch (persistError) {
-          classificationWarnings.push(`Failed to save scans: ${(persistError as Error).message}`);
-          classifications.push({
-            studentId: resolvedStudentId,
-            studentName: studentList.find((s) => s.id === resolvedStudentId)?.fullName || '',
-            studentCode: studentList.find((s) => s.id === resolvedStudentId)?.username || '',
-            submissionId: 0,
-            pagesAssigned: fileSet.length,
-            status: classificationStatus,
-            confidence: 'none',
-            warnings: classificationWarnings,
-          });
-        }
-      } else {
-        for (const file of fileSet) {
-          unmatchedFiles.push(file.originalname || file.filename);
-          // Clean up unmatched files
-          if (file.path && fs.existsSync(file.path)) {
-            fs.unlinkSync(file.path);
-          }
-        }
-        classifications.push({
-          studentId: 0,
-          studentName: extractedIdentity?.fullName || 'Unknown',
-          studentCode: extractedIdentity?.studentCode || 'Unknown',
-          submissionId: 0,
-          pagesAssigned: fileSet.length,
-          status: classificationStatus,
-          confidence: 'none',
-          warnings: classificationWarnings,
-        });
-      }
+    for (const [index, draft] of drafts.entries()) {
+      void processDraftScanIdentityAsync({
+        draftId: draft.id,
+        frontPagePath: draftSets[index][0].path,
+        enrolledStudents: studentList,
+      }).catch((error) => {
+        console.error(`Draft scan processing failed for draft ${draft.id}:`, error);
+      });
     }
 
     res.status(201).json({
-      message: `Bulk upload completed: ${matchedCount} matched, ${ambiguousCount} ambiguous, ${qualityFailedCount} quality-failed, ${unmatchedCount} unmatched`,
+      message: `Staged ${drafts.length} draft scans for session ${sessionId}`,
+      sessionId,
       totalImages: files.length,
       scannablePagesPerSubmission: pagesPerStudent,
-      submissionGroups: studentSubmissionGroups,
-      matched: matchedCount,
-      ambiguous: ambiguousCount,
-      qualityFailed: qualityFailedCount,
-      unmatched: unmatchedCount,
-      classifications,
-      unmatchedFiles,
+      draftCount: drafts.length,
+      drafts: drafts.map((draft, index) => ({
+        draftId: draft.id,
+        groupIndex: index + 1,
+        status: draft.status,
+        frontPageUrl: draft.frontPageUrl,
+        essayPagesUrls: draft.essayPagesUrls,
+      })),
     });
   } catch (error) {
     const httpError = error as HttpError;
@@ -4558,6 +4634,459 @@ export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Prom
 
     console.error('Bulk upload exam scans error:', error);
     res.status(500).json({ error: message });
+  }
+};
+
+export const listExamDraftScans = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const sessionId = toInt(req.params.sessionId);
+
+    const session = await prisma.examSession.findUnique({
+      where: { id: sessionId },
+      include: { exam: true },
+    });
+
+    if (!session || session.exam.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const drafts = await prisma.examDraftScan.findMany({
+      where: { sessionId },
+      include: {
+        student: { select: { id: true, username: true, fullName: true } },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    res.json({
+      sessionId,
+      drafts: drafts.map((draft) => ({
+        ...draft,
+        essayPagesUrls: toStringArray(draft.essayPagesUrls),
+        omrResult: parseDraftOmrResult(draft.omrResult),
+      })),
+    });
+  } catch (error) {
+    console.error('List exam draft scans error:', error);
+    res.status(500).json({ error: 'Failed to list exam draft scans' });
+  }
+};
+
+export const assignDraftScanStudent = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const sessionId = toInt(req.params.sessionId);
+    const draftId = toInt(req.params.draftId);
+    const studentId = toInt(req.body.studentId);
+
+    if (!Number.isFinite(studentId) || studentId <= 0) {
+      res.status(400).json({ error: 'studentId is required' });
+      return;
+    }
+
+    const draft = await prisma.examDraftScan.findUnique({
+      where: { id: draftId },
+      include: {
+        session: { include: { exam: true } },
+      },
+    });
+
+    if (!draft || draft.sessionId !== sessionId || draft.session.exam.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Draft scan not found' });
+      return;
+    }
+
+    const enrolled = await prisma.classStudent.findUnique({
+      where: { classId_studentId: { classId: draft.session.classId, studentId } },
+      include: {
+        student: { select: { id: true, username: true, fullName: true } },
+      },
+    });
+
+    if (!enrolled) {
+      res.status(400).json({ error: 'Student is not enrolled in this class' });
+      return;
+    }
+
+    const updated = await prisma.examDraftScan.update({
+      where: { id: draftId },
+      data: {
+        studentId,
+        status: 'VALID',
+        omrResult: serializeDraftOmrResult({
+          ...(draft.omrResult && typeof draft.omrResult === 'object' ? (draft.omrResult as Record<string, unknown>) : {}),
+          manualAssigned: true,
+          resolvedStudentId: studentId,
+        }),
+      },
+      include: {
+        student: { select: { id: true, username: true, fullName: true } },
+      },
+    });
+
+    res.json({
+      message: 'Draft scan assigned successfully',
+      draft: {
+        ...updated,
+        essayPagesUrls: toStringArray(updated.essayPagesUrls),
+        omrResult: parseDraftOmrResult(updated.omrResult),
+      },
+    });
+  } catch (error) {
+    console.error('Assign draft scan student error:', error);
+    res.status(500).json({ error: 'Failed to assign draft scan student' });
+  }
+};
+
+export const reuploadDraftScanFrontPage = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const sessionId = toInt(req.params.sessionId);
+    const draftId = toInt(req.params.draftId);
+    const file = (req as AuthRequest & { file?: Express.Multer.File }).file;
+
+    if (!file) {
+      res.status(400).json({ error: 'A front page file is required' });
+      return;
+    }
+
+    const draft = await prisma.examDraftScan.findUnique({
+      where: { id: draftId },
+      include: {
+        session: { include: { exam: true } },
+      },
+    });
+
+    if (!draft || draft.sessionId !== sessionId || draft.session.exam.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Draft scan not found' });
+      return;
+    }
+
+    const previousFrontPage = draft.frontPageUrl;
+    const updated = await prisma.examDraftScan.update({
+      where: { id: draftId },
+      data: {
+        frontPageUrl: file.path,
+        studentId: null,
+        status: 'PENDING',
+        omrResult: null,
+      },
+      include: {
+        student: { select: { id: true, username: true, fullName: true } },
+      },
+    });
+
+    if (previousFrontPage && previousFrontPage !== file.path) {
+      await removeLocalPaths([previousFrontPage]);
+    }
+
+    const enrolledStudents = await prisma.classStudent.findMany({
+      where: { classId: draft.session.classId },
+      select: {
+        student: { select: { id: true, username: true, fullName: true } },
+      },
+    });
+
+    void processDraftScanIdentityAsync({
+      draftId,
+      frontPagePath: file.path,
+      enrolledStudents: enrolledStudents.map((item) => item.student),
+    }).catch((error) => {
+      console.error(`Draft scan reprocess failed for draft ${draftId}:`, error);
+    });
+
+    res.json({
+      message: 'Front page replaced and reprocessing started',
+      draft: {
+        ...updated,
+        essayPagesUrls: toStringArray(updated.essayPagesUrls),
+        omrResult: parseDraftOmrResult(updated.omrResult),
+      },
+    });
+  } catch (error) {
+    console.error('Reupload draft scan front page error:', error);
+    res.status(500).json({ error: 'Failed to replace draft front page' });
+  }
+};
+
+export const startDraftGrading = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const sessionId = toInt(req.params.sessionId);
+
+    const session = await prisma.examSession.findUnique({
+      where: { id: sessionId },
+      include: {
+        class: true,
+        exam: {
+          include: {
+            questions: {
+              include: { question: true },
+              orderBy: { position: 'asc' },
+            },
+          },
+        },
+      },
+    });
+
+    if (!session || session.exam.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const drafts = await prisma.examDraftScan.findMany({
+      where: { sessionId },
+      include: {
+        student: { select: { id: true, username: true, fullName: true } },
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    if (drafts.length === 0) {
+      res.status(400).json({ error: 'No draft scans found for this session' });
+      return;
+    }
+
+    const invalidDrafts = drafts.filter((draft) => draft.status !== 'VALID');
+    if (invalidDrafts.length > 0) {
+      res.status(400).json({
+        error: 'All draft scans must be VALID before grading starts',
+        invalidDrafts: invalidDrafts.map((draft) => ({
+          draftId: draft.id,
+          status: draft.status,
+          studentId: draft.studentId,
+        })),
+      });
+      return;
+    }
+
+    const duplicateStudentIds = drafts
+      .map((draft) => draft.studentId)
+      .filter((studentId): studentId is number => Number.isFinite(Number(studentId)) && Number(studentId) > 0)
+      .filter((studentId, index, array) => array.indexOf(studentId) !== index);
+
+    if (duplicateStudentIds.length > 0) {
+      res.status(400).json({
+        error: 'Each staged draft must resolve to a unique student before grading starts',
+        duplicateStudentIds: [...new Set(duplicateStudentIds)],
+      });
+      return;
+    }
+
+    const scanBlueprint = resolveExamScanBlueprint(session.exam.questions, session.exam.requirements);
+    const passPlan = buildScanPassPlan(session.exam.questions, scanBlueprint);
+    const pagesPerStudent = resolveExpectedScannablePages(session.exam.scannablePages, passPlan, scanBlueprint);
+    const studentQuestionList = session.exam.questions.map((item) => ({
+      points: item.points,
+      question: {
+        id: item.question.id,
+        type: item.question.type,
+        content: item.question.content,
+        answer: item.question.answer,
+        rubric: item.question.rubric,
+      },
+    }));
+    const essayQuestionsForGemini = session.exam.questions
+      .filter((item) => item.question.type === 'ESSAY')
+      .map((item) => ({
+        questionId: item.question.id,
+        questionContent: item.question.content,
+        expectedAnswer: item.question.answer,
+        rubric: item.question.rubric,
+        maxScore: item.points,
+      }));
+
+    const objectiveByDraftId = new Map<number, BatchScanGradingData>();
+    for (const draft of drafts) {
+      const scanEntries = getDraftScanPaths(draft).map((scanPath, index) => ({
+        source: 'local' as const,
+        filename: path.basename(scanPath),
+        url: scanPath,
+        passIndex: index + 1,
+        totalPasses: pagesPerStudent,
+        purpose: getScanPassPurpose(index + 1, passPlan),
+        capturedAt: new Date().toISOString(),
+      }));
+
+      const objectiveExtraction = await extractBatchScanGradingData(
+        scanEntries,
+        studentQuestionList,
+        scanBlueprint,
+        { skipEssayGrading: true }
+      );
+      objectiveByDraftId.set(draft.id, objectiveExtraction);
+    }
+
+    const essayByDraftId = new Map<number, {
+      essayAnswers: Record<string, string>;
+      essayResults: Array<{ questionId: number; score: number; maxScore: number; feedback: string }>;
+      warnings: string[];
+      fullName: string | null;
+      studentCode: string | null;
+    }>();
+
+    if (essayQuestionsForGemini.length > 0) {
+      const batchDraftGroups = chunkArray(drafts, 4);
+      for (const batchDrafts of batchDraftGroups) {
+        const geminiResults = await extractAndGradeMultiStudentBatch(
+          batchDrafts.map((draft) => ({
+            studentLabel: `draft-${draft.id}`,
+            scanPaths: getDraftScanPaths(draft),
+          })),
+          essayQuestionsForGemini,
+          pagesPerStudent,
+          passPlan.passPurposeByIndex,
+          scanBlueprint
+        );
+
+        for (const result of geminiResults) {
+          const draftId = Number(String(result.studentLabel || '').replace('draft-', ''));
+          if (!Number.isFinite(draftId)) continue;
+          essayByDraftId.set(draftId, result);
+        }
+      }
+    }
+
+    const uploadedDraftScans = new Map<number, ScanEntry[]>();
+    for (const draft of drafts) {
+      const localPaths = getDraftScanPaths(draft);
+      const uploadedEntries: ScanEntry[] = [];
+      for (let pageIndex = 0; pageIndex < localPaths.length; pageIndex += 1) {
+        uploadedEntries.push(
+          await uploadDraftPathToCloudinary(
+            localPaths[pageIndex],
+            `session_${sessionId}_draft_${draft.id}`,
+            pageIndex + 1
+          )
+        );
+      }
+      uploadedDraftScans.set(draft.id, uploadedEntries);
+    }
+
+    const createdSubmissionIds: number[] = [];
+    await prisma.$transaction(async (tx) => {
+      for (const draft of drafts) {
+        if (!draft.studentId) {
+          throw createHttpError(400, `Draft ${draft.id} is missing a student assignment`);
+        }
+
+        const objectiveExtraction = objectiveByDraftId.get(draft.id);
+        const essayExtraction = essayByDraftId.get(draft.id);
+        if (!objectiveExtraction) {
+          throw createHttpError(500, `Objective extraction missing for draft ${draft.id}`);
+        }
+
+        const objectiveAnswers = normalizeObjectiveAnswers(objectiveExtraction.objectiveAnswers || {});
+        const essayAnswers = normalizeEssayAnswers(essayExtraction?.essayAnswers || {});
+        const essayResults = (essayExtraction?.essayResults || []).map((item) => ({
+          questionId: item.questionId,
+          score: Number(item.score) || 0,
+          maxScore: Number(item.maxScore) || 0,
+          feedback: String(item.feedback || '').trim(),
+        }));
+
+        const warnings = [
+          ...new Set([
+            ...(objectiveExtraction.warnings || []),
+            ...(essayExtraction?.warnings || []),
+          ].map((item) => String(item || '').trim()).filter(Boolean)),
+        ];
+
+        const objectiveScore = session.exam.questions.reduce((acc, examQuestion) => {
+          if (examQuestion.question.type === 'ESSAY') return acc;
+          const submitted = (objectiveAnswers[String(examQuestion.question.id)] || '').trim().toLowerCase();
+          const expected = (examQuestion.question.answer || '').trim().toLowerCase();
+          return submitted && submitted === expected ? acc + Number(examQuestion.points || 0) : acc;
+        }, 0);
+
+        const essayScore = essayResults.reduce((acc, item) => acc + Number(item.score || 0), 0);
+        const totalScore = Number((objectiveScore + essayScore).toFixed(2));
+        const scanFiles = uploadedDraftScans.get(draft.id) || [];
+
+        const feedbackPayload = {
+          draftId: draft.id,
+          identity: {
+            fullName: essayExtraction?.fullName || objectiveExtraction.extractedIdentity.fullName,
+            studentCode: essayExtraction?.studentCode || objectiveExtraction.extractedIdentity.studentCode,
+          },
+          objectiveScore,
+          essayScore,
+          totalScore,
+          objectiveAnswers,
+          essayAnswers,
+          essayResults,
+          warnings,
+          scanBlueprint: {
+            scannablePages: scanBlueprint.scannablePages,
+            passPurposeByIndex: scanBlueprint.passPurposeByIndex,
+          },
+        };
+
+        const submission = await tx.examSubmission.create({
+          data: {
+            sessionId,
+            studentId: draft.studentId,
+            scanFiles: JSON.stringify(scanFiles),
+            objectiveAnswers: JSON.stringify(objectiveAnswers),
+            essayAnswers: JSON.stringify(essayAnswers),
+            status: 'GRADED',
+            aiScore: totalScore,
+            finalScore: totalScore,
+            feedback: JSON.stringify(feedbackPayload),
+            gradedAt: new Date(),
+          },
+        });
+
+        await tx.submissionGrade.create({
+          data: {
+            submissionId: submission.id,
+            graderId: req.user!.id,
+            method: 'AI',
+            objectiveScore,
+            essayScore,
+            totalScore,
+            rubricVersion: `exam-v${session.exam.version}`,
+            promptLog: JSON.stringify({ mode: 'draft-finalization', draftId: draft.id, batchEssayMode: true }),
+            responseLog: JSON.stringify(feedbackPayload),
+          },
+        });
+
+        await tx.gradingAuditLog.create({
+          data: {
+            submissionId: submission.id,
+            actorId: req.user!.id,
+            action: 'DRAFT_FINALIZED',
+            beforeScore: null,
+            afterScore: totalScore,
+            note: 'Draft scan finalized into an official submission',
+          },
+        });
+
+        createdSubmissionIds.push(submission.id);
+      }
+
+      await tx.examDraftScan.deleteMany({
+        where: { sessionId },
+      });
+
+      await tx.examSession.update({
+        where: { id: sessionId },
+        data: {
+          status: 'GRADING',
+          startedAt: session.startedAt || new Date(),
+        },
+      });
+    });
+
+    await removeLocalPaths(drafts.flatMap((draft) => getDraftScanPaths(draft)));
+
+    res.json({
+      message: 'Draft scans finalized and grading started',
+      sessionId,
+      totalDrafts: drafts.length,
+      createdSubmissionIds,
+    });
+  } catch (error) {
+    console.error('Start draft grading error:', error);
+    res.status(500).json({ error: 'Failed to start draft grading' });
   }
 };
 

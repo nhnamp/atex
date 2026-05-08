@@ -34,6 +34,7 @@ model User {
   gradedSubmissions SubmissionGrade[] @relation("SubmissionGrader")
   gradingLogs       GradingAuditLog[] @relation("GradingActor")
   examSubmissions   ExamSubmission[] @relation("StudentSubmissions")
+  draftScans        ExamDraftScan[]
 }
 
 model Department {
@@ -196,6 +197,7 @@ model ExamSession {
   updatedAt   DateTime @updatedAt
 
   submissions ExamSubmission[]
+  draftScans  ExamDraftScan[]
 }
 
 model ExamSubmission {
@@ -220,6 +222,23 @@ model ExamSubmission {
   auditLogs      GradingAuditLog[]
 
   @@unique([sessionId, studentId])
+}
+
+model ExamDraftScan {
+  id             Int                 @id @default(autoincrement())
+  sessionId      Int
+  session        ExamSession         @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  studentId      Int?
+  student        User?               @relation(fields: [studentId], references: [id], onDelete: SetNull)
+  status         String              @default("PENDING") // PENDING | VALID | UNIDENTIFIED | BLURRY_ERROR
+  frontPageUrl   String
+  essayPagesUrls  String              @default("[]")
+  omrResult      String?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  @@index([sessionId])
+  @@index([studentId])
 }
 
 model SubmissionGrade {

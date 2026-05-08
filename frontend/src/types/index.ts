@@ -205,6 +205,7 @@ export interface BulkUploadSubmissionGroup {
 export interface BulkUploadResponse {
   message: string;
   totalImages: number;
+  sessionId?: number;
   scannablePagesPerSubmission?: number;
   submissionGroups?: BulkUploadSubmissionGroup[];
   matched: number;
@@ -213,6 +214,14 @@ export interface BulkUploadResponse {
   unmatched: number;
   classifications: BulkUploadClassificationResult[];
   unmatchedFiles: string[];
+  draftCount?: number;
+  drafts?: Array<{
+    draftId: number;
+    groupIndex: number;
+    status: string;
+    frontPageUrl: string;
+    essayPagesUrls: string;
+  }>;
 }
 
 export interface SessionIssue {

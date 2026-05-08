@@ -1,3 +1,5 @@
+import fs from 'fs';
+import path from 'path';
 import sharp from 'sharp';
 
 let cv: any = null;
@@ -19,35 +21,35 @@ if (!cv) {
   }
 }
 
-export interface Bubble {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-  option: string;
-}
+  export interface Bubble {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+    option: string;
+  }
 
-export interface OmrQuestionRegion {
-  questionId: number;
-  bubbles: Bubble[];
-}
+  export interface OmrQuestionRegion {
+    questionId: number;
+    bubbles: Bubble[];
+  }
 
-export interface OmrTemplate {
-  questions: OmrQuestionRegion[];
-  darknessThreshold?: number;
-  referenceWidth?: number;
-  referenceHeight?: number;
-}
+  export interface OmrTemplate {
+    questions: OmrQuestionRegion[];
+    darknessThreshold?: number;
+    referenceWidth?: number;
+    referenceHeight?: number;
+  }
 
-export interface DocumentDetectionResult {
-  ready: boolean;
-  confidence: number;
-  width: number;
-  height: number;
-  documentBox: { x: number; y: number; width: number; height: number };
-  corners?: { x: number; y: number }[] | null;
-  warnings: string[];
-}
+  export interface DocumentDetectionResult {
+    ready: boolean;
+    confidence: number;
+    width: number;
+    height: number;
+    documentBox: { x: number; y: number; width: number; height: number };
+    corners?: { x: number; y: number }[] | null;
+    warnings: string[];
+  }
 
 export interface OmrIdentityResult {
   fullName: string | null;
@@ -59,13 +61,18 @@ export interface OmrIdentityResult {
 const REFERENCE_WIDTH = 2480;
 const REFERENCE_HEIGHT = 3508;
 
-const IDENTITY_GRID = {
-  x: 1748,
-  y: 300,
-  width: 545,
-  height: 430,
+const STUDENT_CODE_GRID = {
   columns: 8,
-  rows: 10,
+  rows: 11, // include the top handwriting row + 10 bubble rows
+};
+
+// Tunable ROI percentages (relative to warped reference image).
+// These were adjusted to tightly crop the black border around the MSSV box.
+const STUDENT_CODE_ROI_PERCENT = {
+  x: 0.68,
+  y: 0.126,
+  width: 0.245,
+  height: 0.232,
 };
 
 const samplePatchDarkness = async (
@@ -124,6 +131,227 @@ const averageDarkness = (pixels: Buffer): number => {
     total += pixels[i];
   }
   return total / pixels.length;
+};
+
+interface DetectedCircle {
+  x: number;
+  y: number;
+  radius: number;
+}
+
+interface GrayImageData {
+  pixels: Buffer;
+  width: number;
+  height: number;
+  isCvMat?: boolean;
+  cvMat?: any;
+}
+
+interface ContourBubbleCandidate extends DetectedCircle {
+  area: number;
+  circularity: number;
+  fillRatio: number;
+}
+
+const clampRect = (
+  left: number,
+  top: number,
+  width: number,
+  height: number,
+  imageWidth: number,
+  imageHeight: number
+): { left: number; top: number; width: number; height: number } => {
+  const clampedLeft = Math.max(0, Math.min(Math.floor(left), Math.max(0, imageWidth - 1)));
+  const clampedTop = Math.max(0, Math.min(Math.floor(top), Math.max(0, imageHeight - 1)));
+  const clampedRight = Math.max(clampedLeft + 1, Math.min(Math.ceil(left + width), imageWidth));
+  const clampedBottom = Math.max(clampedTop + 1, Math.min(Math.ceil(top + height), imageHeight));
+
+  return {
+    left: clampedLeft,
+    top: clampedTop,
+    width: Math.max(1, clampedRight - clampedLeft),
+    height: Math.max(1, clampedBottom - clampedTop),
+  };
+};
+
+const extractStudentCodeRoi = async (
+  image: sharp.Sharp
+): Promise<{ color: Buffer; width: number; height: number }> => {
+  const metadata = await image.metadata();
+  const imageWidth = Number(metadata.width || 0);
+  const imageHeight = Number(metadata.height || 0);
+
+  if (!imageWidth || !imageHeight) {
+    throw new Error('Cannot determine working image dimensions');
+  }
+
+  const roi = {
+    left: Math.round(imageWidth * STUDENT_CODE_ROI_PERCENT.x),
+    top: Math.round(imageHeight * STUDENT_CODE_ROI_PERCENT.y),
+    width: Math.round(imageWidth * STUDENT_CODE_ROI_PERCENT.width),
+    height: Math.round(imageHeight * STUDENT_CODE_ROI_PERCENT.height),
+  };
+  const rect = clampRect(roi.left, roi.top, roi.width, roi.height, imageWidth, imageHeight);
+  const color = await image
+    .clone()
+    .extract(rect)
+    .png()
+    .toBuffer();
+
+  return { color, width: rect.width, height: rect.height };
+};
+
+const buildStudentCodeGrid = (roiWidth: number, roiHeight: number) => {
+  const cellWidth = roiWidth / STUDENT_CODE_GRID.columns;
+  const cellHeight = roiHeight / STUDENT_CODE_GRID.rows;
+  const radius = Math.max(8, Math.floor(Math.min(cellWidth, cellHeight) * 0.31));
+
+  const centers = Array.from({ length: STUDENT_CODE_GRID.columns }, (_, column) =>
+    Array.from({ length: STUDENT_CODE_GRID.rows }, (_, row) => ({
+      column,
+      row,
+      x: (column + 0.5) * cellWidth,
+      y: (row + 0.5) * cellHeight,
+      radius,
+    }))
+  );
+
+  return { cellWidth, cellHeight, radius, centers };
+};
+
+// Sampling / scoring constants
+const SAMPLE_RADIUS = 5; // pixels around center to average (patch scoring)
+const MIN_MARK_THRESHOLD = 0.25; // minimal fill ratio to consider marked (lowered for faint pencil)
+const TIE_GAP = 0.08; // minimal gap between top two candidates
+
+const SHIFT_PIXELS = 5; // search up/down range in pixels for local calibration
+
+const scoreFixedCircleFill = (grayImage: GrayImageData, circle: DetectedCircle): number => {
+  const innerRadius = circle.radius * 0.08;
+  const outerRadius = circle.radius * 0.58;
+  const inner2 = innerRadius * innerRadius;
+  const outer2 = outerRadius * outerRadius;
+
+  // Try OpenCV first: apply adaptive threshold on a small patch around the bubble
+  if (grayImage.isCvMat && cv && grayImage.cvMat) {
+    try {
+      const left = Math.max(0, Math.floor(circle.x - outerRadius));
+      const right = Math.min(grayImage.width - 1, Math.ceil(circle.x + outerRadius));
+      const top = Math.max(0, Math.floor(circle.y - outerRadius));
+      const bottom = Math.min(grayImage.height - 1, Math.ceil(circle.y + outerRadius));
+      const width = Math.max(1, right - left + 1);
+      const height = Math.max(1, bottom - top + 1);
+
+      const rect = new cv.Rect(left, top, width, height);
+      const patchMat = grayImage.cvMat.getRegion(rect);
+
+      // Use raw grayscale pixel buffer for per-patch adaptive processing (robust across bindings)
+      const PW = width;
+      const PH = height;
+      let darkCount = 0;
+      let sampleCount = 0;
+
+      // compute mean/stddev over patch using grayImage.pixels
+      let sum = 0;
+      let sum2 = 0;
+      for (let py = 0; py < PH; py += 1) {
+        for (let px = 0; px < PW; px += 1) {
+          const gx = left + px;
+          const gy = top + py;
+          const idx = gy * grayImage.width + gx;
+          if (idx >= 0 && idx < grayImage.pixels.length) {
+            const v = grayImage.pixels[idx];
+            sum += v;
+            sum2 += v * v;
+          }
+        }
+      }
+      const total = Math.max(1, PW * PH);
+      const mean = sum / total;
+      const variance = Math.max(0, sum2 / total - mean * mean);
+      const stddev = Math.sqrt(variance);
+      const threshold = Math.max(10, Math.round(mean - Math.max(15, Math.round(stddev * 0.5))));
+
+      for (let py = 0; py < PH; py += 1) {
+        for (let px = 0; px < PW; px += 1) {
+          const gx = left + px;
+          const gy = top + py;
+          const dx = gx - circle.x;
+          const dy = gy - circle.y;
+          const dist2 = dx * dx + dy * dy;
+          if (dist2 < inner2 || dist2 > outer2) continue;
+          const idx = gy * grayImage.width + gx;
+          if (idx >= 0 && idx < grayImage.pixels.length) {
+            const value = grayImage.pixels[idx];
+            sampleCount += 1;
+            if (value < threshold) darkCount += 1;
+          }
+        }
+      }
+
+      const score = darkCount / Math.max(1, sampleCount);
+      if (process.env.OMR_DEBUG_PIXEL === '1') {
+        // eslint-disable-next-line no-console
+        console.log(`[PIXEL_DEBUG] OpenCV adaptive circle (${circle.x.toFixed(0)},${circle.y.toFixed(0)}) r=${circle.radius.toFixed(0)}: dark=${darkCount} samples=${sampleCount} score=${score.toFixed(3)}`);
+      }
+
+      return score;
+    } catch (err) {
+      if (process.env.OMR_DEBUG === '1') {
+        // eslint-disable-next-line no-console
+        console.log('[OMR_DEBUG] OpenCV per-patch scoring failed, falling back:', String(err).slice(0, 120));
+      }
+      // Fall through to pixel-based approach
+    }
+  }
+
+  // Fallback: pixel-based scoring without OpenCV
+  const left = Math.max(0, Math.floor(circle.x - outerRadius));
+  const right = Math.min(grayImage.width - 1, Math.ceil(circle.x + outerRadius));
+  const top = Math.max(0, Math.floor(circle.y - outerRadius));
+  const bottom = Math.min(grayImage.height - 1, Math.ceil(circle.y + outerRadius));
+
+  let darkCount = 0;
+  let sampleCount = 0;
+  // For fallback, compute local mean over the patch and use mean - offset as threshold
+  const patchLeft = Math.max(0, Math.floor(circle.x - outerRadius));
+  const patchTop = Math.max(0, Math.floor(circle.y - outerRadius));
+  const patchRight = Math.min(grayImage.width - 1, Math.ceil(circle.x + outerRadius));
+  const patchBottom = Math.min(grayImage.height - 1, Math.ceil(circle.y + outerRadius));
+
+  // Collect pixels in the rectangular patch to compute mean
+  let patchSum = 0;
+  let patchCount = 0;
+  for (let py = patchTop; py <= patchBottom; py += 1) {
+    for (let px = patchLeft; px <= patchRight; px += 1) {
+      const idx = py * grayImage.width + px;
+      if (idx >= 0 && idx < grayImage.pixels.length) {
+        patchSum += grayImage.pixels[idx];
+        patchCount += 1;
+      }
+    }
+  }
+
+  const patchMean = patchCount > 0 ? patchSum / patchCount : 128;
+  const offset = 20; // lower threshold below mean to capture faint pencil
+  const darkThreshold = Math.max(10, patchMean - offset);
+
+  for (let y = top; y <= bottom; y += 1) {
+    for (let x = left; x <= right; x += 1) {
+      const dx = x - circle.x;
+      const dy = y - circle.y;
+      const dist2 = dx * dx + dy * dy;
+      if (dist2 < inner2 || dist2 > outer2) continue;
+      sampleCount += 1;
+      const pixelIndex = y * grayImage.width + x;
+      if (pixelIndex >= 0 && pixelIndex < grayImage.pixels.length) {
+        const value = grayImage.pixels[pixelIndex];
+        if (value < darkThreshold) darkCount += 1;
+      }
+    }
+  }
+
+  return darkCount / Math.max(1, sampleCount);
 };
 
 const detectDocumentBoxFromThreshold = async (imagePath: string): Promise<{ x: number; y: number; width: number; height: number } | null> => {
@@ -388,7 +616,7 @@ export const detectMarkedOptions = async (
 
 export const extractStudentIdentityFromOmr = async (
   imagePath: string,
-  options?: { exportWarpPath?: string }
+  options?: { exportWarpPath?: string; exportOverlayPath?: string; dumpScores?: boolean }
 ): Promise<OmrIdentityResult> => {
   const warnings: string[] = [];
 
@@ -400,7 +628,6 @@ export const extractStudentIdentityFromOmr = async (
       warnings: ['Scan file path is empty'],
     };
   }
-
 
   const detection = await detectDocumentForOmr(imagePath);
 
@@ -414,269 +641,223 @@ export const extractStudentIdentityFromOmr = async (
     };
   }
 
-  // If corners are available and OpenCV is present, warp to canonical reference size for percent-based ROI
-  let workingImage: sharp.Sharp;
-  let inputImageWidth = detection.width || REFERENCE_WIDTH;
-  let inputImageHeight = detection.height || REFERENCE_HEIGHT;
+  let roiBuffer: Buffer;
+  let roiWidth: number;
+  let roiHeight: number;
 
+  // Try perspective transform with OpenCV if available
   if (cv && detection.corners && detection.corners.length === 4) {
     try {
       const mat = cv.imread(imagePath);
-      const src = detection.corners.map((c) => new cv.Point2(Math.max(0, Math.round(c.x)), Math.max(0, Math.round(c.y))));
+      const src = detection.corners.map((corner) => new cv.Point2(Math.max(0, Math.round(corner.x)), Math.max(0, Math.round(corner.y))));
       const dst = [new cv.Point2(0, 0), new cv.Point2(REFERENCE_WIDTH - 1, 0), new cv.Point2(REFERENCE_WIDTH - 1, REFERENCE_HEIGHT - 1), new cv.Point2(0, REFERENCE_HEIGHT - 1)];
-      const M = cv.getPerspectiveTransform(src, dst);
-      const warped = mat.warpPerspective(M, new cv.Size(REFERENCE_WIDTH, REFERENCE_HEIGHT));
-      const png = cv.imencode('.png', warped);
-      const warpedBuffer = Buffer.from(png);
-      // Export warped image if requested (test/debugging)
-      if (options && options.exportWarpPath) {
-        // write the warpedBuffer directly to disk
-        // eslint-disable-next-line node/no-unsupported-features/es-builtins
-        const fs = await import('fs');
+      const matrix = cv.getPerspectiveTransform(src, dst);
+      const warped = mat.warpPerspective(matrix, new cv.Size(REFERENCE_WIDTH, REFERENCE_HEIGHT));
+      const warpedBuffer = Buffer.from(cv.imencode('.png', warped));
+
+      if (options?.exportWarpPath) {
         try {
-          await fs.promises.mkdir(require('path').dirname(options.exportWarpPath), { recursive: true });
+          await fs.promises.mkdir(path.dirname(options.exportWarpPath), { recursive: true });
           await fs.promises.writeFile(options.exportWarpPath, warpedBuffer);
-        } catch (e) {
-          // ignore write errors for export
+        } catch {
+          // ignore export failures
         }
       }
-      workingImage = sharp(warpedBuffer).greyscale();
-      inputImageWidth = REFERENCE_WIDTH;
-      inputImageHeight = REFERENCE_HEIGHT;
-    } catch (err) {
-      // if warp fails, fall back to using documentBox region via sharp
-      warnings.push('Perspective rectification via OpenCV failed, falling back to document-box crop');
-      workingImage = sharp(imagePath).greyscale();
+
+      // Extract ROI from warped image
+      const roi = await extractStudentCodeRoi(sharp(warpedBuffer));
+      roiBuffer = roi.color;
+      roiWidth = roi.width;
+      roiHeight = roi.height;
+    } catch {
+      // Fall back to direct extraction
+      warnings.push('Perspective transform failed, using direct ROI extraction');
+      const roi = await extractStudentCodeRoi(sharp(imagePath));
+      roiBuffer = roi.color;
+      roiWidth = roi.width;
+      roiHeight = roi.height;
     }
   } else {
-    // No corners or no OpenCV: work on the original image but use documentBox for relative ROI
-    workingImage = sharp(imagePath).greyscale();
-    inputImageWidth = detection.width || inputImageWidth;
-    inputImageHeight = detection.height || inputImageHeight;
-  }
-
-  // Compute grid coordinates relative to the working image.
-  // If we warped to reference size, IDENTITY_GRID is absolute; otherwise map from detection.documentBox
-  let gridX: number;
-  let gridY: number;
-  let gridWidth: number;
-  let gridHeight: number;
-  if (inputImageWidth === REFERENCE_WIDTH && inputImageHeight === REFERENCE_HEIGHT) {
-    gridX = IDENTITY_GRID.x;
-    gridY = IDENTITY_GRID.y;
-    gridWidth = IDENTITY_GRID.width;
-    gridHeight = IDENTITY_GRID.height;
-  } else {
-    const scaleX = detection.documentBox.width / REFERENCE_WIDTH;
-    const scaleY = detection.documentBox.height / REFERENCE_HEIGHT;
-    // Try to auto-locate the identity grid within the detected document box if available
-    const located = await (async () => {
-      try {
-        const docLeft = Math.max(0, Math.floor(detection.documentBox.x));
-        const docTop = Math.max(0, Math.floor(detection.documentBox.y));
-        const docW = Math.max(1, Math.floor(detection.documentBox.width));
-        const docH = Math.max(1, Math.floor(detection.documentBox.height));
-        const probeW = Math.min(1200, Math.max(200, docW));
-        const probeH = Math.max(200, Math.round((docH / docW) * probeW));
-
-        const cropped = await sharp(imagePath)
-          .extract({ left: docLeft, top: docTop, width: docW, height: docH })
-          .resize(probeW, probeH, { fit: 'fill' })
-          .greyscale()
-          .raw()
-          .toBuffer();
-
-        // compute vertical projection (dark pixels per column)
-        const colSums: number[] = new Array(probeW).fill(0);
-        const thresh = 200;
-        for (let y = 0; y < probeH; y += 1) {
-          for (let x = 0; x < probeW; x += 1) {
-            const v = cropped[y * probeW + x] || 255;
-            if (v < thresh) colSums[x] += 1;
-          }
-        }
-
-        const expectedGridW = Math.max(20, Math.round((IDENTITY_GRID.width / REFERENCE_WIDTH) * probeW));
-        // sliding window to find area with maximum dark activity (candidate grid X)
-        let bestX = 0;
-        let bestSum = -1;
-        let windowSum = 0;
-        for (let x = 0; x < probeW; x += 1) {
-          windowSum += colSums[x] || 0;
-          if (x >= expectedGridW) windowSum -= colSums[x - expectedGridW] || 0;
-          if (x >= expectedGridW - 1) {
-            const left = x - (expectedGridW - 1);
-            if (windowSum > bestSum) {
-              bestSum = windowSum;
-              bestX = left;
-            }
-          }
-        }
-
-        // horizontal projection to find vertical placement
-        const rowSums: number[] = new Array(probeH).fill(0);
-        for (let y = 0; y < probeH; y += 1) {
-          let s = 0;
-          for (let x = bestX; x < Math.min(probeW, bestX + expectedGridW); x += 1) {
-            const v = cropped[y * probeW + x] || 255;
-            if (v < thresh) s += 1;
-          }
-          rowSums[y] = s;
-        }
-
-        const expectedGridH = Math.max(60, Math.round((IDENTITY_GRID.height / REFERENCE_HEIGHT) * probeH));
-        let bestY = 0;
-        let bestRowSum = -1;
-        let rowWindow = 0;
-        for (let y = 0; y < probeH; y += 1) {
-          rowWindow += rowSums[y] || 0;
-          if (y >= expectedGridH) rowWindow -= rowSums[y - expectedGridH] || 0;
-          if (y >= expectedGridH - 1) {
-            const top = y - (expectedGridH - 1);
-            if (rowWindow > bestRowSum) {
-              bestRowSum = rowWindow;
-              bestY = top;
-            }
-          }
-        }
-
-        const scaleBackX = docW / probeW;
-        const scaleBackY = docH / probeH;
-        const mappedX = docLeft + Math.max(0, Math.round(bestX * scaleBackX));
-        const mappedY = docTop + Math.max(0, Math.round(bestY * scaleBackY));
-        const mappedW = Math.max(1, Math.round(expectedGridW * scaleBackX));
-        const mappedH = Math.max(1, Math.round(expectedGridH * scaleBackY));
-
-        return { x: mappedX, y: mappedY, width: mappedW, height: mappedH };
-      } catch (err) {
-        return null;
-      }
-    })();
-
-    if (located) {
-      gridX = located.x;
-      gridY = located.y;
-      gridWidth = located.width;
-      gridHeight = located.height;
-    } else {
-      gridX = (detection.documentBox.x || 0) + IDENTITY_GRID.x * scaleX;
-      gridY = (detection.documentBox.y || 0) + IDENTITY_GRID.y * scaleY;
-      gridWidth = Math.max(1, IDENTITY_GRID.width * scaleX);
-      gridHeight = Math.max(1, IDENTITY_GRID.height * scaleY);
+    // Fallback: no OpenCV or corners not detected, extract ROI directly from original image
+    if (cv || (detection.corners && detection.corners.length !== 4)) {
+      warnings.push('OpenCV warp not available, using direct ROI extraction');
     }
+    const roi = await extractStudentCodeRoi(sharp(imagePath));
+    roiBuffer = roi.color;
+    roiWidth = roi.width;
+    roiHeight = roi.height;
   }
 
-  const cellWidth = gridWidth / IDENTITY_GRID.columns;
-  const cellHeight = gridHeight / IDENTITY_GRID.rows;
-  const bubbleSize = Math.max(8, Math.min(cellWidth, cellHeight) * 0.75);
+  // Load ROI image data
+  let roiMat: GrayImageData;
+  
+  if (cv) {
+    try {
+      const cvMat = cv.imdecode(roiBuffer).bgrToGray();
+      // Also extract raw grayscale pixels for robust per-patch processing
+      const pixels = await sharp(Buffer.from(roiBuffer)).greyscale().raw().toBuffer();
+      roiMat = {
+        pixels,
+        width: roiWidth,
+        height: roiHeight,
+        isCvMat: true,
+        cvMat: cvMat,
+      };
+    } catch {
+      // Fall back to pixel-based approach
+      const pixels = await sharp(Buffer.from(roiBuffer))
+        .greyscale()
+        .raw()
+        .toBuffer();
+      roiMat = {
+        pixels,
+        width: roiWidth,
+        height: roiHeight,
+        isCvMat: false,
+      };
+    }
+  } else {
+    // No OpenCV, use pixel-based approach
+    const pixels = await sharp(Buffer.from(roiBuffer))
+      .greyscale()
+      .raw()
+      .toBuffer();
+    roiMat = {
+      pixels,
+      width: roiWidth,
+      height: roiHeight,
+      isCvMat: false,
+    };
+  }
+  
+  const grid = buildStudentCodeGrid(roiWidth, roiHeight);
 
   const digits: string[] = [];
   let detectedColumns = 0;
   let totalConfidence = 0;
+  const selectedCircles: DetectedCircle[] = [];
 
-  for (let column = 0; column < IDENTITY_GRID.columns; column += 1) {
-    // For each column, score an annulus around the bubble core so the printed numeral in empty circles does not dominate.
-    const fillRatios: { row: number; ratio: number }[] = [];
-    for (let row = 0; row < IDENTITY_GRID.rows; row += 1) {
-      const left = Math.max(0, Math.floor(gridX + column * cellWidth));
-      const top = Math.max(0, Math.floor(gridY + row * cellHeight));
-      const w = Math.max(1, Math.floor(cellWidth));
-      const h = Math.max(1, Math.floor(cellHeight));
-      const probeWidth = Math.max(1, Math.floor(w * 0.72));
-      const probeHeight = Math.max(1, Math.floor(h * 0.72));
-      const probeLeft = Math.max(0, left + Math.floor((w - probeWidth) / 2));
-      const probeTop = Math.max(0, top + Math.floor((h - probeHeight) / 2));
+  // Prepare matrix [digit 0..9][column 0..7]
+  const scoreMatrix: number[][] = Array.from({ length: 10 }, () => Array.from({ length: STUDENT_CODE_GRID.columns }, () => 0));
 
-      try {
-        let ratio = 0;
-        if (cv) {
-          const patch = await workingImage
-            .clone()
-            .extract({ left: probeLeft, top: probeTop, width: probeWidth, height: probeHeight })
-            .png()
-            .toBuffer();
+  for (let column = 0; column < grid.centers.length; column += 1) {
+    const candidateCenters = grid.centers[column].filter((c) => c.row >= 1 && c.row <= 10);
+    const scores: { row: number; ratio: number; circle: DetectedCircle }[] = [];
 
-          const patchMat = cv.imdecode(patch);
-          const patchGray = patchMat.channels > 1 ? patchMat.bgrToGray() : patchMat;
-          const binary = patchGray.threshold(0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
-          const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
-          const eroded = binary.erode(kernel).erode(kernel).erode(kernel);
-          const contours = eroded.findContours(cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
-          let bestArea = 0;
-          for (const contour of contours) {
-            if (contour.area > bestArea) {
-              bestArea = contour.area;
-            }
-          }
-          ratio = bestArea / Math.max(1, probeWidth * probeHeight);
-        } else {
-          const patch = await workingImage
-            .clone()
-            .extract({ left: probeLeft, top: probeTop, width: probeWidth, height: probeHeight })
-            .raw()
-            .toBuffer();
-
-          const threshold = 180;
-          const centerX = (probeWidth - 1) / 2;
-          const centerY = (probeHeight - 1) / 2;
-          const outerRadius = Math.min(probeWidth, probeHeight) * 0.42;
-          const innerRadius = Math.min(probeWidth, probeHeight) * 0.18;
-          let darkCount = 0;
-          let maskCount = 0;
-
-          for (let py = 0; py < probeHeight; py += 1) {
-            for (let px = 0; px < probeWidth; px += 1) {
-              const dx = px - centerX;
-              const dy = py - centerY;
-              const dist2 = dx * dx + dy * dy;
-              if (dist2 > outerRadius * outerRadius || dist2 < innerRadius * innerRadius) continue;
-              maskCount += 1;
-              const value = patch[py * probeWidth + px] || 255;
-              if (value < threshold) darkCount += 1;
-            }
-          }
-
-          ratio = darkCount / Math.max(1, maskCount);
+    for (const center of candidateCenters) {
+      // local vertical search around center.y
+      let bestRatio = -1;
+      let bestY = center.y;
+      for (let dy = -SHIFT_PIXELS; dy <= SHIFT_PIXELS; dy += 1) {
+        const testY = center.y + dy;
+        const ratio = scoreFixedCircleFill(roiMat, { x: center.x, y: testY, radius: center.radius });
+        if (ratio > bestRatio) {
+          bestRatio = ratio;
+          bestY = testY;
         }
-        fillRatios.push({ row, ratio });
-      } catch (err) {
-        fillRatios.push({ row, ratio: 0 });
       }
+
+      // store locked center (with adjusted y)
+      const locked: DetectedCircle = { x: center.x, y: bestY, radius: center.radius };
+      scoreMatrix[center.row - 1][column] = bestRatio;
+      scores.push({ row: center.row, ratio: bestRatio, circle: locked });
     }
 
-    fillRatios.sort((a, b) => b.ratio - a.ratio);
-    const best = fillRatios[0];
-    const second = fillRatios[1] || { ratio: 0, row: -1 };
-    const ratioGap = best.ratio - second.ratio;
+    scores.sort((left, right) => right.ratio - left.ratio);
+    const best = scores[0];
+    const second = scores[1] || { ratio: 0, row: -1, circle: best ? best.circle : { x: 0, y: 0, radius: 0 } };
+    const fillGap = best ? best.ratio - second.ratio : 0;
 
     if (process.env.OMR_DEBUG === '1') {
       // eslint-disable-next-line no-console
-      console.log(
-        '[OMR_DEBUG]',
-        'column',
-        column + 1,
-        fillRatios.slice(0, 3).map((item) => ({ row: item.row, ratio: Number(item.ratio.toFixed(3)) }))
-      );
+      console.log('[OMR_DEBUG]', 'column', column + 1, 'all scores:', scores.map((item) => Number(item.ratio.toFixed(3))), 'top3:', scores.slice(0, 3).map((item) => ({ row: item.row, fillRatio: Number(item.ratio.toFixed(3)), x: Number(item.circle.x.toFixed(1)), y: Number(item.circle.y.toFixed(1)), digit: item.row - 1 })));
+      if (best && best.ratio === 0) {
+        // eslint-disable-next-line no-console
+        console.log('[OMR_DEBUG] WARNING: All scores are 0! ROI dimensions:', roiWidth, 'x', roiHeight, 'grid center:', grid.centers[column][1]);
+      }
     }
 
-    // Accept only when fill ratio sufficiently high and clearly separated
-    if (best.ratio < 0.08 || ratioGap < 0.03) {
-      warnings.push(`Unable to confidently read MSSV digit at column ${column + 1}`);
+    if (!best || best.ratio < MIN_MARK_THRESHOLD || fillGap < TIE_GAP) {
+      warnings.push(`MSSV column ${column + 1} is not confident enough`);
       digits.push('?');
       continue;
     }
 
-    digits.push(String(best.row));
+    const digit = best.row - 1;
+    digits.push(String(digit));
     detectedColumns += 1;
     totalConfidence += Math.max(0, Math.min(1, best.ratio));
+    selectedCircles.push(best.circle);
+  }
+
+  // If dumpScores flag set, print a clear matrix: rows digit 0..9, columns 1..8
+  if (options?.dumpScores) {
+    // Print header
+    // eslint-disable-next-line no-console
+    console.log('SCORES MATRIX (rows=digits 0..9, cols=1..8)');
+    for (let r = 0; r < 10; r += 1) {
+      const rowStr = scoreMatrix[r].map((v) => v.toFixed(3).padStart(6)).join(' ');
+      // eslint-disable-next-line no-console
+      console.log(`digit ${r}: ${rowStr}`);
+    }
   }
 
   const studentCode = digits.every((digit) => digit === '?') ? null : digits.join('');
   if (!studentCode) {
-    warnings.push('OMR student code could not be resolved from the MSSV grid');
+    warnings.push('OMR student code could not be resolved from the MSSV grid ROI');
   }
 
   const confidence = detectedColumns > 0 ? Number((totalConfidence / detectedColumns).toFixed(3)) : 0;
+
+  if (options?.exportOverlayPath) {
+    try {
+      if (cv && roiMat.isCvMat && roiMat.cvMat) {
+        // Use OpenCV for overlay if available
+        const overlayMat = cv.imdecode(roiBuffer);
+        // Draw ROI bounding rectangle (around the ROI image itself)
+        const left = 0;
+        const top = 0;
+        const right = roiWidth - 1;
+        const bottom = roiHeight - 1;
+        overlayMat.drawLine(new cv.Point2(left, top), new cv.Point2(right, top), new cv.Vec3(255, 0, 0), 2);
+        overlayMat.drawLine(new cv.Point2(right, top), new cv.Point2(right, bottom), new cv.Vec3(255, 0, 0), 2);
+        overlayMat.drawLine(new cv.Point2(right, bottom), new cv.Point2(left, bottom), new cv.Vec3(255, 0, 0), 2);
+        overlayMat.drawLine(new cv.Point2(left, bottom), new cv.Point2(left, top), new cv.Vec3(255, 0, 0), 2);
+
+        // Draw all centers (including handwriting row) as small red circles
+        for (const rowCenters of grid.centers) {
+          for (const center of rowCenters) {
+            overlayMat.drawCircle(new cv.Point2(Math.round(center.x), Math.round(center.y)), Math.max(1, Math.round(center.radius)), new cv.Vec3(0, 0, 255), 1);
+          }
+        }
+
+        // Highlight chosen bubble per column (green)
+        for (const candidate of selectedCircles) {
+          overlayMat.drawCircle(new cv.Point2(Math.round(candidate.x), Math.round(candidate.y)), Math.max(2, Math.round(candidate.radius)), new cv.Vec3(0, 255, 0), 2);
+        }
+
+        // Draw row index labels (0..9) at right edge for rows 1..10
+        const font = cv.FONT_HERSHEY_SIMPLEX;
+        const fontScale = 0.6;
+        const thickness = 1;
+        for (let r = 1; r <= 10; r += 1) {
+          const label = String(r - 1);
+          const center = grid.centers[0][r];
+          const org = new cv.Point2(Math.max(6, roiWidth - 24), Math.round(center.y) + 6);
+          overlayMat.putText(label, org, font, fontScale, new cv.Vec3(0, 255, 255), thickness);
+        }
+        await fs.promises.mkdir(path.dirname(options.exportOverlayPath), { recursive: true });
+        cv.imwrite(options.exportOverlayPath, overlayMat);
+      } else {
+        // Fallback: create overlay using sharp (draws SVG overlay)
+        await fs.promises.mkdir(path.dirname(options.exportOverlayPath), { recursive: true });
+        // For fallback, just copy the roi color image - full overlay drawing without cv would be complex
+        await fs.promises.writeFile(options.exportOverlayPath, roiBuffer);
+      }
+    } catch (err) {
+      // ignore overlay export failures
+    }
+  }
 
   return {
     fullName: null,
