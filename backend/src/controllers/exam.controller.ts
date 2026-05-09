@@ -17,8 +17,7 @@ import {
 } from '../services/docx.service';
 import { uploadImageToCloudinary, uploadPdfToCloudinary } from '../services/cloudinary.service';
 import { mergeImagesToPdfBuffer } from '../services/pdf.service';
-import { calibrateOmrTemplate, detectDocumentForOmr, detectMarkedOptions, extractStudentIdentityFromOmr, OmrTemplate } from '../services/omr.service';
-import { preprocessScanForAnalysis } from '../services/image-preprocess.service';
+import { processOmrImage, fuzzyMatchStudentCode } from '../services/omr-client.service';
 import { config } from '../config';
 import jwt from 'jsonwebtoken';
 import fs from 'fs';
@@ -514,47 +513,13 @@ const matchesStudentCodePattern = (studentCode: string, candidatePattern: string
 
 const resolveStudentFromIdentity = (
   students: StudentIdentity[],
-  identity: { studentCode: string | null; fullName: string | null }
+  identity: { studentCode: string | null; fullName?: string | null }
 ): { matched: StudentIdentity | null; ambiguous: StudentIdentity[] } => {
-  const normalizedCode = normalizeStudentCode(identity.studentCode);
-  const normalizedName = normalizeIdentityText(identity.fullName);
-
-  if (normalizedCode) {
-    const codeMatches = students.filter((student) => {
-      const studentCode = normalizeStudentCode(student.username);
-      return studentCode === normalizedCode || matchesStudentCodePattern(studentCode, normalizedCode);
-    });
-    if (codeMatches.length === 1) {
-      return { matched: codeMatches[0], ambiguous: [] };
-    }
-    if (codeMatches.length > 1) {
-      return { matched: null, ambiguous: codeMatches };
-    }
+  const matchResult = fuzzyMatchStudentCode(identity.studentCode || '', students);
+  if (matchResult.studentId !== null) {
+    return { matched: matchResult.candidates[0], ambiguous: [] };
   }
-
-  if (normalizedName) {
-    const exactNameMatches = students.filter((student) => normalizeIdentityText(student.fullName) === normalizedName);
-    if (exactNameMatches.length === 1) {
-      return { matched: exactNameMatches[0], ambiguous: [] };
-    }
-    if (exactNameMatches.length > 1) {
-      return { matched: null, ambiguous: exactNameMatches };
-    }
-
-    const fuzzyNameMatches = students.filter((student) => {
-      const normalizedStudentName = normalizeIdentityText(student.fullName);
-      return normalizedStudentName.includes(normalizedName) || normalizedName.includes(normalizedStudentName);
-    });
-
-    if (fuzzyNameMatches.length === 1) {
-      return { matched: fuzzyNameMatches[0], ambiguous: [] };
-    }
-    if (fuzzyNameMatches.length > 1) {
-      return { matched: null, ambiguous: fuzzyNameMatches };
-    }
-  }
-
-  return { matched: null, ambiguous: [] };
+  return { matched: null, ambiguous: matchResult.candidates };
 };
 
 const ensureSessionSubmissionRows = async (sessionId: number, classId: number): Promise<void> => {
@@ -1003,7 +968,7 @@ const processDraftScanIdentityAsync = async (params: {
   const { draftId, frontPagePath, enrolledStudents } = params;
 
   try {
-    const identity = await extractStudentIdentityFromOmr(frontPagePath);
+    const identity = await processOmrImage(frontPagePath);
     const warnings = Array.isArray(identity.warnings) ? identity.warnings : [];
     const blurryFailure = warnings.some((warning) => /warp|opencv|perspective|rectification/i.test(warning));
 
@@ -1012,23 +977,25 @@ const processDraftScanIdentityAsync = async (params: {
         status: 'BLURRY_ERROR',
         studentId: null,
         omrResult: {
-          fullName: identity.fullName,
+          fullName: null,
           studentCode: identity.studentCode,
           confidence: identity.confidence,
+          answers: identity.answers,
           warnings,
         },
       });
       return;
     }
 
-    if ((!identity.studentCode && !identity.fullName) || identity.confidence < DRAFT_UNIDENTIFIED_CONFIDENCE_THRESHOLD) {
+    if (!identity.studentCode || identity.confidence < DRAFT_UNIDENTIFIED_CONFIDENCE_THRESHOLD) {
       await updateDraftStatus(draftId, {
         status: 'UNIDENTIFIED',
         studentId: null,
         omrResult: {
-          fullName: identity.fullName,
+          fullName: null,
           studentCode: identity.studentCode,
           confidence: identity.confidence,
+          answers: identity.answers,
           warnings,
         },
       });
@@ -1041,9 +1008,10 @@ const processDraftScanIdentityAsync = async (params: {
         status: 'VALID',
         studentId: resolved.matched.id,
         omrResult: {
-          fullName: identity.fullName,
+          fullName: null,
           studentCode: identity.studentCode,
           confidence: identity.confidence,
+          answers: identity.answers,
           warnings,
           matchedStudentId: resolved.matched.id,
         },
@@ -1055,9 +1023,10 @@ const processDraftScanIdentityAsync = async (params: {
       status: 'UNIDENTIFIED',
       studentId: null,
       omrResult: {
-        fullName: identity.fullName,
+        fullName: null,
         studentCode: identity.studentCode,
         confidence: identity.confidence,
+        answers: identity.answers,
         warnings,
         ambiguousStudents: resolved.ambiguous.map((student) => ({ id: student.id, fullName: student.fullName, username: student.username })),
       },
@@ -1228,55 +1197,29 @@ const extractBatchScanGradingData = async (
 
     let objectiveAnswers: Record<string, string> = {};
     const omrWarnings: string[] = [];
+    let extractedIdentity = { fullName: null as string | null, studentCode: null as string | null };
 
-    if (mcqQuestions.length > 0) {
-      const firstScannablePath = gradingScanPaths[0];
-      if (!firstScannablePath) {
-        throw createHttpError(422, TEACHER_QUALITY_MESSAGE, {
-          errorCode: 'QUALITY_FAIL',
-        });
-      }
-
-      if (!scanBlueprint?.omrTemplate || !Array.isArray(scanBlueprint.omrTemplate.questions) || scanBlueprint.omrTemplate.questions.length === 0) {
-        omrWarnings.push('OMR template is missing from exam blueprint; objective answers could not be extracted locally.');
-      } else {
-        const preprocessedOmr = await preprocessScanForAnalysis(firstScannablePath);
-        try {
-          const detection = await detectDocumentForOmr(preprocessedOmr.processedPath);
-          const calibratedTemplate = calibrateOmrTemplate(scanBlueprint.omrTemplate as OmrTemplate, detection);
-          objectiveAnswers = normalizeObjectiveAnswers(
-            await detectMarkedOptions(preprocessedOmr.processedPath, calibratedTemplate)
-          );
-
-          omrWarnings.push(...detection.warnings, ...preprocessedOmr.warnings);
-          if (!detection.ready) {
-            omrWarnings.push('OMR first-page detection confidence is low.');
-          }
+    const firstScannablePath = gradingScanPaths[0];
+    if (firstScannablePath && (mcqQuestions.length > 0 || !options?.skipEssayGrading)) {
+      try {
+        const omrResult = await processOmrImage(firstScannablePath);
+        if (mcqQuestions.length > 0) {
+          objectiveAnswers = omrResult.answers || {};
+          omrWarnings.push(...(omrResult.warnings || []));
           if (Object.keys(objectiveAnswers).length === 0) {
             omrWarnings.push('No objective answers extracted by local OMR on the first page.');
           }
-        } catch (error) {
+        }
+        extractedIdentity.studentCode = omrResult.studentCode;
+      } catch (error) {
+        if (mcqQuestions.length > 0) {
           throw createHttpError(422, TEACHER_QUALITY_MESSAGE, {
             errorCode: 'QUALITY_FAIL',
             technicalMessage: (error as Error).message,
           });
-        } finally {
-          preprocessedOmr.cleanup();
         }
       }
     }
-
-    const extractedIdentity = await (async () => {
-      try {
-        const identity = await extractStudentIdentityFromOmr(gradingScanPaths[0]);
-        return {
-          fullName: identity.fullName,
-          studentCode: identity.studentCode,
-        };
-      } catch {
-        return { fullName: null, studentCode: null };
-      }
-    })();
 
     if (options?.skipEssayGrading) {
       const warnings = [
@@ -2616,7 +2559,7 @@ export const uploadMobileSubmissionScans = async (req: Request, res: Response): 
     }
 
     let studentId: number | null = Number.isFinite(Number(rawStudentId)) && rawStudentId > 0 ? rawStudentId : null;
-    let extractedIdentity: { fullName: string | null; studentCode: string | null } | null = null;
+    let extractedIdentity: { fullName?: string | null; studentCode: string | null } | null = null;
     const scanBlueprint = resolveExamScanBlueprint(session.exam.questions, session.exam.requirements);
     const passPlan = buildScanPassPlan(session.exam.questions, scanBlueprint);
     const expectedPages = resolveExpectedScannablePages(session.exam.scannablePages, passPlan, scanBlueprint);
@@ -2634,7 +2577,8 @@ export const uploadMobileSubmissionScans = async (req: Request, res: Response): 
       }
     } else {
       try {
-        extractedIdentity = await extractStudentIdentityFromOmr(files[0].path);
+        const identity = await processOmrImage(files[0].path);
+        extractedIdentity = { studentCode: identity.studentCode, fullName: null };
       } catch (error) {
         res.status(422).json({
           error: TEACHER_IDENTITY_MESSAGE,
@@ -3118,7 +3062,8 @@ export const uploadSubmissionScans = async (req: AuthRequest, res: Response): Pr
       }
 
       try {
-        extractedIdentity = await extractStudentIdentityFromOmr(files[0].path);
+        const identity = await processOmrImage(files[0].path);
+        extractedIdentity = { studentCode: identity.studentCode, fullName: null };
       } catch (error) {
         res.status(422).json({
           error: TEACHER_IDENTITY_MESSAGE,
@@ -3497,12 +3442,7 @@ export const gradeSubmissionWithAI = async (req: AuthRequest, res: Response): Pr
 export const gradeSubmissionWithOmr = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const submissionId = toInt(req.params.submissionId);
-    const { template } = req.body as { template: OmrTemplate };
-
-    if (!template || !Array.isArray(template.questions) || template.questions.length === 0) {
-      res.status(400).json({ error: 'OMR template is required' });
-      return;
-    }
+    // OMR template is now handled natively by the Python service
 
     const submission = await prisma.examSubmission.findUnique({
       where: { id: submissionId },
@@ -3534,32 +3474,19 @@ export const gradeSubmissionWithOmr = async (req: AuthRequest, res: Response): P
 
     const firstScan = scanEntries[0];
     const scanPath = await resolveScanPath(firstScan);
-    let detection: Awaited<ReturnType<typeof detectDocumentForOmr>> | null = null;
     let detectedAnswers: Record<string, string> = {};
+    let omrWarnings: string[] = [];
 
     try {
-      const preprocessed = await preprocessScanForAnalysis(scanPath);
-      try {
-        detection = await detectDocumentForOmr(preprocessed.processedPath);
-        const calibratedTemplate = calibrateOmrTemplate(template, detection);
-        detectedAnswers = await detectMarkedOptions(preprocessed.processedPath, calibratedTemplate);
-        if (preprocessed.warnings.length > 0) {
-          detection = {
-            ...detection,
-            warnings: [...new Set([...detection.warnings, ...preprocessed.warnings])],
-          };
-        }
-      } finally {
-        preprocessed.cleanup();
-      }
+      const omrResult = await processOmrImage(scanPath);
+      detectedAnswers = omrResult.answers || {};
+      omrWarnings = omrResult.warnings || [];
+    } catch (error) {
+      throw new Error('OMR processing failed: ' + (error as Error).message);
     } finally {
       if (path.basename(scanPath).startsWith('scan_tmp_')) {
         fs.unlink(scanPath, () => undefined);
       }
-    }
-
-    if (!detection) {
-      throw new Error('OMR preprocessing did not return detection results');
     }
 
     let objectiveScore = 0;
@@ -3583,7 +3510,7 @@ export const gradeSubmissionWithOmr = async (req: AuthRequest, res: Response): P
           objectiveScore,
           essayScore: 0,
           totalScore: objectiveScore,
-          responseLog: JSON.stringify({ detectedAnswers, detection }),
+          responseLog: JSON.stringify({ detectedAnswers, warnings: omrWarnings }),
         },
       });
 
@@ -3596,7 +3523,7 @@ export const gradeSubmissionWithOmr = async (req: AuthRequest, res: Response): P
           afterScore: objectiveScore,
           note: JSON.stringify({
             message: 'Objective questions graded via OMR pipeline',
-            warnings: detection.warnings,
+            warnings: omrWarnings,
           }),
         },
       });
@@ -4059,28 +3986,23 @@ export const completeScanningAndAutoGrade = async (req: AuthRequest, res: Respon
         try {
           const firstScan = sortScanEntriesByPassIndex(scanEntries)[0];
           const scanPath = await resolveScanPath(firstScan);
-          const preprocessed = await preprocessScanForAnalysis(scanPath);
           try {
-            const detection = await detectDocumentForOmr(preprocessed.processedPath);
-            const omrTemplate = scanBlueprint.omrTemplate;
-            if (omrTemplate) {
-              const calibrated = calibrateOmrTemplate(omrTemplate, detection);
-              const detected = await detectMarkedOptions(preprocessed.processedPath, calibrated);
-              omrResultsBySubmissionId.set(submission.id, detected);
+            const omrResult = await processOmrImage(scanPath);
+            const detected = omrResult.answers || {};
+            omrResultsBySubmissionId.set(submission.id, detected);
 
-              let objectiveScore = 0;
-              for (const eq of mcqExamQuestions) {
-                const submitted = (detected[String(eq.question.id)] || '').trim().toLowerCase();
-                const expected = (eq.question.answer || '').trim().toLowerCase();
-                if (submitted && submitted === expected) objectiveScore += eq.points;
-              }
-              omrObjectiveScoreBySubmissionId.set(submission.id, objectiveScore);
+            let objectiveScore = 0;
+            for (const eq of mcqExamQuestions) {
+              const submitted = (detected[String(eq.question.id)] || '').trim().toLowerCase();
+              const expected = (eq.question.answer || '').trim().toLowerCase();
+              if (submitted && submitted === expected) objectiveScore += eq.points;
             }
+            omrObjectiveScoreBySubmissionId.set(submission.id, objectiveScore);
+
           } finally {
-            preprocessed.cleanup();
-          }
-          if (path.basename(scanPath).startsWith('scan_tmp_')) {
-            fs.unlink(scanPath, () => undefined);
+            if (path.basename(scanPath).startsWith('scan_tmp_')) {
+              fs.unlink(scanPath, () => undefined);
+            }
           }
         } catch (omrError) {
           // OMR failure is non-fatal; score stays 0 for objective
@@ -4519,7 +4441,7 @@ export const exportExamAnswerKey = async (req: AuthRequest, res: Response): Prom
 export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const sessionId = toInt(req.params.sessionId);
-    const files = sortUploadedScanFiles(((req as AuthRequest & { files?: Express.Multer.File[] }).files || []) as Express.Multer.File[]);
+    const files = ((req as AuthRequest & { files?: Express.Multer.File[] }).files || []) as Express.Multer.File[];
 
     if (files.length === 0) {
       res.status(400).json({ error: 'At least one scan file is required' });
@@ -4577,6 +4499,7 @@ export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Prom
 
     const studentList = enrolledStudents.map((item) => item.student);
     const draftSets = chunkArray(files, pagesPerStudent);
+    const createdAtSeed = Date.now();
 
     const drafts = await prisma.$transaction(
       draftSets.map((fileSet, index) =>
@@ -4585,23 +4508,16 @@ export const uploadBulkExamScans = async (req: AuthRequest, res: Response): Prom
             sessionId,
             studentId: null,
             status: 'PENDING',
-            frontPageUrl: fileSet[0].path,
-            essayPagesUrls: JSON.stringify(fileSet.slice(1).map((file) => file.path)),
+            frontPageUrl: `uploads/temp/${fileSet[0].filename}`,
+            essayPagesUrls: JSON.stringify(fileSet.slice(1).map((file) => `uploads/temp/${file.filename}`)),
             omrResult: null,
+            createdAt: new Date(createdAtSeed + index),
           },
         })
       )
     );
 
-    for (const [index, draft] of drafts.entries()) {
-      void processDraftScanIdentityAsync({
-        draftId: draft.id,
-        frontPagePath: draftSets[index][0].path,
-        enrolledStudents: studentList,
-      }).catch((error) => {
-        console.error(`Draft scan processing failed for draft ${draft.id}:`, error);
-      });
-    }
+    // Removed automatic OMR processing; this is now triggered manually via checkDraftsIdentity
 
     res.status(201).json({
       message: `Staged ${drafts.length} draft scans for session ${sessionId}`,
@@ -4656,7 +4572,7 @@ export const listExamDraftScans = async (req: AuthRequest, res: Response): Promi
       include: {
         student: { select: { id: true, username: true, fullName: true } },
       },
-      orderBy: { createdAt: 'asc' },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
     });
 
     res.json({
@@ -4670,6 +4586,84 @@ export const listExamDraftScans = async (req: AuthRequest, res: Response): Promi
   } catch (error) {
     console.error('List exam draft scans error:', error);
     res.status(500).json({ error: 'Failed to list exam draft scans' });
+  }
+};
+
+export const reorderDraftScans = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const sessionId = toInt(req.params.sessionId);
+    const draftIdsRaw: unknown[] = Array.isArray(req.body?.draftIds) ? (req.body.draftIds as unknown[]) : [];
+    const draftIds = draftIdsRaw
+      .map((value: unknown) => toInt(value))
+      .filter((value: number) => Number.isFinite(value) && value > 0);
+
+    if (draftIds.length === 0) {
+      res.status(400).json({ error: 'draftIds is required' });
+      return;
+    }
+
+    if (new Set(draftIds).size !== draftIds.length) {
+      res.status(400).json({ error: 'draftIds must not contain duplicates' });
+      return;
+    }
+
+    const session = await prisma.examSession.findUnique({
+      where: { id: sessionId },
+      include: { exam: true },
+    });
+
+    if (!session || session.exam.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const existingDrafts = await prisma.examDraftScan.findMany({
+      where: { sessionId },
+      select: { id: true },
+    });
+
+    if (existingDrafts.length !== draftIds.length) {
+      res.status(400).json({ error: 'draftIds must include all drafts in this session' });
+      return;
+    }
+
+    const existingIdSet = new Set(existingDrafts.map((draft) => draft.id));
+    const requestIsComplete = draftIds.every((draftId: number) => existingIdSet.has(draftId));
+
+    if (!requestIsComplete) {
+      res.status(400).json({ error: 'Invalid draftIds payload for this session' });
+      return;
+    }
+
+    const createdAtSeed = Date.now();
+    await prisma.$transaction(
+      draftIds.map((draftId: number, index: number) =>
+        prisma.examDraftScan.update({
+          where: { id: draftId },
+          data: { createdAt: new Date(createdAtSeed + index) },
+        })
+      )
+    );
+
+    const reorderedDrafts = await prisma.examDraftScan.findMany({
+      where: { sessionId },
+      include: {
+        student: { select: { id: true, username: true, fullName: true } },
+      },
+      orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+    });
+
+    res.json({
+      message: 'Draft order updated',
+      drafts: reorderedDrafts.map((draft) => ({
+        ...draft,
+        essayPagesUrls: toStringArray(draft.essayPagesUrls),
+        omrResult: parseDraftOmrResult(draft.omrResult),
+      })),
+    });
+  } catch (error) {
+    console.error('Reorder draft scans error:', error);
+    res.status(500).json({ error: 'Failed to reorder draft scans' });
   }
 };
 
@@ -4738,6 +4732,78 @@ export const assignDraftScanStudent = async (req: AuthRequest, res: Response): P
   }
 };
 
+export const reorderDraftScanPages = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const sessionId = toInt(req.params.sessionId);
+    const draftId = toInt(req.params.draftId);
+    const pagePathsRaw: unknown[] = Array.isArray(req.body?.pagePaths) ? (req.body.pagePaths as unknown[]) : [];
+    const pagePaths = pagePathsRaw
+      .map((value: unknown) => String(value || '').trim().replace(/^\/+/, ''))
+      .filter((value: string) => value.length > 0);
+
+    if (pagePaths.length === 0) {
+      res.status(400).json({ error: 'pagePaths is required' });
+      return;
+    }
+
+    if (new Set(pagePaths).size !== pagePaths.length) {
+      res.status(400).json({ error: 'pagePaths must not contain duplicates' });
+      return;
+    }
+
+    const draft = await prisma.examDraftScan.findUnique({
+      where: { id: draftId },
+      include: {
+        session: { include: { exam: true } },
+      },
+    });
+
+    if (!draft || draft.sessionId !== sessionId || draft.session.exam.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Draft scan not found' });
+      return;
+    }
+
+    const currentPaths = getDraftScanPaths(draft).map((pathValue) => String(pathValue).replace(/^\/+/, ''));
+    if (currentPaths.length !== pagePaths.length) {
+      res.status(400).json({ error: 'pagePaths length does not match existing draft pages' });
+      return;
+    }
+
+    const currentPathSet = new Set(currentPaths);
+    const hasOnlyExistingPages = pagePaths.every((pathValue: string) => currentPathSet.has(pathValue));
+    if (!hasOnlyExistingPages) {
+      res.status(400).json({ error: 'pagePaths contains invalid paths for this draft' });
+      return;
+    }
+
+    const updated = await prisma.examDraftScan.update({
+      where: { id: draftId },
+      data: {
+        frontPageUrl: pagePaths[0],
+        essayPagesUrls: JSON.stringify(pagePaths.slice(1)),
+        studentId: null,
+        status: 'PENDING',
+        omrResult: null,
+      },
+      include: {
+        student: { select: { id: true, username: true, fullName: true } },
+      },
+    });
+
+    res.json({
+      message: 'Draft pages reordered successfully',
+      draft: {
+        ...updated,
+        essayPagesUrls: toStringArray(updated.essayPagesUrls),
+        omrResult: parseDraftOmrResult(updated.omrResult),
+      },
+    });
+  } catch (error) {
+    console.error('Reorder draft scan pages error:', error);
+    res.status(500).json({ error: 'Failed to reorder draft pages' });
+  }
+};
+
 export const reuploadDraftScanFrontPage = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const sessionId = toInt(req.params.sessionId);
@@ -4765,7 +4831,7 @@ export const reuploadDraftScanFrontPage = async (req: AuthRequest, res: Response
     const updated = await prisma.examDraftScan.update({
       where: { id: draftId },
       data: {
-        frontPageUrl: file.path,
+        frontPageUrl: `uploads/temp/${file.filename}`,
         studentId: null,
         status: 'PENDING',
         omrResult: null,
@@ -4805,6 +4871,89 @@ export const reuploadDraftScanFrontPage = async (req: AuthRequest, res: Response
   } catch (error) {
     console.error('Reupload draft scan front page error:', error);
     res.status(500).json({ error: 'Failed to replace draft front page' });
+  }
+};
+
+export const deleteDraftScan = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const sessionId = toInt(req.params.sessionId);
+    const draftId = toInt(req.params.draftId);
+
+    const draft = await prisma.examDraftScan.findUnique({
+      where: { id: draftId },
+      include: { session: { include: { exam: true } } },
+    });
+
+    if (!draft || draft.sessionId !== sessionId || draft.session.exam.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Draft scan not found' });
+      return;
+    }
+
+    const pathsToRemove = [draft.frontPageUrl];
+    try {
+      const essayPaths = JSON.parse(draft.essayPagesUrls);
+      if (Array.isArray(essayPaths)) {
+        pathsToRemove.push(...essayPaths);
+      }
+    } catch {}
+
+    await prisma.examDraftScan.delete({ where: { id: draftId } });
+    await removeLocalPaths(pathsToRemove);
+
+    res.json({ message: 'Draft scan deleted successfully', draftId });
+  } catch (error) {
+    console.error('Delete draft scan error:', error);
+    res.status(500).json({ error: 'Failed to delete draft scan' });
+  }
+};
+
+export const checkDraftsIdentity = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const sessionId = toInt(req.params.sessionId);
+    const session = await prisma.examSession.findUnique({
+      where: { id: sessionId },
+      include: { exam: true },
+    });
+
+    if (!session || session.exam.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const pendingDrafts = await prisma.examDraftScan.findMany({
+      where: { sessionId, status: 'PENDING' },
+    });
+
+    if (pendingDrafts.length === 0) {
+      res.json({ message: 'No pending drafts to check' });
+      return;
+    }
+
+    const enrolledStudents = await prisma.classStudent.findMany({
+      where: { classId: session.classId },
+      select: { student: { select: { id: true, username: true, fullName: true } } },
+    });
+    const studentList = enrolledStudents.map((item) => item.student);
+
+    res.json({ message: `Started identity check for ${pendingDrafts.length} drafts` });
+
+    // Process sequentially in the background
+    void (async () => {
+      for (const draft of pendingDrafts) {
+        try {
+          await processDraftScanIdentityAsync({
+            draftId: draft.id,
+            frontPagePath: path.resolve(process.cwd(), draft.frontPageUrl), // Ensure absolute path for fs
+            enrolledStudents: studentList,
+          });
+        } catch (error) {
+          console.error(`Draft scan identity check failed for draft ${draft.id}:`, error);
+        }
+      }
+    })();
+  } catch (error) {
+    console.error('Check drafts identity error:', error);
+    res.status(500).json({ error: 'Failed to start identity check' });
   }
 };
 
@@ -5126,6 +5275,28 @@ export const getSessionIssuesReport = async (req: AuthRequest, res: Response): P
       },
     });
 
+    const mappedDrafts = await prisma.examDraftScan.findMany({
+      where: {
+        sessionId,
+        status: 'VALID',
+        studentId: { not: null },
+      },
+      select: {
+        studentId: true,
+        frontPageUrl: true,
+        essayPagesUrls: true,
+      },
+    });
+
+    const readyDraftStudentIds = new Set<number>();
+    for (const draft of mappedDrafts) {
+      if (!draft.studentId) continue;
+      const draftPageCount = getDraftScanPaths(draft).length;
+      if (draftPageCount >= expectedPages) {
+        readyDraftStudentIds.add(draft.studentId);
+      }
+    }
+
     type SessionIssue = {
       submissionId: number;
       studentId: number;
@@ -5153,6 +5324,11 @@ export const getSessionIssuesReport = async (req: AuthRequest, res: Response): P
 
       // Check for missing exam
       if (scanCount === 0) {
+        if (readyDraftStudentIds.has(submission.studentId)) {
+          readyForGrading += 1;
+          continue;
+        }
+
         missingExamsCount += 1;
         issues.push({
           submissionId: submission.id,

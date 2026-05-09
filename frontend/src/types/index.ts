@@ -202,6 +202,17 @@ export interface BulkUploadSubmissionGroup {
   files: string[];
 }
 
+export interface ExamDraftScan {
+  id: number;
+  sessionId: number;
+  studentId: number | null;
+  status: 'PENDING' | 'VALID' | 'UNIDENTIFIED' | 'BLURRY_ERROR';
+  frontPageUrl: string;
+  essayPagesUrls: string[];
+  omrResult: any;
+  student?: { id: number; username: string; fullName: string };
+}
+
 export interface BulkUploadResponse {
   message: string;
   totalImages: number;

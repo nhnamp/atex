@@ -1,10 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { AlertTriangle, BarChart3, Camera, CameraOff, CheckCircle2, ClipboardCheck, Download, Eye, RefreshCw, Upload, XCircle, Copy, Repeat } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, BarChart3, Camera, CameraOff, CheckCircle2, ClipboardCheck, Download, Eye, GripVertical, RefreshCw, Upload, XCircle, Copy, Repeat, Search } from 'lucide-react';
 import Layout from '../../components/Layout';
 import api from '../../api';
-import { BulkUploadResponse, BuiltExam, Class, ExamScanEntry, ExamSession, ExamSubmission, LearningOutcome, RegradeResponse, SessionIssuesReport } from '../../types';
+import { BulkUploadResponse, BuiltExam, Class, ExamScanEntry, ExamSession, ExamSubmission, LearningOutcome, RegradeResponse, SessionIssuesReport, ExamDraftScan } from '../../types';
 
 type TabKey = 'AI_GRADING' | 'REPORT' | 'EXAM_VIEW';
 
@@ -74,6 +74,23 @@ const toScanAccessUrl = (scan: ExamScanEntry): string | undefined => {
   return undefined;
 };
 
+const parseDraftEssayPages = (essayPagesUrls: string[] | undefined): string[] => {
+  if (!Array.isArray(essayPagesUrls) || essayPagesUrls.length === 0) return [];
+  try {
+    const parsed = JSON.parse(essayPagesUrls[0] || '[]');
+    if (Array.isArray(parsed)) {
+      return parsed.map((item) => String(item));
+    }
+  } catch {
+    // fall through to the already-normalized array payload
+  }
+  return essayPagesUrls.map((item) => String(item));
+};
+
+const getDraftPagePaths = (draft: Pick<ExamDraftScan, 'frontPageUrl' | 'essayPagesUrls'>): string[] => {
+  return [draft.frontPageUrl, ...parseDraftEssayPages(draft.essayPagesUrls)];
+};
+
 const normalizeScanEntry = (scan: ExamScanEntry): ExamScanEntry => ({
   ...scan,
   accessUrl: toScanAccessUrl(scan),
@@ -114,6 +131,12 @@ type ExamRequirementsSummary = {
   }>;
 };
 
+type AssignableStudent = {
+  id: number;
+  username: string;
+  fullName: string;
+};
+
 const TeacherSessionManagement: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -136,9 +159,25 @@ const TeacherSessionManagement: React.FC = () => {
   const [workflowSummary, setWorkflowSummary] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
   const [bulkUploading, setBulkUploading] = useState(false);
+  const [isCheckingIdentity, setIsCheckingIdentity] = useState(false);
+  const [stagedFiles, setStagedFiles] = useState<{ id: string; file: File; preview: string }[]>([]);
+  const [draggedIdx, setDraggedIdx] = useState<number | null>(null);
+  const [viewingStagedImageIdx, setViewingStagedImageIdx] = useState<number | null>(null);
+  const [replacingIdx, setReplacingIdx] = useState<number | null>(null);
+  const replaceInputRef = useRef<HTMLInputElement>(null);
   const [bulkUploadResult, setBulkUploadResult] = useState<BulkUploadResponse | null>(null);
-  const bulkUploadClassifications = bulkUploadResult?.classifications ?? [];
-  const bulkUploadDrafts = bulkUploadResult?.drafts ?? [];
+  const [draftScans, setDraftScans] = useState<ExamDraftScan[]>([]);
+  const [viewingDraft, setViewingDraft] = useState<ExamDraftScan | null>(null);
+  const [viewingDraftImagePath, setViewingDraftImagePath] = useState<string | null>(null);
+  const [draftPageOrder, setDraftPageOrder] = useState<string[]>([]);
+  const [draftPageOrderInitial, setDraftPageOrderInitial] = useState<string[]>([]);
+  const [draggedDraftPageIdx, setDraggedDraftPageIdx] = useState<number | null>(null);
+  const [savingDraftPageOrder, setSavingDraftPageOrder] = useState(false);
+  const [revertingToPreUpload, setRevertingToPreUpload] = useState(false);
+  const [assigningDraftId, setAssigningDraftId] = useState<number | null>(null);
+  const [classStudentsForAssign, setClassStudentsForAssign] = useState<AssignableStudent[]>([]);
+  const [selectedAssignStudentId, setSelectedAssignStudentId] = useState<string>('');
+
   const [issuesReport, setIssuesReport] = useState<SessionIssuesReport | null>(null);
   const [issuesLoading, setIssuesLoading] = useState(false);
   const [regradingSubmissionId, setRegradingSubmissionId] = useState<number | null>(null);
@@ -452,12 +491,40 @@ const TeacherSessionManagement: React.FC = () => {
 
   const fetchSessionDetails = async (sessionId: number) => {
     try {
-      const [submissionRes, reportRes] = await Promise.all([
+      const [submissionRes, reportRes, draftsRes, issuesRes] = await Promise.all([
         api.get<ExamSubmission[]>(`/exams/sessions/${sessionId}/submissions`),
         api.get(`/exams/sessions/${sessionId}/report`),
+        api.get<{ drafts: ExamDraftScan[] }>(`/exams/sessions/${sessionId}/draft-scans`),
+        api.get<SessionIssuesReport>(`/exams/sessions/${sessionId}/issues`).catch(() => ({ data: null })),
       ]);
       setSubmissions(submissionRes.data);
       setReport(reportRes.data);
+      setDraftScans(draftsRes.data?.drafts || []);
+      if (issuesRes.data) setIssuesReport(issuesRes.data);
+
+      const reportClassId = Number(reportRes.data?.session?.class?.id || 0);
+      const fallbackClassId = Number(selectedSession?.classId || 0);
+      const classId = reportClassId > 0 ? reportClassId : fallbackClassId;
+      if (classId > 0) {
+        try {
+          const { data: classData } = await api.get(`/classes/${classId}`);
+          const students: AssignableStudent[] = Array.isArray(classData?.students)
+            ? classData.students
+                .map((item: any) => item?.student)
+                .filter((student: any) => student && Number(student.id) > 0)
+                .map((student: any) => ({
+                  id: Number(student.id),
+                  username: String(student.username || ''),
+                  fullName: String(student.fullName || ''),
+                }))
+            : [];
+          setClassStudentsForAssign(students);
+        } catch {
+          setClassStudentsForAssign([]);
+        }
+      } else {
+        setClassStudentsForAssign([]);
+      }
 
       const examId = reportRes.data?.session?.exam?.id;
       if (examId) {
@@ -917,24 +984,42 @@ const TeacherSessionManagement: React.FC = () => {
     }
   };
 
-  const handleBulkUpload = async (files: FileList | null) => {
+  const handleFileSelect = (files: FileList | null) => {
     if (!files || files.length === 0 || !selectedSessionId) return;
-    setBulkUploading(true);
     setBulkUploadResult(null);
-    try {
-      const expectedPasses = getTotalPasses();
-      if (files.length % expectedPasses !== 0) {
-        toast.error(`Số ảnh phải chia hết cho ${expectedPasses} trang/bài. Bạn đã chọn ${files.length} ảnh.`);
-        return;
-      }
 
+    const fileArray = Array.from(files);
+    const sortedFiles = sortUploadFiles(fileArray);
+    
+    const newStaged = sortedFiles.map(f => ({
+      id: Math.random().toString(36).substr(2, 9),
+      file: f,
+      preview: URL.createObjectURL(f)
+    }));
+
+    setStagedFiles(newStaged);
+  };
+
+  const processStagedFiles = async () => {
+    if (stagedFiles.length === 0 || !selectedSessionId) return;
+
+    const expectedPasses = getTotalPasses();
+    if (stagedFiles.length % expectedPasses !== 0) {
+      toast.error(`Số ảnh phải chia hết cho ${expectedPasses} trang/bài. Bạn đã chọn ${stagedFiles.length} ảnh.`);
+      return;
+    }
+
+    setBulkUploading(true);
+    try {
       const formData = new FormData();
-      sortUploadFiles(Array.from(files)).forEach((file) => formData.append('files', file));
+      stagedFiles.forEach(s => formData.append('files', s.file));
+
       const { data } = await api.post<BulkUploadResponse>(
         `/exams/sessions/${selectedSessionId}/bulk-upload`,
         formData,
         { headers: { 'Content-Type': 'multipart/form-data' } }
       );
+      
       setBulkUploadResult({
         ...data,
         matched: data.matched ?? 0,
@@ -945,12 +1030,174 @@ const TeacherSessionManagement: React.FC = () => {
         unmatchedFiles: data.unmatchedFiles ?? [],
         drafts: data.drafts ?? [],
       });
-      toast.success(data.message || 'Bulk upload completed');
+      toast.success(data.message || 'Images successfully uploaded and drafts created');
+      setStagedFiles([]);
       await fetchSessionDetails(selectedSessionId);
     } catch (err: any) {
-      toast.error(err?.response?.data?.error || 'Bulk upload failed');
+      toast.error(err?.response?.data?.error || 'Failed to process images');
     } finally {
       setBulkUploading(false);
+    }
+  };
+
+  const handleCheckIdentity = async () => {
+    if (!selectedSessionId) return;
+    setIsCheckingIdentity(true);
+    try {
+      const { data } = await api.post(`/exams/sessions/${selectedSessionId}/draft-scans/check-identity`);
+      toast.success(data.message || 'Started checking identities');
+      await fetchSessionDetails(selectedSessionId);
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to check identity');
+    } finally {
+      setIsCheckingIdentity(false);
+    }
+  };
+
+  const handleReplaceFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || e.target.files.length === 0 || replacingIdx === null) return;
+    const newFile = e.target.files[0];
+    setStagedFiles(prev => {
+      const newArr = [...prev];
+      URL.revokeObjectURL(newArr[replacingIdx].preview);
+      newArr[replacingIdx] = {
+        id: Math.random().toString(36).substr(2, 9),
+        file: newFile,
+        preview: URL.createObjectURL(newFile)
+      };
+      return newArr;
+    });
+    setReplacingIdx(null);
+    e.target.value = '';
+  };
+
+  const handleDeleteDraft = async (draftId: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!window.confirm('Are you sure you want to delete this draft?')) return;
+    try {
+      await api.delete(`/exams/sessions/${selectedSessionId}/draft-scans/${draftId}`);
+      toast.success('Draft deleted');
+      setDraftScans(prev => prev.filter(d => d.id !== draftId));
+      fetchSessionDetails(selectedSessionId!);
+    } catch (err: any) {
+      toast.error('Failed to delete draft');
+    }
+  };
+
+  const openDraftDetail = (draft: ExamDraftScan) => {
+    const pages = getDraftPagePaths(draft);
+    setViewingDraft(draft);
+    setDraftPageOrder(pages);
+    setDraftPageOrderInitial(pages);
+    setDraggedDraftPageIdx(null);
+    setSelectedAssignStudentId(draft.studentId ? String(draft.studentId) : '');
+  };
+
+  const closeDraftDetail = () => {
+    setViewingDraft(null);
+    setViewingDraftImagePath(null);
+    setDraftPageOrder([]);
+    setDraftPageOrderInitial([]);
+    setDraggedDraftPageIdx(null);
+    setSelectedAssignStudentId('');
+  };
+
+  const handleAssignDraftStudent = async () => {
+    if (!selectedSessionId || !viewingDraft || !selectedAssignStudentId) return;
+
+    const studentId = Number(selectedAssignStudentId);
+    if (!Number.isFinite(studentId) || studentId <= 0) {
+      toast.error('Please select a valid student');
+      return;
+    }
+
+    setAssigningDraftId(viewingDraft.id);
+    try {
+      const { data } = await api.patch(`/exams/sessions/${selectedSessionId}/draft-scans/${viewingDraft.id}/assign-student`, {
+        studentId,
+      });
+      const updatedDraft: ExamDraftScan = data?.draft;
+      if (updatedDraft) {
+        setDraftScans((prev) => prev.map((item) => (item.id === updatedDraft.id ? updatedDraft : item)));
+        setViewingDraft(updatedDraft);
+      }
+      toast.success(data?.message || 'Draft assigned successfully');
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to assign draft to student');
+    } finally {
+      setAssigningDraftId(null);
+    }
+  };
+
+  const handleRevertToPreUpload = async () => {
+    if (!selectedSessionId || draftScans.length === 0) return;
+
+    const confirmed = window.confirm('Return to pre-upload drag & drop mode? Current pending drafts will be removed.');
+    if (!confirmed) return;
+
+    setRevertingToPreUpload(true);
+    try {
+      const orderedPagePaths = draftScans.flatMap((draft) => getDraftPagePaths(draft));
+      const staged = await Promise.all(
+        orderedPagePaths.map(async (pagePath, index) => {
+          const response = await fetch(`/${pagePath}`);
+          if (!response.ok) {
+            throw new Error('Failed to read staged draft page');
+          }
+          const blob = await response.blob();
+          const fallbackName = `draft_page_${index + 1}.jpg`;
+          const filename = pagePath.split('/').pop() || fallbackName;
+          const file = new File([blob], filename, { type: blob.type || 'image/jpeg' });
+          return {
+            id: Math.random().toString(36).substr(2, 9),
+            file,
+            preview: URL.createObjectURL(blob),
+          };
+        })
+      );
+
+      await Promise.all(
+        draftScans.map((draft) => api.delete(`/exams/sessions/${selectedSessionId}/draft-scans/${draft.id}`))
+      );
+
+      setStagedFiles((prev) => {
+        prev.forEach((item) => URL.revokeObjectURL(item.preview));
+        return staged;
+      });
+      setDraftScans([]);
+      setBulkUploadResult(null);
+      setViewingDraft(null);
+      setDraftPageOrder([]);
+      setDraftPageOrderInitial([]);
+      toast.success('Returned to pre-upload drag & drop mode');
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || err?.message || 'Failed to return to pre-upload mode');
+      await fetchSessionDetails(selectedSessionId);
+    } finally {
+      setRevertingToPreUpload(false);
+    }
+  };
+
+  const handleSaveDraftPageOrder = async () => {
+    if (!selectedSessionId || !viewingDraft || draftPageOrder.length === 0) return;
+
+    setSavingDraftPageOrder(true);
+    try {
+      const { data } = await api.patch(`/exams/sessions/${selectedSessionId}/draft-scans/${viewingDraft.id}/pages-order`, {
+        pagePaths: draftPageOrder,
+      });
+
+      const updatedDraft: ExamDraftScan = data?.draft;
+      if (updatedDraft) {
+        setDraftScans((prev) => prev.map((item) => (item.id === updatedDraft.id ? updatedDraft : item)));
+        setViewingDraft(updatedDraft);
+      }
+      setDraftPageOrderInitial([...draftPageOrder]);
+      toast.success(data?.message || 'Draft pages reordered');
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to reorder draft pages');
+    } finally {
+      setSavingDraftPageOrder(false);
     }
   };
 
@@ -1302,7 +1549,12 @@ const TeacherSessionManagement: React.FC = () => {
                 >
                   Start Scan
                 </button>
-                <button className="btn-secondary text-xs" onClick={completeScanningAndAutoGrade} disabled={!selectedSessionId}>
+                <button 
+                  className={`btn-secondary text-xs ${(!issuesReport || issuesReport.readyForGrading !== issuesReport.totalStudents || draftScans.some((d) => d.status === 'PENDING')) ? 'opacity-50 cursor-not-allowed' : 'bg-primary-600 text-white hover:bg-primary-700'}`} 
+                  onClick={completeScanningAndAutoGrade} 
+                  disabled={!selectedSessionId || !issuesReport || issuesReport.readyForGrading !== issuesReport.totalStudents || draftScans.some((d) => d.status === 'PENDING')}
+                  title="Only available when all students have their exams correctly mapped and identified."
+                >
                   Start Grading
                 </button>
                 <button className="btn-secondary text-xs" onClick={fetchIssuesReport} disabled={!selectedSessionId || issuesLoading}>
@@ -1324,7 +1576,7 @@ const TeacherSessionManagement: React.FC = () => {
                 </div>
                 <label className={`btn-primary text-xs cursor-pointer whitespace-nowrap ${bulkUploading ? 'opacity-50 pointer-events-none' : ''}`}>
                   <Upload size={14} className="inline mr-1" />
-                  {bulkUploading ? 'Uploading...' : 'Select Images'}
+                  {stagedFiles.length > 0 ? 'Reselect Images' : 'Select Images'}
                   <input
                     type="file"
                     multiple
@@ -1332,95 +1584,175 @@ const TeacherSessionManagement: React.FC = () => {
                     className="hidden"
                     disabled={bulkUploading || !selectedSessionId}
                     onChange={(e) => {
-                      void handleBulkUpload(e.target.files);
+                      handleFileSelect(e.target.files);
                       e.currentTarget.value = '';
                     }}
                   />
                 </label>
               </div>
-              {bulkUploading && (
-                <div className="flex items-center gap-2">
-                  <span className="animate-spin rounded-full h-4 w-4 border-b-2 border-primary-600" />
-                  <p className="text-xs text-primary-700">Checking page count, quality, and OMR identity on the first page of each set...</p>
+
+              {stagedFiles.length > 0 && (
+                <div className="flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs text-primary-700">
+                      You have selected <strong>{stagedFiles.length}</strong> images. Drag and drop to reorder them before uploading.
+                    </p>
+                    <button
+                      className="btn-primary text-xs whitespace-nowrap"
+                      onClick={processStagedFiles}
+                      disabled={bulkUploading}
+                    >
+                      {bulkUploading ? (
+                        <>
+                          <span className="animate-spin rounded-full h-3 w-3 border-b-2 border-white inline-block mr-2" />
+                          Uploading...
+                        </>
+                      ) : (
+                        'Upload Images'
+                      )}
+                    </button>
+                  </div>
+                  <div className="grid gap-2 grid-cols-3 sm:grid-cols-4 md:grid-cols-6 max-h-64 overflow-auto border border-primary-100 p-2 rounded-md bg-white">
+                    {stagedFiles.map((staged, idx) => (
+                      <div 
+                        key={staged.id} 
+                        className="relative aspect-[3/4] cursor-move border border-transparent hover:border-blue-500 rounded transition-colors group"
+                        draggable
+                        onDragStart={() => setDraggedIdx(idx)}
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          if (draggedIdx === null || draggedIdx === idx) return;
+                          setStagedFiles(prev => {
+                            const newArr = [...prev];
+                            const draggedItem = newArr[draggedIdx];
+                            newArr.splice(draggedIdx, 1);
+                            newArr.splice(idx, 0, draggedItem);
+                            return newArr;
+                          });
+                          setDraggedIdx(null);
+                        }}
+                        onDragEnd={() => setDraggedIdx(null)}
+                        onClick={() => setViewingStagedImageIdx(idx)}
+                      >
+                        <img src={staged.preview} className="w-full h-full object-cover rounded shadow-sm" alt={`preview-${idx}`} />
+                        <div className="absolute top-1 left-1 bg-black/50 text-white px-1.5 py-0.5 text-[10px] rounded backdrop-blur-sm">
+                          #{idx + 1}
+                        </div>
+                        <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors rounded flex items-center justify-center opacity-0 group-hover:opacity-100 pointer-events-none">
+                          <p className="text-white text-[10px] font-medium drop-shadow-md text-center px-2">
+                            Click to view
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
 
             {/* Bulk Upload Results */}
-            {bulkUploadResult && (
+            {(bulkUploadResult || draftScans.length > 0) && (
               <div className="border border-gray-200 rounded-lg p-3 space-y-2">
-                <p className="text-sm font-medium text-gray-900">Bulk Upload Results</p>
-                <div className="flex gap-4 text-xs">
-                  <span className="text-green-700">✓ Matched: {bulkUploadResult.matched}</span>
-                  <span className="text-amber-700">⚠ Ambiguous: {bulkUploadResult.ambiguous}</span>
-                  <span className="text-red-700">✦ Quality failed: {bulkUploadResult.qualityFailed || 0}</span>
-                  <span className="text-red-700">✗ Unmatched: {bulkUploadResult.unmatched}</span>
-                  <span className="text-gray-600">Total: {bulkUploadResult.totalImages} images</span>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-medium text-gray-900">Bulk Upload Results</p>
+                    {draftScans.length > 0 && (
+                      <button
+                        className="btn-secondary text-xs"
+                        onClick={handleRevertToPreUpload}
+                        disabled={revertingToPreUpload || savingDraftPageOrder}
+                        title="Back to pre-upload drag & drop"
+                      >
+                        <ArrowLeft size={14} className="inline mr-1" />
+                        {revertingToPreUpload ? 'Returning...' : 'Back To Drag & Drop'}
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {draftScans.some(d => d.status === 'PENDING') && (
+                      <button 
+                        className="btn-primary text-xs bg-indigo-600 hover:bg-indigo-700 text-white" 
+                        onClick={handleCheckIdentity} 
+                        disabled={isCheckingIdentity || revertingToPreUpload || savingDraftPageOrder}
+                      >
+                        <Search size={14} className="inline mr-1" />
+                        {isCheckingIdentity ? 'Checking...' : 'Check Identity'}
+                      </button>
+                    )}
+                  </div>
                 </div>
+                {bulkUploadResult && (
+                  <div className="flex gap-4 text-xs">
+                    <span className="text-green-700">✓ Matched: {bulkUploadResult?.matched}</span>
+                    <span className="text-amber-700">⚠ Ambiguous: {bulkUploadResult?.ambiguous}</span>
+                    <span className="text-red-700">✦ Quality failed: {bulkUploadResult?.qualityFailed || 0}</span>
+                    <span className="text-red-700">✗ Unmatched: {bulkUploadResult?.unmatched}</span>
+                    <span className="text-gray-600">Total: {bulkUploadResult?.totalImages} images</span>
+                  </div>
+                )}
                 <div className="rounded-md bg-gray-50 border border-gray-100 p-2 text-[11px] text-gray-600">
                   Green means the first page passed quality checks and OMR read MSSV successfully. Red means the set needs re-upload or manual assignment before grading can begin.
                 </div>
-                {bulkUploadClassifications.length > 0 && (
-                  <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-72 overflow-auto pr-1">
-                    {bulkUploadClassifications.map((cls, idx) => (
-                      <div key={idx} className={`text-xs p-3 rounded-lg border-l-4 ${
-                        cls.status === 'MATCHED' ? 'border-green-200 bg-green-50' :
-                        cls.status === 'AMBIGUOUS' ? 'border-amber-200 bg-amber-50' :
-                        'border-red-200 bg-red-50'
-                      } ${
-                        cls.status === 'MATCHED' ? 'border-l-green-500' :
-                        cls.status === 'AMBIGUOUS' ? 'border-l-amber-500' :
-                        'border-l-red-500'
-                      }`}>
-                        <div className="flex items-center justify-between gap-2">
-                          <div>
-                            <p className="font-medium text-gray-900">{cls.studentName || 'Unknown'}</p>
-                            <p className="text-gray-500">{cls.studentCode || 'Unknown code'}</p>
-                          </div>
-                          <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
-                            cls.status === 'MATCHED' ? 'bg-green-100 text-green-700' :
-                            cls.status === 'AMBIGUOUS' ? 'bg-amber-100 text-amber-700' :
-                            'bg-red-100 text-red-700'
-                          }`}>
-                            {cls.status}
-                          </span>
-                        </div>
-                        <p className="mt-2 text-gray-700">{cls.pagesAssigned} pages</p>
-                        {(cls.warnings ?? []).length > 0 && <p className="mt-1 text-amber-700">{cls.warnings.join(' | ')}</p>}
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {bulkUploadDrafts.length > 0 && bulkUploadClassifications.length === 0 && (
-                  <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-72 overflow-auto pr-1">
-                    {bulkUploadDrafts.map((draft) => {
-                      let essayPageCount = 0;
-                      try {
-                        const parsed = JSON.parse(draft.essayPagesUrls);
-                        essayPageCount = Array.isArray(parsed) ? parsed.length : 0;
-                      } catch {
-                        essayPageCount = 0;
-                      }
+                {draftScans.length > 0 && (
+                  <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-96 overflow-auto pr-1">
+                    {draftScans.map((draft, idx) => {
+                      const essayPageCount = parseDraftEssayPages(draft.essayPagesUrls).length;
 
+                      const isMatched = draft.status === 'VALID';
+                      const isPending = draft.status === 'PENDING';
+                      
                       return (
-                        <div key={draft.draftId} className="text-xs p-3 rounded-lg border-l-4 border-l-blue-500 border-blue-200 bg-blue-50">
+                        <div 
+                          key={draft.id} 
+                          className={`text-xs p-3 rounded-lg border-l-4 flex flex-col gap-2 hover:shadow-md transition-shadow ${
+                            isMatched ? 'border-green-200 bg-green-50 border-l-green-500' :
+                            isPending ? 'border-blue-200 bg-blue-50 border-l-blue-500' :
+                            'border-amber-200 bg-amber-50 border-l-amber-500'
+                          } cursor-pointer`}
+                          onClick={() => openDraftDetail(draft)}
+                        >
                           <div className="flex items-center justify-between gap-2">
                             <div>
-                              <p className="font-medium text-gray-900">Draft #{draft.groupIndex}</p>
-                              <p className="text-gray-500">Front page staged</p>
+                              <p className="font-medium text-gray-900 flex items-center gap-1">
+                                <GripVertical size={12} className="text-gray-500" />
+                                {isMatched && draft.student ? draft.student.fullName : `Draft #${idx + 1}`}
+                              </p>
+                              <p className="text-gray-500">
+                                {isMatched && draft.student ? draft.student.username : 'Click to reorder pages'}
+                              </p>
                             </div>
-                            <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-100 text-blue-700">
-                              {draft.status}
-                            </span>
+                            <div className="flex items-center gap-2">
+                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                                isMatched ? 'bg-green-100 text-green-700' :
+                                isPending ? 'bg-blue-100 text-blue-700 animate-pulse' :
+                                'bg-amber-100 text-amber-700'
+                              }`}>
+                                {draft.status}
+                              </span>
+                              <button
+                                className="text-gray-400 hover:text-red-500 hover:bg-red-50 rounded p-1 transition-colors"
+                                onClick={(e) => handleDeleteDraft(draft.id, e)}
+                                title="Delete this draft"
+                              >
+                                <XCircle size={16} />
+                              </button>
+                            </div>
                           </div>
-                          <p className="mt-2 text-gray-700">Essay pages: {essayPageCount}</p>
+                          <p className="text-gray-700">Total pages: {1 + essayPageCount}</p>
+                          <img 
+                            src={`/${draft.frontPageUrl}`} 
+                            alt={`Draft ${idx + 1}`} 
+                            className="w-full h-32 object-cover rounded border border-gray-200 shadow-sm opacity-90" 
+                            loading="lazy" 
+                          />
                         </div>
                       );
                     })}
                   </div>
                 )}
-                {(bulkUploadResult.unmatchedFiles ?? []).length > 0 && (
-                  <p className="text-xs text-red-600">Unmatched files: {(bulkUploadResult.unmatchedFiles ?? []).join(', ')}</p>
+                {(bulkUploadResult?.unmatchedFiles ?? []).length > 0 && (
+                  <p className="text-xs text-red-600">Unmatched files: {(bulkUploadResult?.unmatchedFiles ?? []).join(', ')}</p>
                 )}
               </div>
             )}
@@ -2014,6 +2346,167 @@ const TeacherSessionManagement: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* Draft Viewing Modal */}
+      {viewingDraft && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4 backdrop-blur-sm" onClick={closeDraftDetail}>
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="p-4 border-b flex items-center justify-between bg-gray-50">
+              <div>
+                <h3 className="font-semibold text-gray-900">
+                {viewingDraft.status === 'VALID' && viewingDraft.student 
+                  ? `Exam Pages for ${viewingDraft.student.fullName} (${viewingDraft.student.username})` 
+                  : `Draft #${viewingDraft.id} Details`}
+                </h3>
+                <p className="text-xs text-gray-500">Drag and drop pages to reorder, then save.</p>
+                {(viewingDraft.status === 'UNIDENTIFIED' || viewingDraft.status === 'PENDING') && (
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <select
+                      className="input-field text-xs min-w-[240px]"
+                      value={selectedAssignStudentId}
+                      onChange={(e) => setSelectedAssignStudentId(e.target.value)}
+                      disabled={assigningDraftId === viewingDraft.id}
+                    >
+                      <option value="">Select student to assign</option>
+                      {classStudentsForAssign.map((student) => (
+                        <option key={student.id} value={student.id}>
+                          {student.fullName} ({student.username})
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      className="btn-secondary text-xs"
+                      onClick={handleAssignDraftStudent}
+                      disabled={!selectedAssignStudentId || assigningDraftId === viewingDraft.id}
+                    >
+                      {assigningDraftId === viewingDraft.id ? 'Assigning...' : 'Assign To Student'}
+                    </button>
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  className="btn-primary text-xs"
+                  onClick={handleSaveDraftPageOrder}
+                  disabled={
+                    savingDraftPageOrder
+                    || draftPageOrder.length === 0
+                    || JSON.stringify(draftPageOrder) === JSON.stringify(draftPageOrderInitial)
+                  }
+                >
+                  {savingDraftPageOrder ? 'Saving...' : 'Save Page Order'}
+                </button>
+                <button className="text-gray-500 hover:text-gray-700" onClick={closeDraftDetail}>
+                  <XCircle size={24} />
+                </button>
+              </div>
+            </div>
+            <div className="p-4 overflow-y-auto flex-1 bg-gray-200">
+              <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3 max-w-5xl mx-auto">
+                {draftPageOrder.map((url, pageIdx) => (
+                  <div
+                    key={`${url}-${pageIdx}`}
+                    className="bg-white p-2 rounded shadow-sm border border-gray-200 cursor-move"
+                    draggable
+                    onDragStart={() => setDraggedDraftPageIdx(pageIdx)}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      if (draggedDraftPageIdx === null || draggedDraftPageIdx === pageIdx) return;
+                      setDraftPageOrder((prev) => {
+                        const reordered = [...prev];
+                        const [draggedItem] = reordered.splice(draggedDraftPageIdx, 1);
+                        reordered.splice(pageIdx, 0, draggedItem);
+                        return reordered;
+                      });
+                      setDraggedDraftPageIdx(null);
+                    }}
+                    onDragEnd={() => setDraggedDraftPageIdx(null)}
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-sm font-medium text-gray-700">Page {pageIdx + 1}</p>
+                      <div className="flex items-center gap-1">
+                        <button
+                          className="btn-secondary text-[10px] px-2 py-1"
+                          onClick={() => setViewingDraftImagePath(url)}
+                          title="View this image"
+                        >
+                          <Eye size={12} className="inline mr-1" />
+                          View
+                        </button>
+                        <GripVertical size={14} className="text-gray-500" />
+                      </div>
+                    </div>
+                    <img
+                      src={`/${url}`}
+                      alt={`Page ${pageIdx + 1}`}
+                      className="w-full h-44 object-cover border border-gray-300 rounded cursor-zoom-in"
+                      onClick={() => setViewingDraftImagePath(url)}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewingDraftImagePath && (
+        <div className="fixed inset-0 z-[70] bg-black/85 flex items-center justify-center p-4" onClick={() => setViewingDraftImagePath(null)}>
+          <div className="bg-white rounded-xl shadow-2xl max-w-5xl max-h-[92vh] flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="p-3 border-b flex items-center justify-between bg-gray-50">
+              <h3 className="font-semibold text-gray-900">Draft Page Preview</h3>
+              <button className="text-gray-500 hover:text-gray-700" onClick={() => setViewingDraftImagePath(null)}>
+                <XCircle size={24} />
+              </button>
+            </div>
+            <div className="p-2 bg-gray-100 overflow-auto flex items-center justify-center">
+              <img
+                src={viewingDraftImagePath.startsWith('http://') || viewingDraftImagePath.startsWith('https://') ? viewingDraftImagePath : `/${viewingDraftImagePath}`}
+                alt="Draft page preview"
+                className="max-w-full max-h-[82vh] object-contain rounded"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Staged Image Viewing Modal */}
+      {viewingStagedImageIdx !== null && stagedFiles[viewingStagedImageIdx] && (
+        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setViewingStagedImageIdx(null)}>
+          <div className="bg-white rounded-xl shadow-2xl max-w-4xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="p-3 border-b flex items-center justify-between bg-gray-50">
+              <h3 className="font-semibold text-gray-900">Image Preview</h3>
+              <div className="flex items-center gap-2">
+                <button
+                  className="btn-primary text-xs"
+                  onClick={() => {
+                    setReplacingIdx(viewingStagedImageIdx);
+                    replaceInputRef.current?.click();
+                  }}
+                >
+                  Replace Image
+                </button>
+                <button className="text-gray-500 hover:text-gray-700" onClick={() => setViewingStagedImageIdx(null)}>
+                  <XCircle size={24} />
+                </button>
+              </div>
+            </div>
+            <div className="p-2 overflow-auto flex items-center justify-center bg-gray-100">
+              <img src={stagedFiles[viewingStagedImageIdx].preview} alt="Preview" className="max-w-full max-h-[80vh] object-contain rounded" />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hidden file input for replacing an image */}
+      <input
+        type="file"
+        ref={replaceInputRef}
+        className="hidden"
+        accept="image/*"
+        onChange={handleReplaceFile}
+      />
     </Layout>
   );
 };

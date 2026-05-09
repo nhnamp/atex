@@ -2,7 +2,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { config } from '../config';
 import fs from 'fs';
 import path from 'path';
-import { preprocessScanForAnalysis } from './image-preprocess.service';
+
 
 const genAI = new GoogleGenerativeAI(config.geminiApiKey);
 
@@ -238,22 +238,13 @@ export const extractAndGradeSubmissionFromScansBatch = async (
   }
 
   const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
-  const cleanupHandlers: Array<() => void> = [];
-  const preprocessedWarnings: string[] = [];
   const imageParts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
 
   try {
     for (let index = 0; index < input.scanPaths.length; index += 1) {
-      const preprocessed = await preprocessScanForAnalysis(input.scanPaths[index]);
-      cleanupHandlers.push(preprocessed.cleanup);
-
-      if (preprocessed.warnings.length > 0) {
-        preprocessedWarnings.push(...preprocessed.warnings.map((warning) => `[Trang ${index + 1}] ${warning}`));
-      }
-
-      const ext = path.extname(preprocessed.processedPath).toLowerCase();
+      const ext = path.extname(input.scanPaths[index]).toLowerCase();
       const mimeType = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
-      const imageBase64 = fs.readFileSync(preprocessed.processedPath).toString('base64');
+      const imageBase64 = fs.readFileSync(input.scanPaths[index]).toString('base64');
 
       imageParts.push({
         inlineData: {
@@ -325,12 +316,10 @@ Output JSON format:
       studentCode: parsed?.studentCode ? String(parsed.studentCode).trim() : null,
       essayAnswers: normalizeEssayAnswers(parsed?.essayAnswers),
       essayResults: normalizeEssayResults(parsed?.essayResults, essayQuestionMaxScore),
-      warnings: [...new Set([...preprocessedWarnings, ...modelWarnings])],
+      warnings: [...new Set(modelWarnings)],
     };
   } finally {
-    for (const cleanup of cleanupHandlers) {
-      cleanup();
-    }
+    // No cleanup required for native images
   }
 };
 
@@ -381,9 +370,7 @@ export const extractAndGradeMultiStudentBatch = async (
   }
 
   const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
-  const cleanupHandlers: Array<() => void> = [];
   const imageParts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
-  const preprocessedWarnings: string[] = [];
 
   // Build image manifest describing which images belong to which student
   const imageManifest: Array<{ studentLabel: string; imageIndex: number; pageOfStudent: number }> = [];
@@ -397,18 +384,9 @@ export const extractAndGradeMultiStudentBatch = async (
           throw new Error(`Scan file not found: ${scanPath}`);
         }
 
-        const preprocessed = await preprocessScanForAnalysis(scanPath);
-        cleanupHandlers.push(preprocessed.cleanup);
-
-        if (preprocessed.warnings.length > 0) {
-          preprocessedWarnings.push(
-            ...preprocessed.warnings.map((w) => `[${student.studentLabel} - Page ${pageIdx + 1}] ${w}`)
-          );
-        }
-
-        const ext = path.extname(preprocessed.processedPath).toLowerCase();
+        const ext = path.extname(scanPath).toLowerCase();
         const mimeType = ext === '.png' ? 'image/png' : ext === '.webp' ? 'image/webp' : 'image/jpeg';
-        const imageBase64 = fs.readFileSync(preprocessed.processedPath).toString('base64');
+        const imageBase64 = fs.readFileSync(scanPath).toString('base64');
 
         imageParts.push({ inlineData: { mimeType, data: imageBase64 } });
         imageManifest.push({
@@ -503,7 +481,7 @@ Output JSON format (mảng kết quả cho từng sinh viên):
           studentCode: null,
           essayAnswers: {},
           essayResults: [],
-          warnings: [...preprocessedWarnings.filter((w) => w.includes(student.studentLabel)), 'No AI result returned for this student'],
+          warnings: ['No AI result returned for this student'],
         };
       }
 
@@ -518,14 +496,11 @@ Output JSON format (mảng kết quả cho từng sinh viên):
         essayAnswers: normalizeEssayAnswers(match.essayAnswers),
         essayResults: normalizeEssayResults(match.essayResults, essayQuestionMaxScore),
         warnings: [...new Set([
-          ...preprocessedWarnings.filter((w) => w.includes(student.studentLabel)),
           ...modelWarnings,
         ])],
       };
     });
   } finally {
-    for (const cleanup of cleanupHandlers) {
-      cleanup();
-    }
+    // No cleanup required for native images
   }
 };

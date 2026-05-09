@@ -34,8 +34,12 @@ import {
   uploadMissingPages,
   uploadMobileSubmissionScans,
   uploadSubmissionScans,
-  reuploadDraftScanFrontPage,
   startDraftGrading,
+  checkDraftsIdentity,
+  deleteDraftScan,
+  reorderDraftScans,
+  reorderDraftScanPages,
+  reuploadDraftScanFrontPage,
 } from '../controllers/exam.controller';
 import { config } from '../config';
 import { authenticate, requireApproved, requireRole } from '../middleware/auth';
@@ -109,10 +113,14 @@ router.post('/sessions/:sessionId/report/finalize', requireRole('TEACHER'), fina
 router.post('/sessions/:sessionId/mobile-scan-link', requireRole('TEACHER'), createSessionMobileScanLink);
 router.get('/sessions/:sessionId/issues', requireRole('TEACHER'), getSessionIssuesReport);
 router.get('/sessions/:sessionId/draft-scans', requireRole('TEACHER'), listExamDraftScans);
+router.post('/sessions/:sessionId/draft-scans/check-identity', requireRole('TEACHER'), checkDraftsIdentity);
 router.post('/sessions/:sessionId/bulk-upload', requireRole('TEACHER'), tempUpload.array('files', bulkScanFileLimit), uploadBulkExamScans);
 router.post('/sessions/:sessionId/start-grading', requireRole('TEACHER'), startDraftGrading);
+router.patch('/sessions/:sessionId/draft-scans/reorder', requireRole('TEACHER'), reorderDraftScans);
+router.patch('/sessions/:sessionId/draft-scans/:draftId/pages-order', requireRole('TEACHER'), reorderDraftScanPages);
 router.patch('/sessions/:sessionId/draft-scans/:draftId/assign-student', requireRole('TEACHER'), assignDraftScanStudent);
 router.patch('/sessions/:sessionId/draft-scans/:draftId/front-page', requireRole('TEACHER'), tempUpload.single('file'), reuploadDraftScanFrontPage);
+router.delete('/sessions/:sessionId/draft-scans/:draftId', requireRole('TEACHER'), deleteDraftScan);
 
 // Student results (published after report confirmation)
 router.get('/results/me', requireRole('STUDENT'), getMyPublishedExamResults);

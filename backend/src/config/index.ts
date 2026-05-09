@@ -16,6 +16,7 @@ export const config = {
   cloudinaryApiKey: process.env.CLOUDINARY_API_KEY || '',
   cloudinaryApiSecret: process.env.CLOUDINARY_API_SECRET || '',
   frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
+  omrServiceUrl: process.env.OMR_SERVICE_URL || 'http://localhost:5001',
   databaseUrl: process.env.DATABASE_URL || 'file:./dev.db',
   uploadLimits: {
     mobileScanFiles: parsePositiveInt(process.env.EXAM_MOBILE_SCAN_MAX_FILES, 20),
