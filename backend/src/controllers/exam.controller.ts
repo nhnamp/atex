@@ -25,6 +25,7 @@ import path from 'path';
 import sharp from 'sharp';
 
 const prisma = new PrismaClient();
+const BACKEND_ROOT = path.resolve(__dirname, '..', '..');
 
 type ExamRequirements = {
   total: number;
@@ -810,14 +811,33 @@ const persistSubmissionScans = async (params: {
   };
 };
 
+const resolveLocalFilePath = (rawPath: string | null | undefined): string | null => {
+  const normalized = String(rawPath || '').trim();
+  if (!normalized) return null;
+
+  const candidates = path.isAbsolute(normalized)
+    ? [normalized]
+    : [
+        path.resolve(process.cwd(), normalized),
+        path.resolve(BACKEND_ROOT, normalized),
+      ];
+
+  return candidates.find((candidate) => fs.existsSync(candidate)) || null;
+};
+
 const resolveScanPath = async (entry: ScanEntry): Promise<string> => {
+  const directLocalPath = resolveLocalFilePath(entry.url);
+  if (directLocalPath) {
+    return directLocalPath;
+  }
+
   if (entry.url && path.isAbsolute(entry.url) && fs.existsSync(entry.url)) {
     return entry.url;
   }
 
   if (entry.filename) {
-    const localPath = path.join(process.cwd(), 'uploads', 'scans', entry.filename);
-    if (fs.existsSync(localPath)) {
+    const localPath = resolveLocalFilePath(path.join('uploads', 'scans', entry.filename));
+    if (localPath) {
       return localPath;
     }
 
@@ -902,7 +922,18 @@ const serializeDraftOmrResult = (value: unknown): string | null => {
 };
 
 const getDraftScanPaths = (draft: { frontPageUrl: string; essayPagesUrls: unknown }): string[] => {
-  return [draft.frontPageUrl, ...toStringArray(draft.essayPagesUrls)];
+  return [draft.frontPageUrl, ...toStringArray(draft.essayPagesUrls)]
+    .map((item) => resolveLocalFilePath(item) || item);
+};
+
+const getDraftEssayScanPaths = (
+  draft: { frontPageUrl: string; essayPagesUrls: unknown },
+  passPlan: ScanPassPlan
+): string[] => {
+  return getDraftScanPaths(draft).filter((_, index) => {
+    const purpose = getScanPassPurpose(index + 1, passPlan).toUpperCase();
+    return purpose.includes('ESSAY');
+  });
 };
 
 const getDraftTempDirectory = (sessionId: number): string => {
@@ -911,9 +942,10 @@ const getDraftTempDirectory = (sessionId: number): string => {
 
 const removeLocalPaths = async (paths: string[]): Promise<void> => {
   for (const filePath of paths) {
-    if (filePath && fs.existsSync(filePath)) {
+    const resolvedPath = resolveLocalFilePath(filePath);
+    if (resolvedPath) {
       try {
-        fs.unlinkSync(filePath);
+        fs.unlinkSync(resolvedPath);
       } catch {
         // ignore cleanup failures
       }
@@ -922,12 +954,17 @@ const removeLocalPaths = async (paths: string[]): Promise<void> => {
 };
 
 const uploadDraftPathToCloudinary = async (filePath: string, label: string, pageIndex: number): Promise<ScanEntry> => {
-  const buffer = await fs.promises.readFile(filePath);
+  const resolvedPath = resolveLocalFilePath(filePath);
+  if (!resolvedPath) {
+    throw new Error(`Draft scan file not found: ${filePath}`);
+  }
+
+  const buffer = await fs.promises.readFile(resolvedPath);
   const url = await uploadImageToCloudinary(buffer, `${label}_page_${pageIndex}.png`);
 
   return {
     source: 'cloudinary',
-    filename: path.basename(filePath),
+    filename: path.basename(resolvedPath),
     url,
     passIndex: pageIndex,
     capturedAt: new Date().toISOString(),
@@ -1108,6 +1145,25 @@ const normalizeObjectiveAnswers = (answers: Record<string, string>): Record<stri
   }, {});
 };
 
+const mapOmrAnswersToQuestionIds = (
+  answers: Record<string, string>,
+  mcqQuestions: Array<{ questionId: number }>
+): Record<string, string> => {
+  const normalizedAnswers = normalizeObjectiveAnswers(answers);
+  const mapped: Record<string, string> = {};
+
+  mcqQuestions.forEach((question, index) => {
+    const questionIdKey = String(question.questionId);
+    const sequentialKey = String(index + 1);
+    const answer = normalizedAnswers[questionIdKey] || normalizedAnswers[sequentialKey];
+    if (answer) {
+      mapped[questionIdKey] = answer;
+    }
+  });
+
+  return mapped;
+};
+
 const normalizeEssayAnswers = (answers: Record<string, string>): Record<string, string> => {
   return Object.entries(answers).reduce<Record<string, string>>((acc, [questionId, answer]) => {
     const key = String(questionId).replace(/[^0-9]/g, '');
@@ -1202,9 +1258,9 @@ const extractBatchScanGradingData = async (
     const firstScannablePath = gradingScanPaths[0];
     if (firstScannablePath && (mcqQuestions.length > 0 || !options?.skipEssayGrading)) {
       try {
-        const omrResult = await processOmrImage(firstScannablePath);
+        const omrResult = await processOmrImage(firstScannablePath, Math.max(1, mcqQuestions.length));
         if (mcqQuestions.length > 0) {
-          objectiveAnswers = omrResult.answers || {};
+          objectiveAnswers = mapOmrAnswersToQuestionIds(omrResult.answers || {}, mcqQuestions);
           omrWarnings.push(...(omrResult.warnings || []));
           if (Object.keys(objectiveAnswers).length === 0) {
             omrWarnings.push('No objective answers extracted by local OMR on the first page.');
@@ -3478,8 +3534,11 @@ export const gradeSubmissionWithOmr = async (req: AuthRequest, res: Response): P
     let omrWarnings: string[] = [];
 
     try {
-      const omrResult = await processOmrImage(scanPath);
-      detectedAnswers = omrResult.answers || {};
+      const mcqQuestions = submission.session.exam.questions
+        .filter((item) => item.question.type !== 'ESSAY')
+        .map((item) => ({ questionId: item.question.id }));
+      const omrResult = await processOmrImage(scanPath, Math.max(1, mcqQuestions.length));
+      detectedAnswers = mapOmrAnswersToQuestionIds(omrResult.answers || {}, mcqQuestions);
       omrWarnings = omrResult.warnings || [];
     } catch (error) {
       throw new Error('OMR processing failed: ' + (error as Error).message);
@@ -3550,10 +3609,25 @@ export const gradeSubmissionWithOmr = async (req: AuthRequest, res: Response): P
 export const reviewSubmissionScore = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const submissionId = toInt(req.params.submissionId);
-    const { finalScore, note } = req.body as { finalScore: number; note?: string };
+    const { finalScore, objectiveScore, essayScore, note } = req.body as {
+      finalScore?: number;
+      objectiveScore?: number;
+      essayScore?: number;
+      note?: string;
+    };
 
-    if (!Number.isFinite(finalScore)) {
-      res.status(400).json({ error: 'finalScore must be a number' });
+    const normalizedObjectiveScore = Number(objectiveScore);
+    const normalizedEssayScore = Number(essayScore);
+    const hasComponentScores = Number.isFinite(normalizedObjectiveScore) || Number.isFinite(normalizedEssayScore);
+    const normalizedFinalScore = Number.isFinite(Number(finalScore))
+      ? Number(finalScore)
+      : hasComponentScores
+        ? (Number.isFinite(normalizedObjectiveScore) ? normalizedObjectiveScore : 0)
+          + (Number.isFinite(normalizedEssayScore) ? normalizedEssayScore : 0)
+        : NaN;
+
+    if (!Number.isFinite(normalizedFinalScore)) {
+      res.status(400).json({ error: 'finalScore must be a number, or objectiveScore/essayScore must be provided' });
       return;
     }
 
@@ -3569,15 +3643,42 @@ export const reviewSubmissionScore = async (req: AuthRequest, res: Response): Pr
       return;
     }
 
+    const existingDetails = extractSubmissionReportDetails({
+      feedback: submission.feedback,
+      scanFiles: submission.scanFiles,
+    });
+    const nextObjectiveScore = Number.isFinite(normalizedObjectiveScore)
+      ? normalizedObjectiveScore
+      : existingDetails.objectiveScore ?? 0;
+    const nextEssayScore = Number.isFinite(normalizedEssayScore)
+      ? normalizedEssayScore
+      : existingDetails.essayScore ?? 0;
+    const nextFeedback = {
+      ...(() => {
+        try {
+          return JSON.parse(submission.feedback || '{}') as Record<string, unknown>;
+        } catch {
+          return {};
+        }
+      })(),
+      objectiveScore: nextObjectiveScore,
+      essayScore: nextEssayScore,
+      totalScore: normalizedFinalScore,
+      manualReview: {
+        note: note || '',
+        reviewedAt: new Date().toISOString(),
+      },
+    };
+
     const reviewed = await prisma.$transaction(async (tx) => {
       await tx.submissionGrade.create({
         data: {
           submissionId,
           graderId: req.user!.id,
           method: 'MANUAL',
-          totalScore: finalScore,
-          objectiveScore: 0,
-          essayScore: 0,
+          totalScore: normalizedFinalScore,
+          objectiveScore: nextObjectiveScore,
+          essayScore: nextEssayScore,
           responseLog: JSON.stringify({ note: note || '' }),
         },
       });
@@ -3589,14 +3690,15 @@ export const reviewSubmissionScore = async (req: AuthRequest, res: Response): Pr
           action: 'MANUAL_REVIEW',
           note: note || null,
           beforeScore: submission.finalScore ?? null,
-          afterScore: finalScore,
+          afterScore: normalizedFinalScore,
         },
       });
 
       return tx.examSubmission.update({
         where: { id: submissionId },
         data: {
-          finalScore,
+          finalScore: normalizedFinalScore,
+          feedback: JSON.stringify(nextFeedback),
           status: 'FINALIZED',
         },
         include: {
@@ -3987,8 +4089,11 @@ export const completeScanningAndAutoGrade = async (req: AuthRequest, res: Respon
           const firstScan = sortScanEntriesByPassIndex(scanEntries)[0];
           const scanPath = await resolveScanPath(firstScan);
           try {
-            const omrResult = await processOmrImage(scanPath);
-            const detected = omrResult.answers || {};
+            const omrResult = await processOmrImage(scanPath, Math.max(1, mcqExamQuestions.length));
+            const detected = mapOmrAnswersToQuestionIds(
+              omrResult.answers || {},
+              mcqExamQuestions.map((item) => ({ questionId: item.question.id }))
+            );
             omrResultsBySubmissionId.set(submission.id, detected);
 
             let objectiveScore = 0;
@@ -4068,43 +4173,25 @@ export const completeScanningAndAutoGrade = async (req: AuthRequest, res: Respon
           for (let j = 0; j < batchSubmissions.length; j++) {
             const sub = batchSubmissions[j].submission;
             const result = batchResults[j];
-            const objectiveScore = omrObjectiveScoreBySubmissionId.get(sub.id) || 0;
-            const essayScore = result ? result.essayResults.reduce((acc, r) => acc + r.score, 0) : 0;
+            const objectiveScore = Number((omrObjectiveScoreBySubmissionId.get(sub.id) || 0).toFixed(2));
+            const essayScore = Number((result ? result.essayResults.reduce((acc, r) => acc + r.score, 0) : 0).toFixed(2));
             const totalScore = Number((objectiveScore + essayScore).toFixed(2));
 
             const objectiveAnswers = omrResultsBySubmissionId.get(sub.id) || {};
             const essayAnswers = result?.essayAnswers || {};
             const essayResults = result?.essayResults || [];
             const warnings = result?.warnings || [];
-            const extractedIdentity = result ? { fullName: result.fullName, studentCode: result.studentCode } : null;
-
-            let identityCheck: { nameMatch: boolean; codeMatch: boolean } | null = null;
-            if (extractedIdentity) {
-              const expectedName = (sub.student.fullName || '').trim().toLowerCase();
-              const expectedCode = normalizeStudentCode(sub.student.username);
-              const foundName = (extractedIdentity.fullName || '').trim().toLowerCase();
-              const foundCode = normalizeStudentCode(extractedIdentity.studentCode);
-              identityCheck = {
-                nameMatch: !!foundName && expectedName.includes(foundName),
-                codeMatch: !!foundCode && expectedCode === foundCode,
-              };
-              identityCheckedCount += 1;
-              if (!identityCheck.nameMatch || !identityCheck.codeMatch) {
-                identityMismatchCount += 1;
-                warnings.push('Student identity extracted from scan does not fully match enrollment data');
-              }
-            }
 
             const feedbackPayload = {
-              identity: extractedIdentity,
-              identityCheck,
+              identity: null,
+              identityCheck: null,
               objectiveScore,
               essayScore,
               totalScore,
               objectiveAnswers,
               essayAnswers,
               essayResults,
-              aiComments: essayResults.length > 0 ? 'Đã chấm trắc nghiệm bằng OMR cục bộ và tự luận bằng AI (multi-student batch).' : null,
+              aiComments: essayResults.length > 0 ? 'Đã chấm trắc nghiệm bằng OMR cục bộ và tự luận bằng AI. Gemini chỉ được dùng cho phần tự luận.' : null,
               warnings: [...new Set(warnings)],
               scanBlueprint: { scannablePages: scanBlueprint.scannablePages, passPurposeByIndex: scanBlueprint.passPurposeByIndex },
             };
@@ -4943,7 +5030,7 @@ export const checkDraftsIdentity = async (req: AuthRequest, res: Response): Prom
         try {
           await processDraftScanIdentityAsync({
             draftId: draft.id,
-            frontPagePath: path.resolve(process.cwd(), draft.frontPageUrl), // Ensure absolute path for fs
+            frontPagePath: resolveLocalFilePath(draft.frontPageUrl) || draft.frontPageUrl,
             enrolledStudents: studentList,
           });
         } catch (error) {
@@ -5073,18 +5160,59 @@ export const startDraftGrading = async (req: AuthRequest, res: Response): Promis
     }>();
 
     if (essayQuestionsForGemini.length > 0) {
-      const batchDraftGroups = chunkArray(drafts, 4);
+      const essayPagesPerStudent = Math.max(1, passPlan.hasMcq ? pagesPerStudent - 1 : pagesPerStudent);
+      const batchSize = computeMultiStudentBatchSize(essayQuestionsForGemini.length, essayPagesPerStudent);
+      const batchDraftGroups = chunkArray(drafts, batchSize);
       for (const batchDrafts of batchDraftGroups) {
-        const geminiResults = await extractAndGradeMultiStudentBatch(
-          batchDrafts.map((draft) => ({
+        const batchInputs = batchDrafts.map((draft) => {
+          const essayScanPaths = getDraftEssayScanPaths(draft, passPlan);
+          return {
             studentLabel: `draft-${draft.id}`,
-            scanPaths: getDraftScanPaths(draft),
-          })),
-          essayQuestionsForGemini,
-          pagesPerStudent,
-          passPlan.passPurposeByIndex,
-          scanBlueprint
-        );
+            scanPaths: essayScanPaths.length > 0 ? essayScanPaths : getDraftScanPaths(draft),
+          };
+        });
+
+        let geminiResults: Awaited<ReturnType<typeof extractAndGradeMultiStudentBatch>>;
+        try {
+          geminiResults = await extractAndGradeMultiStudentBatch(
+            batchInputs,
+            essayQuestionsForGemini,
+            essayPagesPerStudent,
+            passPlan.passPurposeByIndex,
+            scanBlueprint
+          );
+        } catch (batchError) {
+          geminiResults = [];
+          for (const input of batchInputs) {
+            try {
+              const [singleResult] = await extractAndGradeMultiStudentBatch(
+                [input],
+                essayQuestionsForGemini,
+                essayPagesPerStudent,
+                passPlan.passPurposeByIndex,
+                scanBlueprint
+              );
+              geminiResults.push(singleResult);
+            } catch (singleError) {
+              geminiResults.push({
+                studentLabel: input.studentLabel,
+                fullName: null,
+                studentCode: null,
+                essayAnswers: {},
+                essayResults: essayQuestionsForGemini.map((question) => ({
+                  questionId: question.questionId,
+                  score: 0,
+                  maxScore: question.maxScore,
+                  feedback: 'Gemini essay grading failed for this submission. Teacher review is required.',
+                })),
+                warnings: [
+                  `Batch Gemini grading failed: ${(batchError as Error).message}`,
+                  `Individual Gemini grading failed: ${(singleError as Error).message}`,
+                ],
+              });
+            }
+          }
+        }
 
         for (const result of geminiResults) {
           const draftId = Number(String(result.studentLabel || '').replace('draft-', ''));
@@ -5139,22 +5267,23 @@ export const startDraftGrading = async (req: AuthRequest, res: Response): Promis
           ].map((item) => String(item || '').trim()).filter(Boolean)),
         ];
 
-        const objectiveScore = session.exam.questions.reduce((acc, examQuestion) => {
+        const objectiveScore = Number(session.exam.questions.reduce((acc, examQuestion) => {
           if (examQuestion.question.type === 'ESSAY') return acc;
           const submitted = (objectiveAnswers[String(examQuestion.question.id)] || '').trim().toLowerCase();
           const expected = (examQuestion.question.answer || '').trim().toLowerCase();
           return submitted && submitted === expected ? acc + Number(examQuestion.points || 0) : acc;
-        }, 0);
+        }, 0).toFixed(2));
 
-        const essayScore = essayResults.reduce((acc, item) => acc + Number(item.score || 0), 0);
+        const essayScore = Number(essayResults.reduce((acc, item) => acc + Number(item.score || 0), 0).toFixed(2));
         const totalScore = Number((objectiveScore + essayScore).toFixed(2));
         const scanFiles = uploadedDraftScans.get(draft.id) || [];
 
         const feedbackPayload = {
           draftId: draft.id,
           identity: {
-            fullName: essayExtraction?.fullName || objectiveExtraction.extractedIdentity.fullName,
-            studentCode: essayExtraction?.studentCode || objectiveExtraction.extractedIdentity.studentCode,
+            fullName: objectiveExtraction.extractedIdentity.fullName,
+            studentCode: objectiveExtraction.extractedIdentity.studentCode,
+            source: 'OMR',
           },
           objectiveScore,
           essayScore,
@@ -5169,10 +5298,26 @@ export const startDraftGrading = async (req: AuthRequest, res: Response): Promis
           },
         };
 
-        const submission = await tx.examSubmission.create({
-          data: {
+        const existingSubmission = await tx.examSubmission.findUnique({
+          where: { sessionId_studentId: { sessionId, studentId: draft.studentId } },
+          select: { id: true, finalScore: true },
+        });
+
+        const submission = await tx.examSubmission.upsert({
+          where: { sessionId_studentId: { sessionId, studentId: draft.studentId } },
+          create: {
             sessionId,
             studentId: draft.studentId,
+            scanFiles: JSON.stringify(scanFiles),
+            objectiveAnswers: JSON.stringify(objectiveAnswers),
+            essayAnswers: JSON.stringify(essayAnswers),
+            status: 'GRADED',
+            aiScore: totalScore,
+            finalScore: totalScore,
+            feedback: JSON.stringify(feedbackPayload),
+            gradedAt: new Date(),
+          },
+          update: {
             scanFiles: JSON.stringify(scanFiles),
             objectiveAnswers: JSON.stringify(objectiveAnswers),
             essayAnswers: JSON.stringify(essayAnswers),
@@ -5203,7 +5348,7 @@ export const startDraftGrading = async (req: AuthRequest, res: Response): Promis
             submissionId: submission.id,
             actorId: req.user!.id,
             action: 'DRAFT_FINALIZED',
-            beforeScore: null,
+            beforeScore: existingSubmission?.finalScore ?? null,
             afterScore: totalScore,
             note: 'Draft scan finalized into an official submission',
           },
@@ -5228,14 +5373,31 @@ export const startDraftGrading = async (req: AuthRequest, res: Response): Promis
     await removeLocalPaths(drafts.flatMap((draft) => getDraftScanPaths(draft)));
 
     res.json({
-      message: 'Draft scans finalized and grading started',
+      message: 'Draft scans finalized and grading completed',
       sessionId,
       totalDrafts: drafts.length,
+      gradedCount: createdSubmissionIds.length,
+      totalSubmissions: drafts.length,
       createdSubmissionIds,
+      reportUrl: `/api/exams/sessions/${sessionId}/report`,
+      publishHint: 'Review the report, adjust component scores if needed, then confirm and publish.',
     });
   } catch (error) {
+    const httpError = error as HttpError;
+    const message = mapTeacherFacingErrorMessage(error, 'Failed to start draft grading');
+    if (httpError.statusCode) {
+      res.status(httpError.statusCode).json({ error: message, ...((httpError.payload as Record<string, unknown>) || {}) });
+      return;
+    }
+
+    const geminiStatus = getGeminiErrorStatusCode(error);
+    if (geminiStatus === 429 || geminiStatus === 503) {
+      res.status(geminiStatus).json({ error: message });
+      return;
+    }
+
     console.error('Start draft grading error:', error);
-    res.status(500).json({ error: 'Failed to start draft grading' });
+    res.status(500).json({ error: message });
   }
 };
 

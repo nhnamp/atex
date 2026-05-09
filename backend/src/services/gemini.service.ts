@@ -254,11 +254,12 @@ export const extractAndGradeSubmissionFromScansBatch = async (
       });
     }
 
-    const prompt = `Bạn là AI chấm bài thi từ nhiều ảnh của cùng MỘT sinh viên.
+    const prompt = `Bạn là AI chấm phần TỰ LUẬN của bài thi từ nhiều ảnh của cùng MỘT sinh viên.
 
 Mục tiêu:
-1. Nhận diện họ tên và MSSV từ TRANG 1 (ảnh đầu tiên).
-2. Trích xuất câu trả lời tự luận và chấm điểm tự luận theo đáp án/rubric cho từng câu.
+1. Chỉ trích xuất câu trả lời tự luận từ các trang tự luận.
+2. Chấm điểm tự luận theo đáp án/rubric cho từng câu.
+3. Không nhận diện họ tên, MSSV, khuôn mặt, hoặc danh tính thí sinh.
 
 Ngữ cảnh bài thi:
 ${JSON.stringify(
@@ -274,14 +275,14 @@ ${JSON.stringify(
 
 Ràng buộc bắt buộc:
 1. Trả về DUY NHẤT JSON hợp lệ, không markdown, không giải thích.
-2. Không bịa dữ liệu. Nếu không đọc được họ tên hoặc MSSV thì trả null.
+2. Không bịa dữ liệu. Không sử dụng ảnh để xác định thí sinh.
 3. score của essayResults phải trong khoảng [0, maxScore] từng câu.
 4. Nếu ảnh mờ, lệch, thiếu góc hoặc khó đọc thì ghi rõ trong warnings.
 
 Output JSON format:
 {
-  "fullName": "... hoặc null",
-  "studentCode": "... hoặc null",
+  "fullName": null,
+  "studentCode": null,
   "essayAnswers": { "34": "..." },
   "essayResults": [
     {
@@ -400,7 +401,7 @@ export const extractAndGradeMultiStudentBatch = async (
 
     const studentLabels = students.map((s) => s.studentLabel);
 
-    const prompt = `Bạn là AI chấm bài thi từ ảnh quét của NHIỀU sinh viên cùng lúc.
+    const prompt = `Bạn là AI chấm phần TỰ LUẬN từ ảnh quét của NHIỀU sinh viên cùng lúc.
 
 Tổng số ảnh: ${imageParts.length}
 Số sinh viên: ${students.length}
@@ -410,8 +411,9 @@ Phân bổ ảnh theo sinh viên:
 ${imageManifest.map((m) => `  Ảnh ${m.imageIndex + 1}: ${m.studentLabel} - Trang ${m.pageOfStudent}`).join('\n')}
 
 Mục tiêu cho MỖI sinh viên:
-1. Nhận diện họ tên và MSSV từ trang đầu tiên của sinh viên đó.
-2. Trích xuất câu trả lời tự luận và chấm điểm theo rubric.
+1. Chỉ trích xuất câu trả lời tự luận từ các trang tự luận của sinh viên đó.
+2. Chấm điểm theo rubric.
+3. Không nhận diện họ tên, MSSV, khuôn mặt, hoặc danh tính thí sinh.
 
 Thông tin bài thi:
 ${JSON.stringify(
@@ -427,7 +429,7 @@ ${JSON.stringify(
 
 Ràng buộc bắt buộc:
 1. Trả về DUY NHẤT JSON hợp lệ, không markdown, không giải thích.
-2. Không bịa dữ liệu. Nếu không đọc được thì trả null.
+2. Không bịa dữ liệu. Không sử dụng ảnh để xác định thí sinh.
 3. score phải trong khoảng [0, maxScore] cho mỗi câu.
 4. Nếu ảnh mờ hoặc khó đọc, ghi vào warnings.
 
@@ -436,8 +438,8 @@ Output JSON format (mảng kết quả cho từng sinh viên):
   "students": [
     {
       "studentLabel": "${studentLabels[0]}",
-      "fullName": "... hoặc null",
-      "studentCode": "... hoặc null",
+      "fullName": null,
+      "studentCode": null,
       "essayAnswers": { "34": "..." },
       "essayResults": [
         {

@@ -22,8 +22,14 @@ STUDENT_CODE_COLUMNS = 8
 STUDENT_CODE_DIGIT_ROWS = 10
 
 # Calibrated ROI for MSSV region (relative to working-size image).
+#
+# The search ROI is intentionally wider than the actual 8x10 grid. Phone
+# captures in the test set use the resize fallback and can shift/compress the
+# right edge enough that a tight static ROI clips the last MSSV column.
 STUDENT_CODE_ROI = {"x": 0.63, "y": 0.12, "width": 0.27, "height": 0.30}
+STUDENT_CODE_SEARCH_ROI = {"x": 0.55, "y": 0.08, "width": 0.43, "height": 0.34}
 STUDENT_CODE_HEADER_FRAC = 0.20  # Top 20% is label/header, skip it
+STUDENT_CODE_GRID_HEADER_FRAC = 0.12  # Header row inside the detected MSSV table
 
 # MCQ answer region ROI.
 MCQ_ROI = {"x": 0.03, "y": 0.42, "width": 0.94, "height": 0.52}
@@ -131,24 +137,71 @@ def _crop_roi(gray: np.ndarray, roi: dict) -> np.ndarray:
     return gray[y:y + rh, x:x + rw]
 
 
+def _find_student_grid(gray: np.ndarray):
+    """Find the MSSV 8x10 table inside the wider identity search area."""
+    search = _crop_roi(gray, STUDENT_CODE_SEARCH_ROI)
+    rh, rw = search.shape[:2]
+    if rw < 40 or rh < 80:
+        return None
+
+    _, binary = cv2.threshold(search, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    dilated = cv2.dilate(
+        binary,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        iterations=1,
+    )
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(dilated, 8)
+    candidates = []
+    for label in range(1, num_labels):
+        x, y, w, h, area = stats[label]
+        if w < rw * 0.45 or h < rh * 0.55:
+            continue
+        aspect = w / max(1, h)
+        if 0.55 <= aspect <= 1.10:
+            candidates.append((int(area), int(x), int(y), int(w), int(h)))
+
+    if not candidates:
+        return None
+
+    _, x, y, w, h = max(candidates, key=lambda item: item[0])
+    pad = 1
+    x0 = max(0, x - pad)
+    y0 = max(0, y - pad)
+    x1 = min(rw, x + w + pad)
+    y1 = min(rh, y + h + pad)
+    return search[y0:y1, x0:x1]
+
+
 def extract_student_code(warped_gray: np.ndarray) -> dict:
     """Extract 8-digit student code from MSSV bubble grid."""
     warnings = []
-    roi = _crop_roi(warped_gray, STUDENT_CODE_ROI)
-    rh, rw = roi.shape[:2]
+    grid = _find_student_grid(warped_gray)
+    adaptive = grid is not None
 
+    if grid is None:
+        warnings.append("Using static MSSV ROI fallback")
+        roi = _crop_roi(warped_gray, STUDENT_CODE_ROI)
+        rh, rw = roi.shape[:2]
+
+        if rw < 10 or rh < 10:
+            return {"studentCode": None, "confidence": 0.0, "warnings": ["MSSV ROI too small"]}
+
+        grid_start_y = int(rh * STUDENT_CODE_HEADER_FRAC)
+        grid = roi[grid_start_y:rh, 0:rw]
+    else:
+        grid_start_y = int(grid.shape[0] * STUDENT_CODE_GRID_HEADER_FRAC)
+        grid = grid[grid_start_y:grid.shape[0], 0:grid.shape[1]]
+
+    rh, rw = grid.shape[:2]
     if rw < 10 or rh < 10:
-        return {"studentCode": None, "confidence": 0.0, "warnings": ["MSSV ROI too small"]}
+        return {"studentCode": None, "confidence": 0.0, "warnings": ["MSSV grid too small"]}
 
-    # Apply Otsu threshold on the entire ROI
-    _, binary = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    _, binary = cv2.threshold(grid, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # Grid layout: top STUDENT_CODE_HEADER_FRAC is header, rest is 10 digit rows
-    grid_start_y = int(rh * STUDENT_CODE_HEADER_FRAC)
-    grid_h = rh - grid_start_y
     cell_w = rw / STUDENT_CODE_COLUMNS
-    cell_h = grid_h / STUDENT_CODE_DIGIT_ROWS
-    r = max(3, int(min(cell_w, cell_h) * 0.25))
+    cell_h = rh / STUDENT_CODE_DIGIT_ROWS
+    r = max(3, int(min(cell_w, cell_h) * (0.20 if adaptive else 0.25)))
 
     digits = []
     total_confidence = 0.0
@@ -159,7 +212,7 @@ def extract_student_code(warped_gray: np.ndarray) -> dict:
         fills = []
 
         for row in range(STUDENT_CODE_DIGIT_ROWS):
-            cy = grid_start_y + int((row + 0.5) * cell_h)
+            cy = int((row + 0.5) * cell_h)
             fill = _score_cell(binary, cx, cy, r)
             fills.append(fill)
 

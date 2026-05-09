@@ -106,6 +106,8 @@ type SubmissionFeedbackPayload = {
   objectiveScore: number | null;
   essayScore: number | null;
   totalScore: number | null;
+  objectiveAnswers: Record<string, string>;
+  essayResults: Array<{ questionId: number; score: number; maxScore: number; feedback: string }>;
   aiComments: string | null;
   mergedPdfUrl: string | null;
   aiReport: {
@@ -157,6 +159,8 @@ const TeacherSessionManagement: React.FC = () => {
   const [publishingReport, setPublishingReport] = useState(false);
   const [mobileScanLink, setMobileScanLink] = useState('');
   const [workflowSummary, setWorkflowSummary] = useState<any | null>(null);
+  const [gradingInProgress, setGradingInProgress] = useState(false);
+  const [gradingCompleteDialog, setGradingCompleteDialog] = useState<{ gradedCount: number; totalSubmissions: number } | null>(null);
   const [loading, setLoading] = useState(true);
   const [bulkUploading, setBulkUploading] = useState(false);
   const [isCheckingIdentity, setIsCheckingIdentity] = useState(false);
@@ -182,7 +186,12 @@ const TeacherSessionManagement: React.FC = () => {
   const [issuesLoading, setIssuesLoading] = useState(false);
   const [regradingSubmissionId, setRegradingSubmissionId] = useState<number | null>(null);
   const [expandedSubmissionId, setExpandedSubmissionId] = useState<number | null>(null);
-  const [inlineEditScore, setInlineEditScore] = useState<{ submissionId: number; score: string } | null>(null);
+  const [inlineEditScore, setInlineEditScore] = useState<{
+    submissionId: number;
+    objectiveScore: string;
+    essayScore: string;
+    totalScore: string;
+  } | null>(null);
   const [classDialogMode, setClassDialogMode] = useState<'CLONE' | 'REUSE' | null>(null);
   const [selectedTargetClassId, setSelectedTargetClassId] = useState<string>('');
   const [transferTitle, setTransferTitle] = useState('');
@@ -246,6 +255,19 @@ const TeacherSessionManagement: React.FC = () => {
       mcq,
       essay,
     };
+  }, [selectedExam]);
+
+  const mcqAnswerKey = useMemo(() => {
+    const entries = (selectedExam?.questions || [])
+      .filter((item) => item.question.type === 'MULTIPLE_CHOICE')
+      .sort((left, right) => left.position - right.position)
+      .map((item, index) => ({
+        questionId: String(item.question.id),
+        label: index + 1,
+        correctAnswer: String(item.question.answer || '').trim().toUpperCase(),
+        maxScore: Number(item.points || 0),
+      }));
+    return entries;
   }, [selectedExam]);
 
   const essayQuestionIds = useMemo(
@@ -365,6 +387,8 @@ const TeacherSessionManagement: React.FC = () => {
       objectiveScore: toNumberOrNull(submission.objectiveScore),
       essayScore: toNumberOrNull(submission.essayScore),
       totalScore: toNumberOrNull(submission.totalScore ?? submission.finalScore),
+      objectiveAnswers: {},
+      essayResults: [],
       aiComments: submission.aiComments || null,
       mergedPdfUrl: submission.mergedPdfUrl || null,
       aiReport: null,
@@ -379,6 +403,8 @@ const TeacherSessionManagement: React.FC = () => {
         objectiveScore?: unknown;
         essayScore?: unknown;
         totalScore?: unknown;
+        objectiveAnswers?: Record<string, unknown>;
+        essayResults?: unknown;
         aiComments?: unknown;
         mergedPdfUrl?: unknown;
         aiReport?: {
@@ -401,12 +427,28 @@ const TeacherSessionManagement: React.FC = () => {
       const recommendations = normalizeTextArray(parsed?.aiReport?.recommendations);
       const integrityFlags = normalizeTextArray(parsed?.aiReport?.integrityFlags);
       const hasAiReport = summary || strengths.length || weaknesses.length || recommendations.length || integrityFlags.length;
+      const objectiveAnswers = parsed?.objectiveAnswers && typeof parsed.objectiveAnswers === 'object'
+        ? Object.entries(parsed.objectiveAnswers).reduce<Record<string, string>>((acc, [key, value]) => {
+            acc[String(key)] = String(value || '').trim().toUpperCase();
+            return acc;
+          }, {})
+        : {};
+      const essayResults = Array.isArray(parsed?.essayResults)
+        ? parsed.essayResults.map((item: any) => ({
+            questionId: Number(item?.questionId || 0),
+            score: Number(item?.score || 0),
+            maxScore: Number(item?.maxScore || 0),
+            feedback: String(item?.feedback || '').trim(),
+          })).filter((item) => item.questionId > 0)
+        : [];
 
       return {
         warnings: normalizeTextArray(parsed?.warnings),
         objectiveScore: toNumberOrNull(submission.objectiveScore ?? parsed?.objectiveScore),
         essayScore: toNumberOrNull(submission.essayScore ?? parsed?.essayScore),
         totalScore: toNumberOrNull(submission.totalScore ?? parsed?.totalScore),
+        objectiveAnswers,
+        essayResults,
         aiComments: String(submission.aiComments || parsed?.aiComments || '').trim() || null,
         mergedPdfUrl: String(submission.mergedPdfUrl || parsed?.mergedPdfUrl || '').trim() || null,
         aiReport: hasAiReport
@@ -453,6 +495,50 @@ const TeacherSessionManagement: React.FC = () => {
     } catch {
       return [];
     }
+  };
+
+  const renderMcqAnswerReport = (feedback: SubmissionFeedbackPayload) => {
+    if (mcqAnswerKey.length === 0) return null;
+
+    return (
+      <div className="border border-gray-100 bg-white rounded-md p-2 space-y-2">
+        <p className="text-xs font-medium text-gray-900">MCQ Answer Report</p>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-2">
+          {mcqAnswerKey.map((question) => {
+            const detected = feedback.objectiveAnswers[question.questionId] || '';
+            const isCorrect = detected && detected === question.correctAnswer;
+            return (
+              <div key={question.questionId} className="rounded border border-gray-100 px-2 py-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[11px] font-medium text-gray-700">Q{question.label}</span>
+                  <span className={`text-[11px] ${isCorrect ? 'text-green-700' : detected ? 'text-red-700' : 'text-gray-400'}`}>
+                    {detected || '-'} / {question.maxScore}
+                  </span>
+                </div>
+                <div className="mt-1 flex gap-1">
+                  {['A', 'B', 'C', 'D'].map((option) => {
+                    const isKey = option === question.correctAnswer;
+                    const isDetected = option === detected;
+                    const className = isKey
+                      ? isDetected
+                        ? 'border-green-600 bg-green-100 text-green-800'
+                        : 'border-blue-600 bg-blue-50 text-blue-800'
+                      : isDetected
+                        ? 'border-red-500 bg-red-50 text-red-700'
+                        : 'border-gray-200 text-gray-400';
+                    return (
+                      <span key={option} className={`flex h-6 w-6 items-center justify-center rounded-full border text-[11px] font-semibold ${className}`}>
+                        {option}
+                      </span>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
   };
 
   const resolveScanEntries = (submission: ExamSubmission): ExamScanEntry[] => {
@@ -917,17 +1003,23 @@ const TeacherSessionManagement: React.FC = () => {
 
   const completeScanningAndAutoGrade = async () => {
     if (!selectedSessionId) return;
+    setGradingInProgress(true);
     try {
-      const { data } = await api.post(`/exams/sessions/${selectedSessionId}/complete-scanning`, {});
+      const { data } = await api.post(`/exams/sessions/${selectedSessionId}/start-grading`, {});
       setWorkflowSummary(data);
-      toast.success(`Batch graded ${data.gradedCount || 0}/${data.totalSubmissions || 0} submissions`);
       await fetchSessionDetails(selectedSessionId);
       await fetchSessions();
+      setGradingCompleteDialog({
+        gradedCount: Number(data.gradedCount || data.createdSubmissionIds?.length || 0),
+        totalSubmissions: Number(data.totalSubmissions || data.totalDrafts || 0),
+      });
       setTab('REPORT');
       setScanMode(false);
       stopCamera();
-    } catch {
-      toast.error('Failed to complete scanning workflow');
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to complete grading workflow');
+    } finally {
+      setGradingInProgress(false);
     }
   };
 
@@ -1249,15 +1341,19 @@ const TeacherSessionManagement: React.FC = () => {
 
   const saveInlineScore = async () => {
     if (!inlineEditScore) return;
-    const score = Number(inlineEditScore.score);
-    if (!Number.isFinite(score)) {
+    const objectiveScore = Number(inlineEditScore.objectiveScore);
+    const essayScore = Number(inlineEditScore.essayScore);
+    const totalScore = Number(inlineEditScore.totalScore);
+    if (!Number.isFinite(objectiveScore) || !Number.isFinite(essayScore) || !Number.isFinite(totalScore)) {
       toast.error('Invalid score value');
       return;
     }
     try {
       await api.post(`/exams/submissions/${inlineEditScore.submissionId}/review`, {
-        finalScore: score,
-        note: 'Inline manual review from session management',
+        objectiveScore,
+        essayScore,
+        finalScore: totalScore,
+        note: 'Inline component score review from session management',
       });
       toast.success('Score updated');
       setInlineEditScore(null);
@@ -1550,12 +1646,12 @@ const TeacherSessionManagement: React.FC = () => {
                   Start Scan
                 </button>
                 <button 
-                  className={`btn-secondary text-xs ${(!issuesReport || issuesReport.readyForGrading !== issuesReport.totalStudents || draftScans.some((d) => d.status === 'PENDING')) ? 'opacity-50 cursor-not-allowed' : 'bg-primary-600 text-white hover:bg-primary-700'}`} 
+                  className={`btn-secondary text-xs ${(gradingInProgress || !issuesReport || issuesReport.readyForGrading !== issuesReport.totalStudents || draftScans.some((d) => d.status === 'PENDING')) ? 'opacity-50 cursor-not-allowed' : 'bg-primary-600 text-white hover:bg-primary-700'}`} 
                   onClick={completeScanningAndAutoGrade} 
-                  disabled={!selectedSessionId || !issuesReport || issuesReport.readyForGrading !== issuesReport.totalStudents || draftScans.some((d) => d.status === 'PENDING')}
+                  disabled={gradingInProgress || !selectedSessionId || !issuesReport || issuesReport.readyForGrading !== issuesReport.totalStudents || draftScans.some((d) => d.status === 'PENDING')}
                   title="Only available when all students have their exams correctly mapped and identified."
                 >
-                  Start Grading
+                  {gradingInProgress ? 'Grading...' : 'Start Grading'}
                 </button>
                 <button className="btn-secondary text-xs" onClick={fetchIssuesReport} disabled={!selectedSessionId || issuesLoading}>
                   <AlertTriangle size={14} className="inline mr-1" />
@@ -2061,6 +2157,11 @@ const TeacherSessionManagement: React.FC = () => {
                 <CheckCircle2 size={14} /> Latest auto grading run completed: {workflowSummary.gradedCount || 0} graded
               </p>
             )}
+            {gradingInProgress && (
+              <div className="rounded-md border border-primary-100 bg-primary-50 px-3 py-2 text-sm text-primary-800">
+                Auto grading is running. OMR is scoring the first page and Gemini is grading essay pages.
+              </div>
+            )}
 
             <div className="border-t border-gray-100 pt-3 space-y-2">
               <p className="text-sm font-medium text-gray-900">Submission Details</p>
@@ -2099,14 +2200,39 @@ const TeacherSessionManagement: React.FC = () => {
                             {regradingSubmissionId === item.id ? '...' : 'AI Regrade'}
                           </button>
                           {isInlineEditing ? (
-                            <div className="flex gap-1">
+                            <div className="flex gap-1 flex-wrap justify-end">
                               <input
                                 type="number"
                                 className="input-field text-xs w-20 py-0.5"
-                                value={inlineEditScore.score}
-                                onChange={(e) => setInlineEditScore({ ...inlineEditScore, score: e.target.value })}
+                                value={inlineEditScore.objectiveScore}
+                                onChange={(e) => {
+                                  const objectiveScore = e.target.value;
+                                  const nextTotal = Number(objectiveScore || 0) + Number(inlineEditScore.essayScore || 0);
+                                  setInlineEditScore({ ...inlineEditScore, objectiveScore, totalScore: Number(nextTotal.toFixed(2)).toString() });
+                                }}
                                 onKeyDown={(e) => e.key === 'Enter' && saveInlineScore()}
+                                aria-label="MCQ score"
                                 autoFocus
+                              />
+                              <input
+                                type="number"
+                                className="input-field text-xs w-20 py-0.5"
+                                value={inlineEditScore.essayScore}
+                                onChange={(e) => {
+                                  const essayScore = e.target.value;
+                                  const nextTotal = Number(inlineEditScore.objectiveScore || 0) + Number(essayScore || 0);
+                                  setInlineEditScore({ ...inlineEditScore, essayScore, totalScore: Number(nextTotal.toFixed(2)).toString() });
+                                }}
+                                onKeyDown={(e) => e.key === 'Enter' && saveInlineScore()}
+                                aria-label="Essay score"
+                              />
+                              <input
+                                type="number"
+                                className="input-field text-xs w-20 py-0.5"
+                                value={inlineEditScore.totalScore}
+                                onChange={(e) => setInlineEditScore({ ...inlineEditScore, totalScore: e.target.value })}
+                                onKeyDown={(e) => e.key === 'Enter' && saveInlineScore()}
+                                aria-label="Total score"
                               />
                               <button className="btn-primary text-[10px] px-2" onClick={saveInlineScore}>✓</button>
                               <button className="btn-secondary text-[10px] px-2" onClick={() => setInlineEditScore(null)}>✗</button>
@@ -2114,7 +2240,12 @@ const TeacherSessionManagement: React.FC = () => {
                           ) : (
                             <button
                               className="btn-secondary text-[11px]"
-                              onClick={() => setInlineEditScore({ submissionId: item.id, score: String(item.finalScore ?? 0) })}
+                              onClick={() => setInlineEditScore({
+                                submissionId: item.id,
+                                objectiveScore: String(feedback.objectiveScore ?? 0),
+                                essayScore: String(feedback.essayScore ?? 0),
+                                totalScore: String(feedback.totalScore ?? item.finalScore ?? 0),
+                              })}
                             >
                               Edit Score
                             </button>
@@ -2158,6 +2289,8 @@ const TeacherSessionManagement: React.FC = () => {
                           {feedback.warnings.length > 0 && (
                             <p className="text-xs text-amber-700">Warnings: {feedback.warnings.join(' | ')}</p>
                           )}
+
+                          {renderMcqAnswerReport(feedback)}
 
                           {feedback.aiComments && (
                             <p className="text-xs text-blue-700">AI comments: {feedback.aiComments}</p>
@@ -2494,6 +2627,38 @@ const TeacherSessionManagement: React.FC = () => {
             </div>
             <div className="p-2 overflow-auto flex items-center justify-center bg-gray-100">
               <img src={stagedFiles[viewingStagedImageIdx].preview} alt="Preview" className="max-w-full max-h-[80vh] object-contain rounded" />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {gradingCompleteDialog && (
+        <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/50 px-4">
+          <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-2xl space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 rounded-full bg-green-100 p-2 text-green-700">
+                <CheckCircle2 size={20} />
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900">Grading Completed</h3>
+                <p className="mt-1 text-sm text-gray-600">
+                  {gradingCompleteDialog.gradedCount}/{gradingCompleteDialog.totalSubmissions} submissions are ready in the report.
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button className="btn-secondary text-sm" onClick={() => setGradingCompleteDialog(null)}>
+                Stay Here
+              </button>
+              <button
+                className="btn-primary text-sm"
+                onClick={() => {
+                  setGradingCompleteDialog(null);
+                  setTab('REPORT');
+                }}
+              >
+                View Report
+              </button>
             </div>
           </div>
         </div>
