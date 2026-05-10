@@ -124,7 +124,6 @@ export interface SubmissionBatchEssayQuestion {
   questionId: number;
   questionContent: string;
   expectedAnswer: string;
-  rubric?: string | null;
   maxScore: number;
 }
 
@@ -143,6 +142,23 @@ export interface SubmissionBatchExtractionResult {
   essayResults: EssayGradingResult[];
   warnings: string[];
 }
+
+const DEFAULT_ESSAY_RUBRIC = [
+  'Use this default rubric for every essay question. Convert the 10-point bands proportionally to each question maxScore:',
+  '- 9-10/10 (90%-100% of maxScore): Complete, accurate answer with clear reasoning.',
+  '- 7-8/10 (70%-89% of maxScore): Mostly correct with minor gaps.',
+  '- 5-6/10 (50%-69% of maxScore): Correct but incomplete explanation.',
+  '- 3-4/10 (30%-49% of maxScore): Partially correct with significant gaps.',
+  '- 1-2/10 (10%-29% of maxScore): Minimal correctness.',
+  '- 0/10 (0% of maxScore): Incorrect or no answer.',
+].join('\n');
+
+const buildEssayQuestionPromptPayload = (essayQuestions: SubmissionBatchEssayQuestion[]) => {
+  return essayQuestions.map((question) => ({
+    ...question,
+    defaultRubric: DEFAULT_ESSAY_RUBRIC,
+  }));
+};
 
 const parseModelJson = <T>(rawText: string): T => {
   const cleaned = rawText
@@ -175,7 +191,8 @@ const normalizeEssayAnswers = (answers: unknown): Record<string, string> => {
 
 const normalizeEssayResults = (
   essayResults: unknown,
-  essayQuestionMaxScore: Map<number, number>
+  essayQuestionMaxScore: Map<number, number>,
+  essayAnswersByQuestion: Record<string, string> = {}
 ): EssayGradingResult[] => {
   if (!Array.isArray(essayResults)) return [];
 
@@ -200,14 +217,29 @@ const normalizeEssayResults = (
         ? Math.min(incomingMaxScore, configuredMaxScore)
         : configuredMaxScore;
 
+    const extractedAnswer = String(essayAnswersByQuestion[String(questionId)] || '').trim();
+    const answerWordCount = extractedAnswer.split(/\s+/).filter(Boolean).length;
     const incomingScore = Number(raw.score);
     const resolvedScore = Number.isFinite(incomingScore)
       ? Math.max(0, Math.min(resolvedMaxScore, incomingScore))
       : 0;
+    const feedbackText = String(raw.feedback || '').toLowerCase();
+    const strongNegativeFeedback = /(sai|lạc đề|không đúng|không nêu|không trả lời|chưa giải thích|chưa đưa ra|né tránh|mơ hồ|không có bằng chứng)/i.test(feedbackText);
+    const partialNegativeFeedback = /(thiếu|chưa đầy đủ|chung chung|một phần|sơ sài)/i.test(feedbackText);
+    const cappedByAnswerLength = !extractedAnswer
+      ? 0
+      : answerWordCount < 6
+        ? Math.min(resolvedScore, resolvedMaxScore * 0.2)
+        : resolvedScore;
+    const cappedByFeedback = strongNegativeFeedback
+      ? Math.min(cappedByAnswerLength, resolvedMaxScore * 0.2)
+      : partialNegativeFeedback
+        ? Math.min(cappedByAnswerLength, resolvedMaxScore * 0.6)
+        : cappedByAnswerLength;
 
     normalizedByQuestion.set(questionId, {
       questionId,
-      score: Number(resolvedScore.toFixed(2)),
+      score: Number(cappedByFeedback.toFixed(2)),
       maxScore: Number(resolvedMaxScore.toFixed(2)),
       feedback: String(raw.feedback || '').trim().slice(0, 1000),
     });
@@ -258,7 +290,7 @@ export const extractAndGradeSubmissionFromScansBatch = async (
 
 Mục tiêu:
 1. Chỉ trích xuất câu trả lời tự luận từ các trang tự luận.
-2. Chấm điểm tự luận theo đáp án/rubric cho từng câu.
+2. Chấm điểm tự luận theo đáp án mẫu và defaultRubric cho từng câu.
 3. Không nhận diện họ tên, MSSV, khuôn mặt, hoặc danh tính thí sinh.
 
 Ngữ cảnh bài thi:
@@ -267,7 +299,8 @@ ${JSON.stringify(
         scannablePages: input.scannablePages,
         passPurposeByIndex: input.passPurposeByIndex || {},
         layoutBlueprint: input.layoutBlueprint || {},
-        essayQuestions: input.essayQuestions,
+        defaultRubric: DEFAULT_ESSAY_RUBRIC,
+        essayQuestions: buildEssayQuestionPromptPayload(input.essayQuestions),
       },
       null,
       2
@@ -276,8 +309,12 @@ ${JSON.stringify(
 Ràng buộc bắt buộc:
 1. Trả về DUY NHẤT JSON hợp lệ, không markdown, không giải thích.
 2. Không bịa dữ liệu. Không sử dụng ảnh để xác định thí sinh.
-3. score của essayResults phải trong khoảng [0, maxScore] từng câu.
-4. Nếu ảnh mờ, lệch, thiếu góc hoặc khó đọc thì ghi rõ trong warnings.
+3. Chấm NGHIÊM theo đáp án mẫu và defaultRubric. Chỉ cho điểm cao khi câu trả lời nêu đúng ý cốt lõi bằng nội dung cụ thể.
+4. Nếu câu trả lời sai, lạc đề, né tránh, chỉ lặp lại đề, quá chung chung, hoặc không có bằng chứng trong ảnh thì score phải là 0 hoặc tối đa 20% maxScore.
+5. Không suy diễn ý đúng từ câu trả lời mơ hồ. Không thưởng điểm cho văn phong nếu thiếu ý chính.
+6. score của essayResults phải trong khoảng [0, maxScore] từng câu.
+7. feedback phải nêu ngắn gọn ý nào đúng, ý nào thiếu/sai, và lý do điểm.
+8. Nếu ảnh mờ, lệch, thiếu góc hoặc khó đọc thì ghi rõ trong warnings.
 
 Output JSON format:
 {
@@ -316,7 +353,11 @@ Output JSON format:
       fullName: parsed?.fullName ? String(parsed.fullName).trim() : null,
       studentCode: parsed?.studentCode ? String(parsed.studentCode).trim() : null,
       essayAnswers: normalizeEssayAnswers(parsed?.essayAnswers),
-      essayResults: normalizeEssayResults(parsed?.essayResults, essayQuestionMaxScore),
+      essayResults: normalizeEssayResults(
+        parsed?.essayResults,
+        essayQuestionMaxScore,
+        normalizeEssayAnswers(parsed?.essayAnswers)
+      ),
       warnings: [...new Set(modelWarnings)],
     };
   } finally {
@@ -412,7 +453,7 @@ ${imageManifest.map((m) => `  Ảnh ${m.imageIndex + 1}: ${m.studentLabel} - Tra
 
 Mục tiêu cho MỖI sinh viên:
 1. Chỉ trích xuất câu trả lời tự luận từ các trang tự luận của sinh viên đó.
-2. Chấm điểm theo rubric.
+2. Chấm điểm theo đáp án mẫu và defaultRubric.
 3. Không nhận diện họ tên, MSSV, khuôn mặt, hoặc danh tính thí sinh.
 
 Thông tin bài thi:
@@ -421,7 +462,8 @@ ${JSON.stringify(
         scannablePages,
         passPurposeByIndex: passPurposeByIndex || {},
         layoutBlueprint: layoutBlueprint || {},
-        essayQuestions,
+        defaultRubric: DEFAULT_ESSAY_RUBRIC,
+        essayQuestions: buildEssayQuestionPromptPayload(essayQuestions),
       },
       null,
       2
@@ -430,8 +472,12 @@ ${JSON.stringify(
 Ràng buộc bắt buộc:
 1. Trả về DUY NHẤT JSON hợp lệ, không markdown, không giải thích.
 2. Không bịa dữ liệu. Không sử dụng ảnh để xác định thí sinh.
-3. score phải trong khoảng [0, maxScore] cho mỗi câu.
-4. Nếu ảnh mờ hoặc khó đọc, ghi vào warnings.
+3. Chấm NGHIÊM theo đáp án mẫu và defaultRubric. Chỉ cho điểm cao khi câu trả lời nêu đúng ý cốt lõi bằng nội dung cụ thể.
+4. Nếu câu trả lời sai, lạc đề, né tránh, chỉ lặp lại đề, quá chung chung, hoặc không có bằng chứng trong ảnh thì score phải là 0 hoặc tối đa 20% maxScore.
+5. Không suy diễn ý đúng từ câu trả lời mơ hồ. Không thưởng điểm cho văn phong nếu thiếu ý chính.
+6. score phải trong khoảng [0, maxScore] cho mỗi câu.
+7. feedback phải nêu ngắn gọn ý nào đúng, ý nào thiếu/sai, và lý do điểm.
+8. Nếu ảnh mờ hoặc khó đọc, ghi vào warnings.
 
 Output JSON format (mảng kết quả cho từng sinh viên):
 {
@@ -496,7 +542,11 @@ Output JSON format (mảng kết quả cho từng sinh viên):
         fullName: match.fullName ? String(match.fullName).trim() : null,
         studentCode: match.studentCode ? String(match.studentCode).trim() : null,
         essayAnswers: normalizeEssayAnswers(match.essayAnswers),
-        essayResults: normalizeEssayResults(match.essayResults, essayQuestionMaxScore),
+        essayResults: normalizeEssayResults(
+          match.essayResults,
+          essayQuestionMaxScore,
+          normalizeEssayAnswers(match.essayAnswers)
+        ),
         warnings: [...new Set([
           ...modelWarnings,
         ])],

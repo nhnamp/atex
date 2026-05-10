@@ -77,7 +77,6 @@ export interface Question {
   options?: string | null; // JSON string
   status?: 'ACTIVE' | 'ARCHIVED';
   difficulty?: 'EASY' | 'MEDIUM' | 'HARD';
-  rubric?: string | null;
   learningOutcomeId?: number | null;
   learningOutcome?: LearningOutcome;
   createdAt?: string;

@@ -107,7 +107,9 @@ type SubmissionFeedbackPayload = {
   essayScore: number | null;
   totalScore: number | null;
   objectiveAnswers: Record<string, string>;
+  essayAnswers: Record<string, string>;
   essayResults: Array<{ questionId: number; score: number; maxScore: number; feedback: string }>;
+  omrAnnotatedImageUrl: string | null;
   aiComments: string | null;
   mergedPdfUrl: string | null;
   aiReport: {
@@ -257,17 +259,20 @@ const TeacherSessionManagement: React.FC = () => {
     };
   }, [selectedExam]);
 
-  const mcqAnswerKey = useMemo(() => {
-    const entries = (selectedExam?.questions || [])
-      .filter((item) => item.question.type === 'MULTIPLE_CHOICE')
-      .sort((left, right) => left.position - right.position)
-      .map((item, index) => ({
-        questionId: String(item.question.id),
-        label: index + 1,
-        correctAnswer: String(item.question.answer || '').trim().toUpperCase(),
-        maxScore: Number(item.points || 0),
-      }));
-    return entries;
+  const essayQuestionById = useMemo(() => {
+    return new Map(
+      (selectedExam?.questions || [])
+        .filter((item) => item.question.type === 'ESSAY')
+        .map((item, index) => [
+          Number(item.question.id),
+          {
+            label: index + 1,
+            content: item.question.content,
+            expectedAnswer: item.question.answer,
+            maxScore: Number(item.points || 0),
+          },
+        ])
+    );
   }, [selectedExam]);
 
   const essayQuestionIds = useMemo(
@@ -388,7 +393,9 @@ const TeacherSessionManagement: React.FC = () => {
       essayScore: toNumberOrNull(submission.essayScore),
       totalScore: toNumberOrNull(submission.totalScore ?? submission.finalScore),
       objectiveAnswers: {},
+      essayAnswers: {},
       essayResults: [],
+      omrAnnotatedImageUrl: null,
       aiComments: submission.aiComments || null,
       mergedPdfUrl: submission.mergedPdfUrl || null,
       aiReport: null,
@@ -404,7 +411,9 @@ const TeacherSessionManagement: React.FC = () => {
         essayScore?: unknown;
         totalScore?: unknown;
         objectiveAnswers?: Record<string, unknown>;
+        essayAnswers?: Record<string, unknown>;
         essayResults?: unknown;
+        omrAnnotatedImageUrl?: unknown;
         aiComments?: unknown;
         mergedPdfUrl?: unknown;
         aiReport?: {
@@ -441,6 +450,12 @@ const TeacherSessionManagement: React.FC = () => {
             feedback: String(item?.feedback || '').trim(),
           })).filter((item) => item.questionId > 0)
         : [];
+      const essayAnswers = parsed?.essayAnswers && typeof parsed.essayAnswers === 'object'
+        ? Object.entries(parsed.essayAnswers).reduce<Record<string, string>>((acc, [key, value]) => {
+            acc[String(key)] = String(value || '').trim();
+            return acc;
+          }, {})
+        : {};
 
       return {
         warnings: normalizeTextArray(parsed?.warnings),
@@ -448,7 +463,9 @@ const TeacherSessionManagement: React.FC = () => {
         essayScore: toNumberOrNull(submission.essayScore ?? parsed?.essayScore),
         totalScore: toNumberOrNull(submission.totalScore ?? parsed?.totalScore),
         objectiveAnswers,
+        essayAnswers,
         essayResults,
+        omrAnnotatedImageUrl: String(parsed?.omrAnnotatedImageUrl || '').trim() || null,
         aiComments: String(submission.aiComments || parsed?.aiComments || '').trim() || null,
         mergedPdfUrl: String(submission.mergedPdfUrl || parsed?.mergedPdfUrl || '').trim() || null,
         aiReport: hasAiReport
@@ -497,42 +514,36 @@ const TeacherSessionManagement: React.FC = () => {
     }
   };
 
-  const renderMcqAnswerReport = (feedback: SubmissionFeedbackPayload) => {
-    if (mcqAnswerKey.length === 0) return null;
+  const renderEssayGradingDetails = (feedback: SubmissionFeedbackPayload) => {
+    if (feedback.essayResults.length === 0 && Object.keys(feedback.essayAnswers).length === 0) return null;
 
     return (
       <div className="border border-gray-100 bg-white rounded-md p-2 space-y-2">
-        <p className="text-xs font-medium text-gray-900">MCQ Answer Report</p>
-        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-2">
-          {mcqAnswerKey.map((question) => {
-            const detected = feedback.objectiveAnswers[question.questionId] || '';
-            const isCorrect = detected && detected === question.correctAnswer;
+        <p className="text-xs font-medium text-gray-900">Essay Grading Details</p>
+        <div className="space-y-2">
+          {feedback.essayResults.map((result) => {
+            const question = essayQuestionById.get(result.questionId);
+            const detectedAnswer = feedback.essayAnswers[String(result.questionId)] || '';
             return (
-              <div key={question.questionId} className="rounded border border-gray-100 px-2 py-1.5">
+              <div key={result.questionId} className="rounded border border-gray-100 bg-gray-50 px-2 py-2">
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-[11px] font-medium text-gray-700">Q{question.label}</span>
-                  <span className={`text-[11px] ${isCorrect ? 'text-green-700' : detected ? 'text-red-700' : 'text-gray-400'}`}>
-                    {detected || '-'} / {question.maxScore}
+                  <span className="text-xs font-medium text-gray-800">
+                    Essay {question?.label ?? result.questionId}
+                  </span>
+                  <span className="text-xs font-semibold text-orange-700">
+                    {result.score}/{result.maxScore || question?.maxScore || '-'}
                   </span>
                 </div>
-                <div className="mt-1 flex gap-1">
-                  {['A', 'B', 'C', 'D'].map((option) => {
-                    const isKey = option === question.correctAnswer;
-                    const isDetected = option === detected;
-                    const className = isKey
-                      ? isDetected
-                        ? 'border-green-600 bg-green-100 text-green-800'
-                        : 'border-blue-600 bg-blue-50 text-blue-800'
-                      : isDetected
-                        ? 'border-red-500 bg-red-50 text-red-700'
-                        : 'border-gray-200 text-gray-400';
-                    return (
-                      <span key={option} className={`flex h-6 w-6 items-center justify-center rounded-full border text-[11px] font-semibold ${className}`}>
-                        {option}
-                      </span>
-                    );
-                  })}
+                {question?.content && (
+                  <p className="mt-1 text-[11px] text-gray-600">{question.content}</p>
+                )}
+                <div className="mt-2 rounded border border-gray-100 bg-white p-2">
+                  <p className="text-[11px] font-medium text-gray-700">AI detected answer</p>
+                  <p className="mt-1 whitespace-pre-wrap text-xs text-gray-700">{detectedAnswer || 'No answer detected.'}</p>
                 </div>
+                {result.feedback && (
+                  <p className="mt-1 text-xs text-blue-700">Feedback: {result.feedback}</p>
+                )}
               </div>
             );
           })}
@@ -2266,6 +2277,17 @@ const TeacherSessionManagement: React.FC = () => {
                             <p className="text-xs text-gray-500">No scan images available for this submission.</p>
                           ) : (
                             <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                              {feedback.omrAnnotatedImageUrl && (
+                                <a
+                                  href={feedback.omrAnnotatedImageUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="border border-primary-200 rounded-md p-2 hover:border-primary-400 transition-colors"
+                                >
+                                  <p className="text-xs text-primary-700 truncate">OMR annotated result</p>
+                                  <img src={feedback.omrAnnotatedImageUrl} alt="omr-annotated-result" className="mt-1 w-full h-24 object-cover rounded" loading="lazy" />
+                                </a>
+                              )}
                               {scans?.map?.((scan, idx) => {
                                 const href = scan.accessUrl || scan.url || (scan.filename ? `/uploads/scans/${encodeURIComponent(scan.filename)}` : '');
                                 if (!href) return null;
@@ -2290,7 +2312,7 @@ const TeacherSessionManagement: React.FC = () => {
                             <p className="text-xs text-amber-700">Warnings: {feedback.warnings.join(' | ')}</p>
                           )}
 
-                          {renderMcqAnswerReport(feedback)}
+                          {renderEssayGradingDetails(feedback)}
 
                           {feedback.aiComments && (
                             <p className="text-xs text-blue-700">AI comments: {feedback.aiComments}</p>

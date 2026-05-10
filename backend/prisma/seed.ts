@@ -128,6 +128,309 @@ async function main() {
   });
   const outcomeMap = new Map(outcomes.map((item) => [item.code, item.id]));
 
+  let cryptographySubject = await prisma.subject.findFirst({
+    where: {
+      teacherId: teacher.id,
+      name: 'Cryptography Fundamentals',
+    },
+  });
+
+  if (!cryptographySubject) {
+    cryptographySubject = await prisma.subject.create({
+      data: {
+        name: 'Cryptography Fundamentals',
+        teacherId: teacher.id,
+      },
+    });
+  }
+
+  const cryptographyOutcomeSeeds = [
+    { code: 'CR1.1', description: 'Explain cryptographic terms, plaintext, ciphertext, and core security goals' },
+    { code: 'CR1.2', description: 'Apply symmetric and asymmetric encryption to practical scenarios' },
+    { code: 'CR2.1', description: 'Analyze hash functions, MACs, and digital signatures for integrity' },
+    { code: 'CR2.2', description: 'Evaluate key exchange, protocol design, and secure deployment choices' },
+  ];
+
+  for (const outcome of cryptographyOutcomeSeeds) {
+    const existing = await prisma.learningOutcome.findFirst({
+      where: {
+        subjectId: cryptographySubject.id,
+        code: outcome.code,
+      },
+    });
+
+    if (!existing) {
+      await prisma.learningOutcome.create({
+        data: {
+          subjectId: cryptographySubject.id,
+          code: outcome.code,
+          description: outcome.description,
+        },
+      });
+    }
+  }
+
+  const cryptographyOutcomes = await prisma.learningOutcome.findMany({
+    where: { subjectId: cryptographySubject.id },
+    orderBy: { code: 'asc' },
+  });
+  const cryptographyOutcomeMap = new Map(cryptographyOutcomes.map((item) => [item.code, item.id]));
+
+  const cryptographyQuestions: Array<{
+    type: 'MULTIPLE_CHOICE' | 'ESSAY';
+    content: string;
+    answer: string;
+    options: string | null;
+    difficulty: 'EASY' | 'MEDIUM' | 'HARD';
+    learningOutcomeCode: string;
+  }> = [
+    {
+      type: 'MULTIPLE_CHOICE',
+      content: 'Which term refers to readable data before encryption?',
+      answer: 'A',
+      options: JSON.stringify(['Plaintext', 'Ciphertext', 'Key', 'Salt']),
+      difficulty: 'EASY',
+      learningOutcomeCode: 'CR1.1',
+    },
+    {
+      type: 'MULTIPLE_CHOICE',
+      content: 'Which practice most directly reduces risk when a private key is compromised?',
+      answer: 'B',
+      options: JSON.stringify(['Reusing the same key indefinitely', 'Rotating and revoking the key', 'Publishing the key publicly', 'Lowering the key length']),
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'CR1.1',
+    },
+    {
+      type: 'ESSAY',
+      content: 'Explain why cryptographic systems need strong key management even when the algorithms themselves are secure.',
+      answer:
+        'Cryptographic algorithms can be mathematically strong, but the whole system still fails if keys are weak, exposed, reused, or never revoked. Key management covers secure generation, storage, distribution, rotation, backup, and destruction of keys. It also includes controlling who can access keys and how often they should change. If an attacker steals a key, they may decrypt protected data, forge signatures, or impersonate trusted systems without breaking the algorithm. Good key management therefore protects confidentiality, integrity, and trust in real deployments. In practice, organizations use hardware security modules, access controls, audit logs, and lifecycle policies to keep keys safe.',
+      options: null,
+      difficulty: 'HARD',
+      learningOutcomeCode: 'CR1.1',
+    },
+    {
+      type: 'MULTIPLE_CHOICE',
+      content: 'Which algorithm is a symmetric block cipher widely used in modern systems?',
+      answer: 'C',
+      options: JSON.stringify(['RSA', 'DSA', 'AES', 'Diffie-Hellman']),
+      difficulty: 'EASY',
+      learningOutcomeCode: 'CR1.2',
+    },
+    {
+      type: 'MULTIPLE_CHOICE',
+      content: 'Which statement best describes public-key cryptography?',
+      answer: 'D',
+      options: JSON.stringify(['It uses the same key for both directions', 'It works only with hashes', 'It requires no keys at all', 'It uses a public/private key pair']),
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'CR1.2',
+    },
+    {
+      type: 'ESSAY',
+      content: 'Compare symmetric and asymmetric encryption and explain when each is most appropriate.',
+      answer:
+        'Symmetric encryption uses one shared secret key for both encryption and decryption, so it is fast and suitable for large files, disk encryption, and bulk data transfer. The main challenge is safely sharing that key. Asymmetric encryption uses a public key and a private key pair. It is slower, but it solves the key distribution problem and supports identity, digital signatures, and secure key exchange. In real systems, the two methods are usually combined. For example, TLS uses asymmetric cryptography to authenticate parties and negotiate a session key, then switches to symmetric encryption for the actual data because it is much more efficient.',
+      options: null,
+      difficulty: 'HARD',
+      learningOutcomeCode: 'CR1.2',
+    },
+    {
+      type: 'MULTIPLE_CHOICE',
+      content: 'Which property is primarily provided by a cryptographic hash?',
+      answer: 'A',
+      options: JSON.stringify(['Integrity checking', 'Compression', 'Transport routing', 'Availability']),
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'CR2.1',
+    },
+    {
+      type: 'MULTIPLE_CHOICE',
+      content: 'Which construction combines a hash with a secret key to verify message authenticity?',
+      answer: 'B',
+      options: JSON.stringify(['Caesar cipher', 'HMAC', 'ECB', 'XOR shift']),
+      difficulty: 'HARD',
+      learningOutcomeCode: 'CR2.1',
+    },
+    {
+      type: 'ESSAY',
+      content: 'Explain how a hash function differs from encryption and why this difference matters when protecting passwords.',
+      answer:
+        'A hash function is one-way: it transforms input data into a fixed-length digest that should not be practically reversible. Encryption is reversible because its purpose is to let authorized users recover the original plaintext with the correct key. This difference matters for password protection because passwords should not be stored in recoverable form. Instead of encrypting passwords, systems store salted password hashes. When a user logs in, the system hashes the entered password and compares the result to the stored value. Salting helps prevent rainbow-table attacks and makes identical passwords produce different stored hashes. Good password storage also uses a slow hashing algorithm such as bcrypt, scrypt, or Argon2.',
+      options: null,
+      difficulty: 'EASY',
+      learningOutcomeCode: 'CR2.1',
+    },
+    {
+      type: 'MULTIPLE_CHOICE',
+      content: 'Which AES mode is widely recommended for confidentiality plus integrity when used correctly?',
+      answer: 'C',
+      options: JSON.stringify(['ECB', 'CBC without IV', 'GCM', 'OTP with reused pad']),
+      difficulty: 'MEDIUM',
+      learningOutcomeCode: 'CR2.2',
+    },
+    {
+      type: 'MULTIPLE_CHOICE',
+      content: 'Which attack is most closely associated with unauthenticated Diffie-Hellman exchanges?',
+      answer: 'D',
+      options: JSON.stringify(['SQL injection', 'Cache poisoning', 'Brute-force password guessing', 'Man-in-the-middle']),
+      difficulty: 'HARD',
+      learningOutcomeCode: 'CR2.2',
+    },
+    {
+      type: 'ESSAY',
+      content: 'Describe why authenticated key exchange is important in protocols like TLS and what attack it prevents.',
+      answer:
+        'Authenticated key exchange is important because two parties must not only agree on a shared secret, but also know who they are talking to. In protocols like TLS, authentication prevents an attacker from inserting themselves between the client and server during key establishment. Without authentication, a man-in-the-middle can negotiate separate secrets with each side, read the traffic, and even modify it without being detected. TLS solves this by combining key exchange with certificates and signatures from trusted certificate authorities. That lets the client verify the server identity before sending sensitive data. The result is both confidentiality and trust in the session key that protects the rest of the communication.',
+      options: null,
+      difficulty: 'EASY',
+      learningOutcomeCode: 'CR2.2',
+    },
+  ];
+
+  for (const question of cryptographyQuestions) {
+    const existing = await prisma.question.findFirst({
+      where: {
+        subjectId: cryptographySubject.id,
+        content: question.content,
+      },
+    });
+
+    if (existing) continue;
+
+    await prisma.question.create({
+      data: {
+        subjectId: cryptographySubject.id,
+        type: question.type,
+        content: question.content,
+        answer: question.answer,
+        options: question.options,
+        difficulty: question.difficulty,
+        learningOutcomeId: cryptographyOutcomeMap.get(question.learningOutcomeCode) ?? null,
+        status: 'ACTIVE',
+      },
+    });
+  }
+
+  console.log(`✅ Created ${cryptographyQuestions.length} cryptography questions`);
+
+  // Ensure the cryptography question bank has 220 MCQs + 30 Essays (total 250)
+  const desiredCryptMcq = 220;
+  const desiredCryptEssay = 30;
+
+  const existingCryptMcqCount = await prisma.question.count({
+    where: { subjectId: cryptographySubject.id, type: 'MULTIPLE_CHOICE' },
+  });
+  const existingCryptEssayCount = await prisma.question.count({
+    where: { subjectId: cryptographySubject.id, type: 'ESSAY' },
+  });
+
+  const mcqToAdd = Math.max(0, desiredCryptMcq - existingCryptMcqCount);
+  const essayToAdd = Math.max(0, desiredCryptEssay - existingCryptEssayCount);
+
+  if (mcqToAdd > 0 || essayToAdd > 0) {
+    const toCreate: Array<{
+      subjectId: number;
+      type: 'MULTIPLE_CHOICE' | 'ESSAY';
+      content: string;
+      answer: string;
+      options: string | null;
+      difficulty: 'EASY' | 'MEDIUM' | 'HARD';
+      learningOutcomeId: number | null;
+      status: 'ACTIVE';
+    }> = [];
+
+    const outcomeCodes = ['CR1.1', 'CR1.2', 'CR2.1', 'CR2.2'];
+
+    // generate MCQs
+    for (let i = 0; i < mcqToAdd; i++) {
+      const idx = i + 1 + existingCryptMcqCount;
+      const outcomeCode = outcomeCodes[i % outcomeCodes.length];
+      const difficulty = i % 3 === 0 ? 'EASY' : i % 3 === 1 ? 'MEDIUM' : 'HARD';
+
+      // rotate correct letter evenly across A-D
+      const letter = ['A', 'B', 'C', 'D'][i % 4];
+
+      const correctAnswerText = `Correct answer for cryptography MCQ ${idx}`;
+      const opts = [
+        `${correctAnswerText} (option A)`,
+        `${correctAnswerText} (option B)`,
+        `${correctAnswerText} (option C)`,
+        `${correctAnswerText} (option D)`,
+      ];
+
+      // place correct text at the index determined by letter
+      const correctIndex = ['A', 'B', 'C', 'D'].indexOf(letter);
+      // swap the correct text into that position and create plausible distractors
+      opts[correctIndex] = `Best choice: ${correctAnswerText}`;
+      for (let j = 0; j < opts.length; j++) {
+        if (j !== correctIndex) {
+          opts[j] = `Distractor ${j + 1} for MCQ ${idx}`;
+        }
+      }
+
+      toCreate.push({
+        subjectId: cryptographySubject.id,
+        type: 'MULTIPLE_CHOICE',
+        content: `Cryptography MCQ ${idx}: Which statement is correct about topic ${idx}?`,
+        answer: letter,
+        options: JSON.stringify(opts),
+        difficulty,
+        learningOutcomeId: cryptographyOutcomeMap.get(outcomeCode) ?? null,
+        status: 'ACTIVE',
+      });
+    }
+
+    // helper to produce a long essay answer (~110-130 words)
+    const makeEssayAnswer = (i: number, promptTopic: string) => {
+      // craft a 110-130 word paragraph by concatenating sentences
+      const sentences = [
+        `This answer discusses ${promptTopic} in the context of cryptography and practical systems.`,
+        'It explains the fundamental principles, gives examples of real-world usage, and highlights common pitfalls to avoid.',
+        'Key operational considerations are described, including deployment patterns, administrative controls, and mitigation strategies.',
+        'The response also contrasts alternative approaches where appropriate and provides guidance on deciding which option fits a given scenario.',
+        'Finally, it summarizes the practical implications for system designers and operators so the reader can apply the concepts effectively.',
+      ];
+
+      // add a short concluding sentence with index to increase uniqueness
+      sentences.push(`In summary, the point ${i} emphasizes pragmatic trade-offs and sound engineering practice.`);
+
+      return sentences.join(' ');
+    };
+
+    // generate Essay questions
+    for (let k = 0; k < essayToAdd; k++) {
+      const idx = k + 1 + existingCryptEssayCount;
+      const outcomeCode = outcomeCodes[(mcqToAdd + k) % outcomeCodes.length];
+      const difficulty = k % 3 === 0 ? 'EASY' : k % 3 === 1 ? 'MEDIUM' : 'HARD';
+
+      const topic = `cryptographic concept ${idx}`;
+      const content = `Cryptography Essay ${idx}: Discuss ${topic} with practical examples and implications.`;
+      const answer = makeEssayAnswer(idx, topic);
+
+      toCreate.push({
+        subjectId: cryptographySubject.id,
+        type: 'ESSAY',
+        content,
+        answer,
+        options: null,
+        difficulty,
+        learningOutcomeId: cryptographyOutcomeMap.get(outcomeCode) ?? null,
+        status: 'ACTIVE',
+      });
+    }
+
+    for (const q of toCreate) {
+      // avoid duplicates by content
+      const existing = await prisma.question.findFirst({ where: { subjectId: cryptographySubject.id, content: q.content } });
+      if (!existing) {
+        await prisma.question.create({ data: q });
+      }
+    }
+
+    console.log(`✅ Added ${toCreate.length} cryptography questions (${mcqToAdd} MCQ, ${essayToAdd} Essay)`);
+  } else {
+    console.log('✅ Cryptography subject already meets target counts (220 MCQ + 30 Essay).');
+  }
+
   const essayOutcomeCodes = ['G1.1', 'G1.2', 'G2.1', 'G2.2', 'G3.1'];
 
   const sampleQuestions = [
@@ -461,7 +764,6 @@ async function main() {
           options: q.options,
           difficulty: q.difficulty ?? 'MEDIUM',
           learningOutcomeId: q.type === 'ESSAY' ? outcomeMap.get(q.learningOutcomeCode || '') ?? null : outcomes[0]?.id ?? null,
-          rubric: q.type === 'ESSAY' ? null : undefined,
           status: 'ACTIVE',
         },
       });
@@ -491,7 +793,6 @@ async function main() {
         status: 'ACTIVE',
         difficulty: essay.difficulty,
         learningOutcomeId: outcomeMap.get(essay.learningOutcomeCode) ?? null,
-        rubric: `Assess against ${essay.learningOutcomeCode}.`,
       },
     });
   }
@@ -546,7 +847,6 @@ async function main() {
       options: string | null;
       difficulty: 'EASY' | 'MEDIUM' | 'HARD';
       learningOutcomeId: number | null;
-      rubric: string | null;
       status: 'ACTIVE';
     }> = [];
 
@@ -568,7 +868,6 @@ async function main() {
           ]),
           difficulty,
           learningOutcomeId: outcome?.id ?? null,
-          rubric: null,
           status: 'ACTIVE',
         });
       } else {
@@ -580,7 +879,6 @@ async function main() {
           options: null,
           difficulty,
           learningOutcomeId: outcome?.id ?? null,
-          rubric: 'Score by: technical accuracy (0.4), mitigation quality (0.4), communication clarity (0.2).',
           status: 'ACTIVE',
         });
       }

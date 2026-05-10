@@ -2,8 +2,11 @@ import { Response } from 'express';
 import { PrismaClient } from '@prisma/client';
 import { AuthRequest } from '../middleware/auth';
 import * as XLSX from 'xlsx';
+import * as path from 'path';
+import * as fs from 'fs';
 
 const prisma = new PrismaClient();
+const EXCEL_MAX_ROWS = 500;
 
 const normalizeQuestionType = (raw: string): 'MULTIPLE_CHOICE' | 'ESSAY' | null => {
   const value = String(raw || '').trim().toUpperCase();
@@ -76,7 +79,6 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
       status,
       difficulty,
       learningOutcomeId,
-      rubric,
     } = req.body;
 
     if (!subjectId || !type || !content || !answer) {
@@ -111,7 +113,6 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
         status: status || 'ACTIVE',
         difficulty: normalizeDifficulty(difficulty),
         learningOutcomeId: learningOutcomeId ? parseInt(String(learningOutcomeId), 10) : null,
-        rubric: rubric || null,
       },
     });
 
@@ -135,7 +136,7 @@ export const updateQuestion = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const { type, content, answer, options, status, difficulty, learningOutcomeId, rubric } = req.body;
+    const { type, content, answer, options, status, difficulty, learningOutcomeId } = req.body;
     const updated = await prisma.question.update({
       where: { id },
       data: {
@@ -151,7 +152,6 @@ export const updateQuestion = async (req: AuthRequest, res: Response): Promise<v
             : Number.isFinite(Number(learningOutcomeId))
               ? parseInt(String(learningOutcomeId), 10)
               : question.learningOutcomeId,
-        rubric: rubric ?? question.rubric,
       },
     });
 
@@ -186,7 +186,17 @@ export const deleteQuestion = async (req: AuthRequest, res: Response): Promise<v
   }
 };
 
-export const importQuestionsFromExcel = async (req: AuthRequest, res: Response): Promise<void> => {
+interface ParsedQuestion {
+  id: string;
+  type: 'MULTIPLE_CHOICE' | 'ESSAY';
+  content: string;
+  answer: string;
+  options?: string[];
+  difficulty: 'EASY' | 'MEDIUM' | 'HARD';
+  learningOutcomeCode?: string;
+}
+
+export const previewQuestionsFromExcel = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const subjectId = parseInt(String(req.params.subjectId), 10);
     const file = (req as AuthRequest & { file?: Express.Multer.File }).file;
@@ -203,44 +213,58 @@ export const importQuestionsFromExcel = async (req: AuthRequest, res: Response):
     }
 
     const workbook = XLSX.read(file.buffer, { type: 'buffer' });
-    const firstSheetName = workbook.SheetNames[0];
-    const firstSheet = workbook.Sheets[firstSheetName];
-    const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(firstSheet, { defval: '' });
+    
+    if (workbook.SheetNames.length === 0) {
+      res.status(400).json({ error: 'Excel file has no sheets' });
+      return;
+    }
 
-    if (rows.length === 0) {
+    const allRows: Record<string, unknown>[] = [];
+    for (const sheetName of workbook.SheetNames) {
+      const sheet = workbook.Sheets[sheetName];
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+      allRows.push(...rows);
+    }
+
+    if (allRows.length === 0) {
       res.status(400).json({ error: 'Excel file has no data rows' });
+      return;
+    }
+
+    if (allRows.length > EXCEL_MAX_ROWS) {
+      res.status(400).json({ error: `Excel file exceeds maximum of ${EXCEL_MAX_ROWS} rows (found ${allRows.length})` });
       return;
     }
 
     const outcomes = await prisma.learningOutcome.findMany({ where: { subjectId } });
     const outcomeMap = new Map(outcomes.map((item) => [item.code.toUpperCase(), item.id]));
 
-    let inserted = 0;
+    const questions: ParsedQuestion[] = [];
     const errors: Array<{ row: number; message: string }> = [];
 
-    for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
+    for (let i = 0; i < allRows.length; i++) {
+      const row = allRows[i];
       const rowNumber = i + 2;
 
-      const content = String(row.content || row.question || '').trim();
-      const answer = String(row.answer || '').trim();
-      const type = normalizeQuestionType(String(row.type || row.questionType || ''));
-      const outcomeCode = String(row.learningOutcomeCode || row.outcomeCode || '').trim().toUpperCase();
-      const difficulty = normalizeDifficulty(row.difficulty || 'MEDIUM');
-      const rubric = String(row.rubric || '').trim();
+      const content = String(row['Question Content'] || row.content || row.question || '').trim();
+      const answer = String(row['Correct Answer'] || row.answer || '').trim();
+      const typeRaw = String(row['Question Type'] || row.type || row.questionType || '').trim();
+      const type = normalizeQuestionType(typeRaw);
+      const outcomeCode = String(row['Learning Outcome Code'] || row.learningOutcomeCode || row.outcomeCode || '').trim().toUpperCase();
+      const difficulty = normalizeDifficulty(row.Difficulty || row.difficulty || 'MEDIUM');
 
       if (!content || !answer || !type) {
-        errors.push({ row: rowNumber, message: 'Missing required fields: content, answer, or type' });
+        errors.push({ row: rowNumber, message: 'Missing required fields: Question Content, Correct Answer, or Question Type' });
         continue;
       }
 
-      const optionsRaw = String(row.options || '').trim();
+      const optionsRaw = String(row['Options (A|B|C|D)'] || row.options || '').trim();
       const options = optionsRaw
         ? optionsRaw.split('|').map((item) => item.trim()).filter(Boolean)
         : [];
 
       if (type === 'MULTIPLE_CHOICE' && options.length !== 4) {
-        errors.push({ row: rowNumber, message: 'Multiple choice question must have exactly 4 options separated by |' });
+        errors.push({ row: rowNumber, message: 'Multiple choice question must have exactly 4 options separated by | (found ' + options.length + ')' });
         continue;
       }
 
@@ -248,49 +272,150 @@ export const importQuestionsFromExcel = async (req: AuthRequest, res: Response):
       if (outcomeCode) {
         learningOutcomeId = outcomeMap.get(outcomeCode) || null;
         if (!learningOutcomeId) {
-          errors.push({ row: rowNumber, message: `Outcome code not found: ${outcomeCode}` });
+          errors.push({ row: rowNumber, message: `Learning Outcome code not found in database: ${outcomeCode}` });
           continue;
         }
       }
 
-      const existing = await prisma.question.findFirst({
-        where: {
-          subjectId,
-          type,
-          content,
-          answer,
-        },
-      });
+      const question: ParsedQuestion = {
+        id: `temp-${i}`,
+        type,
+        content,
+        answer,
+        difficulty,
+      };
 
-      if (existing) {
-        continue;
+      if (type === 'MULTIPLE_CHOICE') {
+        question.options = options;
       }
 
-      await prisma.question.create({
-        data: {
-          subjectId,
-          type,
-          content,
-          answer,
-          options: type === 'MULTIPLE_CHOICE' ? JSON.stringify(options) : null,
-          difficulty,
-          rubric: type === 'ESSAY' ? rubric || null : null,
-          learningOutcomeId,
-          status: 'ACTIVE',
-        },
-      });
-      inserted += 1;
+      if (outcomeCode) {
+        question.learningOutcomeCode = outcomeCode;
+      }
+
+      questions.push(question);
     }
 
     res.json({
-      message: 'Excel import completed',
-      totalRows: rows.length,
-      inserted,
-      skipped: rows.length - inserted - errors.length,
+      successCount: questions.length,
+      errorCount: errors.length,
+      questions,
       errors,
     });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Failed to import questions from Excel' });
+    res.status(500).json({ error: 'Failed to preview Excel file' });
+  }
+};
+
+export const downloadTemplate = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const templatePath = path.join(__dirname, '../../..', 'template', 'question-import-template.xlsx');
+    
+    if (!fs.existsSync(templatePath)) {
+      res.status(404).json({ error: 'Template file not found' });
+      return;
+    }
+
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="question-import-template.xlsx"');
+    
+    const fileStream = fs.createReadStream(templatePath);
+    fileStream.pipe(res);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to download template' });
+  }
+};
+
+export const importQuestionsFromExcel = async (req: AuthRequest, res: Response): Promise<void> => {
+  try {
+    const subjectId = parseInt(String(req.params.subjectId), 10);
+    const { questions: questionsData } = req.body;
+
+    if (!questionsData || !Array.isArray(questionsData) || questionsData.length === 0) {
+      res.status(400).json({ error: 'Questions array is required' });
+      return;
+    }
+
+    const subject = await prisma.subject.findUnique({ where: { id: subjectId } });
+    if (!subject || subject.teacherId !== req.user!.id) {
+      res.status(404).json({ error: 'Subject not found' });
+      return;
+    }
+
+    const outcomes = await prisma.learningOutcome.findMany({ where: { subjectId } });
+    const outcomeMap = new Map(outcomes.map((item) => [item.code.toUpperCase(), item.id]));
+
+    let inserted = 0;
+    const errors: Array<{ index: number; message: string }> = [];
+
+    for (let i = 0; i < questionsData.length; i++) {
+      const qData = questionsData[i];
+
+      try {
+        const content = String(qData.content || '').trim();
+        const answer = String(qData.answer || '').trim();
+        const type = qData.type as 'MULTIPLE_CHOICE' | 'ESSAY' | undefined;
+        const difficulty = (qData.difficulty || 'MEDIUM') as 'EASY' | 'MEDIUM' | 'HARD';
+        const learningOutcomeCode = String(qData.learningOutcomeCode || '').trim().toUpperCase();
+
+        if (!content || !answer || !type || !['MULTIPLE_CHOICE', 'ESSAY'].includes(type)) {
+          errors.push({ index: i, message: 'Invalid question data' });
+          continue;
+        }
+
+        let learningOutcomeId: number | null = null;
+        if (learningOutcomeCode) {
+          learningOutcomeId = outcomeMap.get(learningOutcomeCode) || null;
+          if (!learningOutcomeId) {
+            errors.push({ index: i, message: `Learning Outcome code not found: ${learningOutcomeCode}` });
+            continue;
+          }
+        }
+
+        const existing = await prisma.question.findFirst({
+          where: {
+            subjectId,
+            type,
+            content,
+            answer,
+          },
+        });
+
+        if (existing) {
+          continue;
+        }
+
+        const options = type === 'MULTIPLE_CHOICE' ? qData.options : undefined;
+
+        await prisma.question.create({
+          data: {
+            subjectId,
+            type,
+            content,
+            answer,
+            options: options ? JSON.stringify(options) : null,
+            difficulty,
+            learningOutcomeId,
+            status: 'ACTIVE',
+          },
+        });
+        inserted += 1;
+      } catch (err) {
+        console.error(err);
+        errors.push({ index: i, message: 'Error processing question' });
+      }
+    }
+
+    res.json({
+      message: `Successfully imported ${inserted} question(s)`,
+      imported: inserted,
+      failed: errors.length,
+      errors,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to import questions' });
   }
 };

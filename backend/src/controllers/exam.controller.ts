@@ -1164,6 +1164,161 @@ const mapOmrAnswersToQuestionIds = (
   return mapped;
 };
 
+const escapeSvgText = (value: unknown): string => {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+};
+
+const buildCorrectObjectiveAnswers = (
+  examQuestions: Array<{ question: { id: number; type: string; answer: string } }>
+): Record<string, string> => {
+  return examQuestions.reduce<Record<string, string>>((acc, item) => {
+    if (item.question.type === 'ESSAY') return acc;
+    const answer = String(item.question.answer || '').trim().toUpperCase().replace(/[^A-D]/g, '');
+    if (answer) acc[String(item.question.id)] = answer;
+    return acc;
+  }, {});
+};
+
+const createOmrAnnotatedImageUrl = async (params: {
+  imagePath: string;
+  detectedAnswers: Record<string, string>;
+  correctAnswers: Record<string, string>;
+  studentCode?: string | null;
+  scanBlueprint: ExamScanBlueprint;
+  label: string;
+}): Promise<string | null> => {
+  const localPath = resolveLocalFilePath(params.imagePath);
+  if (!localPath) return null;
+
+  const referenceWidth = Number((params.scanBlueprint as any)?.omrTemplate?.referenceWidth) || 2480;
+  const referenceHeight = Number((params.scanBlueprint as any)?.omrTemplate?.referenceHeight) || 3508;
+  const svgParts: string[] = [
+    `<svg width="${referenceWidth}" height="${referenceHeight}" viewBox="0 0 ${referenceWidth} ${referenceHeight}" xmlns="http://www.w3.org/2000/svg">`,
+    '<style>.detected{fill:none;stroke:#dc2626;stroke-width:8}.correct{fill:none;stroke:#16a34a;stroke-width:8}.label{font:700 30px Arial,sans-serif;fill:#111827}.small{font:700 22px Arial,sans-serif;fill:#111827}</style>',
+    '<rect x="24" y="24" width="980" height="104" rx="16" fill="#ffffff" fill-opacity="0.88" stroke="#d1d5db" stroke-width="3"/>',
+    '<circle cx="66" cy="58" r="16" class="detected"/><text x="96" y="68" class="small">Red: recognized bubbles / MSSV</text>',
+    '<circle cx="66" cy="98" r="16" class="correct"/><text x="96" y="108" class="small">Green: correct answer when student answer is different</text>',
+  ];
+
+  const questions = Array.isArray((params.scanBlueprint as any)?.omrTemplate?.questions)
+    ? (params.scanBlueprint as any).omrTemplate.questions as Array<{
+        questionId: number;
+        bubbles: Array<{ option: string; x: number; y: number; width: number; height: number }>;
+      }>
+    : [];
+
+  for (const question of questions) {
+    const questionId = String(question.questionId);
+    const detected = String(params.detectedAnswers[questionId] || '').trim().toUpperCase();
+    const correct = String(params.correctAnswers[questionId] || '').trim().toUpperCase();
+    const detectedBubble = question.bubbles.find((bubble) => String(bubble.option).toUpperCase() === detected);
+    const correctBubble = question.bubbles.find((bubble) => String(bubble.option).toUpperCase() === correct);
+
+    if (detectedBubble) {
+      const cx = detectedBubble.x + detectedBubble.width / 2;
+      const cy = detectedBubble.y + detectedBubble.height / 2;
+      const radius = Math.max(detectedBubble.width, detectedBubble.height) * 0.72;
+      svgParts.push(`<circle cx="${cx}" cy="${cy}" r="${radius}" class="detected"/>`);
+    }
+
+    if (detected && correct && detected !== correct && correctBubble) {
+      const cx = correctBubble.x + correctBubble.width / 2;
+      const cy = correctBubble.y + correctBubble.height / 2;
+      const radius = Math.max(correctBubble.width, correctBubble.height) * 0.72;
+      svgParts.push(`<circle cx="${cx}" cy="${cy}" r="${radius}" class="correct"/>`);
+    }
+  }
+
+  const studentCode = String(params.studentCode || '').trim();
+  if (studentCode) {
+    const roi = { x: 0.63, y: 0.12, width: 0.27, height: 0.30 };
+    const gridX = roi.x * referenceWidth;
+    const gridY = (roi.y + roi.height * 0.20) * referenceHeight;
+    const gridWidth = roi.width * referenceWidth;
+    const gridHeight = roi.height * referenceHeight * 0.80;
+    const cellWidth = gridWidth / 8;
+    const cellHeight = gridHeight / 10;
+    svgParts.push(`<text x="${gridX}" y="${Math.max(150, gridY - 18)}" class="label">MSSV: ${escapeSvgText(studentCode)}</text>`);
+
+    studentCode.slice(0, 8).split('').forEach((digit, index) => {
+      const row = Number.parseInt(digit, 10);
+      if (!Number.isFinite(row) || row < 0 || row > 9) return;
+      const cx = gridX + (index + 0.5) * cellWidth;
+      const cy = gridY + (row + 0.5) * cellHeight;
+      const radius = Math.max(12, Math.min(cellWidth, cellHeight) * 0.26);
+      svgParts.push(`<circle cx="${cx}" cy="${cy}" r="${radius}" class="detected"/>`);
+    });
+  }
+
+  svgParts.push('</svg>');
+
+  const annotatedBuffer = await sharp(localPath)
+    .resize(referenceWidth, referenceHeight, { fit: 'fill' })
+    .composite([{ input: Buffer.from(svgParts.join('')), top: 0, left: 0 }])
+    .png()
+    .toBuffer();
+
+  return uploadImageToCloudinary(annotatedBuffer, `${params.label}_omr_annotated.png`);
+};
+
+const ensureSubmissionOmrAnnotatedImage = async (params: {
+  submission: { id: number; scanFiles: string; feedback: string | null };
+  examQuestions: Array<{ question: { id: number; type: string; answer: string } }>;
+  scanBlueprint: ExamScanBlueprint;
+}): Promise<string | null> => {
+  if (!params.submission.feedback) return null;
+
+  let feedback: Record<string, any>;
+  try {
+    feedback = JSON.parse(params.submission.feedback || '{}') as Record<string, any>;
+  } catch {
+    return null;
+  }
+
+  if (feedback.omrAnnotatedImageUrl) {
+    return String(feedback.omrAnnotatedImageUrl);
+  }
+
+  const objectiveAnswers = normalizeObjectiveAnswers(feedback.objectiveAnswers || {});
+  if (Object.keys(objectiveAnswers).length === 0) return null;
+
+  const firstScan = sortScanEntriesByPassIndex(parseScanEntries(params.submission.scanFiles || '[]'))[0];
+  if (!firstScan) return null;
+
+  let scanPath = '';
+  try {
+    scanPath = await resolveScanPath(firstScan);
+    const annotatedUrl = await createOmrAnnotatedImageUrl({
+      imagePath: scanPath,
+      detectedAnswers: objectiveAnswers,
+      correctAnswers: buildCorrectObjectiveAnswers(params.examQuestions),
+      studentCode: feedback.identity?.studentCode || null,
+      scanBlueprint: params.scanBlueprint,
+      label: `submission_${params.submission.id}`,
+    });
+
+    if (!annotatedUrl) return null;
+
+    feedback.omrAnnotatedImageUrl = annotatedUrl;
+    await prisma.examSubmission.update({
+      where: { id: params.submission.id },
+      data: { feedback: JSON.stringify(feedback) },
+    });
+
+    return annotatedUrl;
+  } catch {
+    return null;
+  } finally {
+    if (scanPath && path.basename(scanPath).startsWith('scan_tmp_') && fs.existsSync(scanPath)) {
+      fs.unlink(scanPath, () => undefined);
+    }
+  }
+};
+
 const normalizeEssayAnswers = (answers: Record<string, string>): Record<string, string> => {
   return Object.entries(answers).reduce<Record<string, string>>((acc, [questionId, answer]) => {
     const key = String(questionId).replace(/[^0-9]/g, '');
@@ -1181,7 +1336,6 @@ type SubmissionExamQuestion = {
     type: string;
     content: string;
     answer: string;
-    rubric?: string | null;
   };
 };
 
@@ -1235,7 +1389,6 @@ const extractBatchScanGradingData = async (
         questionId: item.question.id,
         questionContent: item.question.content,
         expectedAnswer: item.question.answer,
-        rubric: item.question.rubric,
         maxScore: item.points,
       }));
 
@@ -3765,16 +3918,29 @@ export const getSessionReport = async (req: AuthRequest, res: Response): Promise
       },
     });
 
-    const enrichedSubmissions = submissions.map((submission) => {
+    const enrichedSubmissions = await Promise.all(submissions.map(async (submission) => {
+      await ensureSubmissionOmrAnnotatedImage({
+        submission,
+        examQuestions: session.exam.questions,
+        scanBlueprint,
+      });
+
+      const refreshedSubmission = await prisma.examSubmission.findUnique({
+        where: { id: submission.id },
+        include: {
+          student: { select: { id: true, username: true, fullName: true } },
+        },
+      });
+      const resolvedSubmission = refreshedSubmission || submission;
       const details = extractSubmissionReportDetails({
-        feedback: submission.feedback,
-        scanFiles: submission.scanFiles,
+        feedback: resolvedSubmission.feedback,
+        scanFiles: resolvedSubmission.scanFiles,
       });
 
       return {
-        ...submission,
-        scanEntries: parseAccessibleScanEntries(submission.scanFiles || '[]'),
-        scanCount: parseScanEntries(submission.scanFiles || '[]').length,
+        ...resolvedSubmission,
+        scanEntries: parseAccessibleScanEntries(resolvedSubmission.scanFiles || '[]'),
+        scanCount: parseScanEntries(resolvedSubmission.scanFiles || '[]').length,
         mergedPdfUrl: details.mergedPdfUrl,
         objectiveScore: details.objectiveScore,
         essayScore: details.essayScore,
@@ -3782,7 +3948,7 @@ export const getSessionReport = async (req: AuthRequest, res: Response): Promise
         aiComments: details.aiComments,
         warnings: details.warnings,
       };
-    });
+    }));
 
     const scores = enrichedSubmissions.map((s) => s.finalScore || 0);
     const average = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
@@ -4026,7 +4192,6 @@ export const completeScanningAndAutoGrade = async (req: AuthRequest, res: Respon
       questionId: item.question.id,
       questionContent: item.question.content,
       expectedAnswer: item.question.answer,
-      rubric: item.question.rubric,
       maxScore: item.points,
     }));
 
@@ -5117,7 +5282,6 @@ export const startDraftGrading = async (req: AuthRequest, res: Response): Promis
         type: item.question.type,
         content: item.question.content,
         answer: item.question.answer,
-        rubric: item.question.rubric,
       },
     }));
     const essayQuestionsForGemini = session.exam.questions
@@ -5126,9 +5290,9 @@ export const startDraftGrading = async (req: AuthRequest, res: Response): Promis
         questionId: item.question.id,
         questionContent: item.question.content,
         expectedAnswer: item.question.answer,
-        rubric: item.question.rubric,
         maxScore: item.points,
       }));
+    const correctObjectiveAnswers = buildCorrectObjectiveAnswers(session.exam.questions);
 
     const objectiveByDraftId = new Map<number, BatchScanGradingData>();
     for (const draft of drafts) {
@@ -5149,6 +5313,33 @@ export const startDraftGrading = async (req: AuthRequest, res: Response): Promis
         { skipEssayGrading: true }
       );
       objectiveByDraftId.set(draft.id, objectiveExtraction);
+    }
+
+    const omrAnnotatedImageByDraftId = new Map<number, string>();
+    for (const draft of drafts) {
+      const objectiveExtraction = objectiveByDraftId.get(draft.id);
+      if (!objectiveExtraction) continue;
+      const firstPagePath = getDraftScanPaths(draft)[0];
+      if (!firstPagePath) continue;
+
+      try {
+        const annotatedUrl = await createOmrAnnotatedImageUrl({
+          imagePath: firstPagePath,
+          detectedAnswers: normalizeObjectiveAnswers(objectiveExtraction.objectiveAnswers || {}),
+          correctAnswers: correctObjectiveAnswers,
+          studentCode: objectiveExtraction.extractedIdentity.studentCode,
+          scanBlueprint,
+          label: `session_${sessionId}_draft_${draft.id}`,
+        });
+        if (annotatedUrl) {
+          omrAnnotatedImageByDraftId.set(draft.id, annotatedUrl);
+        }
+      } catch (error) {
+        const existing = objectiveByDraftId.get(draft.id);
+        if (existing) {
+          existing.warnings.push(`Failed to generate OMR annotated image: ${(error as Error).message}`);
+        }
+      }
     }
 
     const essayByDraftId = new Map<number, {
@@ -5280,6 +5471,7 @@ export const startDraftGrading = async (req: AuthRequest, res: Response): Promis
 
         const feedbackPayload = {
           draftId: draft.id,
+          omrAnnotatedImageUrl: omrAnnotatedImageByDraftId.get(draft.id) || null,
           identity: {
             fullName: objectiveExtraction.extractedIdentity.fullName,
             studentCode: objectiveExtraction.extractedIdentity.studentCode,

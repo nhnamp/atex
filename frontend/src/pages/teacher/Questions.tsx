@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { Plus, ArrowLeft, Trash2, X, Pencil } from 'lucide-react';
+import { Plus, ArrowLeft, Trash2, X, Pencil, Upload } from 'lucide-react';
 import toast from 'react-hot-toast';
 import Layout from '../../components/Layout';
 import LoadingSpinner from '../../components/LoadingSpinner';
+import QuestionImportModal from '../../components/QuestionImportModal';
 import api from '../../api';
 import { LearningOutcome, Question, Subject } from '../../types';
 
@@ -17,7 +18,6 @@ interface QuestionForm {
   status: 'ACTIVE' | 'ARCHIVED';
   difficulty: 'EASY' | 'MEDIUM' | 'HARD';
   learningOutcomeId: string;
-  rubric: string;
 }
 
 const EMPTY_FORM: QuestionForm = {
@@ -28,7 +28,6 @@ const EMPTY_FORM: QuestionForm = {
   status: 'ACTIVE',
   difficulty: 'MEDIUM',
   learningOutcomeId: '',
-  rubric: '',
 };
 
 const TYPE_LABELS: Record<QuestionType, string> = {
@@ -48,7 +47,7 @@ const TeacherQuestions: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [typeFilter, setTypeFilter] = useState<'ALL' | QuestionType>('ALL');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ACTIVE' | 'ARCHIVED'>('ALL');
-  const [importing, setImporting] = useState(false);
+  const [isImportModalOpen, setIsImportModalOpen] = useState(false);
 
   const fetchData = async () => {
     if (!subjectId) return;
@@ -89,7 +88,6 @@ const TeacherQuestions: React.FC = () => {
       status: q.status || 'ACTIVE',
       difficulty: q.difficulty || 'MEDIUM',
       learningOutcomeId: q.learningOutcomeId ? String(q.learningOutcomeId) : '',
-      rubric: q.rubric || '',
     });
     setShowModal(true);
   };
@@ -107,7 +105,6 @@ const TeacherQuestions: React.FC = () => {
       status: form.status,
       difficulty: form.difficulty,
       learningOutcomeId: form.learningOutcomeId ? parseInt(form.learningOutcomeId, 10) : null,
-      rubric: form.rubric,
     };
 
     if (form.type === 'MULTIPLE_CHOICE') {
@@ -148,30 +145,7 @@ const TeacherQuestions: React.FC = () => {
     }
   };
 
-  const importExcel = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    if (!subjectId) return;
-    const file = event.target.files?.[0];
-    if (!file) return;
 
-    setImporting(true);
-    try {
-      const formData = new FormData();
-      formData.append('file', file);
-      const { data } = await api.post(`/questions/subject/${subjectId}/import-excel`, formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
-      toast.success(`Imported ${data.inserted} question(s)`);
-      if (Array.isArray(data.errors) && data.errors.length > 0) {
-        toast.error(`${data.errors.length} row(s) failed validation`);
-      }
-      fetchData();
-    } catch (err: any) {
-      toast.error(err?.response?.data?.error || 'Failed to import Excel');
-    } finally {
-      setImporting(false);
-      event.target.value = '';
-    }
-  };
 
   const filtered = questions.filter((q) => {
     if (typeFilter !== 'ALL' && q.type !== typeFilter) return false;
@@ -194,10 +168,12 @@ const TeacherQuestions: React.FC = () => {
             <button onClick={openCreate} className="btn-primary flex items-center gap-2">
               <Plus size={18} /> Add Question
             </button>
-            <label className="btn-secondary flex items-center gap-2 cursor-pointer">
-              {importing ? 'Importing...' : 'Import Excel'}
-              <input type="file" accept=".xlsx,.xls" className="hidden" disabled={importing} onChange={importExcel} />
-            </label>
+            <button
+              onClick={() => setIsImportModalOpen(true)}
+              className="btn-secondary flex items-center gap-2"
+            >
+              <Upload size={18} /> Import Questions
+            </button>
           </div>
         </div>
 
@@ -364,11 +340,6 @@ const TeacherQuestions: React.FC = () => {
                 <input className="input-field" value={form.answer} onChange={(e) => setForm({ ...form, answer: e.target.value })} required />
               </div>
 
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1.5">Rubric (Essay grading)</label>
-                <textarea className="input-field resize-none" rows={3} value={form.rubric} onChange={(e) => setForm({ ...form, rubric: e.target.value })} placeholder="Criteria for essay grading" />
-              </div>
-
               <div className="flex gap-3 pt-2">
                 <button type="button" className="btn-secondary flex-1" onClick={() => setShowModal(false)}>Cancel</button>
                 <button type="submit" disabled={saving} className="btn-primary flex-1">{saving ? 'Saving...' : editingId ? 'Update' : 'Add Question'}</button>
@@ -377,6 +348,14 @@ const TeacherQuestions: React.FC = () => {
           </div>
         </div>
       )}
+
+      <QuestionImportModal
+        subjectId={parseInt(subjectId || '0', 10)}
+        outcomes={outcomes}
+        isOpen={isImportModalOpen}
+        onClose={() => setIsImportModalOpen(false)}
+        onSuccess={fetchData}
+      />
     </Layout>
   );
 };

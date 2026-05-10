@@ -42,7 +42,6 @@ const TeacherExamGenerator: React.FC = () => {
     answer: '',
     difficulty: 'MEDIUM' as 'EASY' | 'MEDIUM' | 'HARD',
     status: 'ACTIVE' as 'ACTIVE' | 'ARCHIVED',
-    rubric: '',
     learningOutcomeId: '',
     options: ['', '', '', ''],
   });
@@ -489,7 +488,6 @@ const TeacherExamGenerator: React.FC = () => {
       answer: question.answer,
       difficulty: question.difficulty || 'MEDIUM',
       status: question.status || 'ACTIVE',
-      rubric: question.rubric || '',
       learningOutcomeId: question.learningOutcomeId ? String(question.learningOutcomeId) : '',
       options: question.type === 'MULTIPLE_CHOICE' ? (parseQuestionOptions(question).length > 0 ? parseQuestionOptions(question) : ['', '', '', '']) : ['', '', '', ''],
     });
@@ -513,7 +511,6 @@ const TeacherExamGenerator: React.FC = () => {
       answer: questionForm.answer.trim(),
       difficulty: questionForm.difficulty,
       status: questionForm.status,
-      rubric: questionForm.rubric.trim(),
       learningOutcomeId: questionForm.learningOutcomeId ? Number(questionForm.learningOutcomeId) : null,
     };
 
@@ -1313,16 +1310,6 @@ const TeacherExamGenerator: React.FC = () => {
                           <option value="ARCHIVED">Archived</option>
                         </select>
                       </div>
-                    </div>
-
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">Rubric / notes</label>
-                      <textarea
-                        className="input-field resize-none"
-                        rows={3}
-                        value={questionForm.rubric}
-                        onChange={(e) => setQuestionForm((prev) => ({ ...prev, rubric: e.target.value }))}
-                      />
                     </div>
 
                     <div className="flex items-center justify-end gap-2 pt-2">

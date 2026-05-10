@@ -126,7 +126,6 @@ model Question {
   options   String?  // JSON: ["Option A","Option B","Option C","Option D"] for MC
   status    String   @default("ACTIVE") // ACTIVE | ARCHIVED
   difficulty String  @default("MEDIUM") // EASY | MEDIUM | HARD
-  rubric    String?
   learningOutcomeId Int?
   learningOutcome LearningOutcome? @relation(fields: [learningOutcomeId], references: [id], onDelete: SetNull)
   createdAt DateTime @default(now())
