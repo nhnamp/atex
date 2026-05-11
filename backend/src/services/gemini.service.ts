@@ -96,6 +96,20 @@ export interface EssayGradingResult {
   score: number;
   maxScore: number;
   feedback: string;
+  componentScores: EssayRubricComponentScore[];
+  achievedCriteria: string[];
+  missingCriteria: string[];
+}
+
+export interface EssayRubricComponentScore {
+  criterionId: string;
+  description: string;
+  score: number;
+  maxScore: number;
+  achieved: boolean;
+  matchedKeywords: string[];
+  missingKeywords: string[];
+  comments: string;
 }
 
 export interface ScanLayoutBlueprint {
@@ -144,19 +158,100 @@ export interface SubmissionBatchExtractionResult {
 }
 
 const DEFAULT_ESSAY_RUBRIC = [
-  'Use this default rubric for every essay question. Convert the 10-point bands proportionally to each question maxScore:',
-  '- 9-10/10 (90%-100% of maxScore): Complete, accurate answer with clear reasoning.',
-  '- 7-8/10 (70%-89% of maxScore): Mostly correct with minor gaps.',
-  '- 5-6/10 (50%-69% of maxScore): Correct but incomplete explanation.',
-  '- 3-4/10 (30%-49% of maxScore): Partially correct with significant gaps.',
-  '- 1-2/10 (10%-29% of maxScore): Minimal correctness.',
-  '- 0/10 (0% of maxScore): Incorrect or no answer.',
+  'Use the generated rubric criteria for every essay question. Award points only for rubric criteria supported by the candidate answer.',
+  'Accept equivalent phrasing when the same technical meaning is clearly present.',
+  'Do not award points for generic, off-topic, contradictory, or merely stylistic text.',
+  'If the candidate answer does not address a criterion, that criterion score must be 0.',
 ].join('\n');
+
+const RUBRIC_STOPWORDS = new Set([
+  'about', 'after', 'also', 'and', 'because', 'been', 'being', 'between', 'can', 'complete',
+  'could', 'does', 'each', 'explain', 'from', 'have', 'help', 'helps', 'into', 'mention',
+  'must', 'need', 'needs', 'note', 'other', 'should', 'that', 'their', 'these', 'this',
+  'through', 'uses', 'when', 'where', 'which', 'while', 'with', 'would',
+  'cac', 'can', 'cau', 'cho', 'cua', 'duoc', 'giai', 'hay', 'khac', 'khi', 'khong',
+  'mot', 'neu', 'nhung', 'phai', 'rieng', 'thi', 'trong', 'va', 'voi',
+]);
+
+const normalizeRubricText = (value: string): string => (
+  value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+);
+
+const extractRubricKeywords = (text: string): string[] => {
+  const seen = new Set<string>();
+  return normalizeRubricText(text)
+    .split(/[^a-z0-9]+/i)
+    .map((item) => item.trim())
+    .filter((item) => item.length >= 4 && !RUBRIC_STOPWORDS.has(item))
+    .filter((item) => {
+      if (seen.has(item)) return false;
+      seen.add(item);
+      return true;
+    })
+    .slice(0, 8);
+};
+
+const splitExpectedAnswerIntoRubricPoints = (expectedAnswer: string): string[] => {
+  const cleaned = String(expectedAnswer || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!cleaned) {
+    return ['Candidate answer must directly and correctly answer the question.'];
+  }
+
+  const bulletParts = cleaned
+    .split(/(?:^|\s)(?:[-*•]|\d+[.)])\s+/)
+    .map((part) => part.trim())
+    .filter((part) => part.length >= 12);
+
+  const rawParts = bulletParts.length > 1
+    ? bulletParts
+    : cleaned.split(/(?<=[.!?;。！？])\s+|\s+-\s+|\s*,\s*(?=(?:and|và|va)\s+)/i);
+
+  const points = rawParts
+    .map((part) => part.trim().replace(/^[,;:.]+|[,;:.]+$/g, ''))
+    .filter((part) => part.length >= 12)
+    .slice(0, 8);
+
+  return points.length > 0 ? points : [cleaned];
+};
+
+const buildRubricFromExpectedAnswer = (question: SubmissionBatchEssayQuestion) => {
+  const points = splitExpectedAnswerIntoRubricPoints(question.expectedAnswer);
+  const maxScore = Math.max(0, Number(question.maxScore) || 0);
+  const baseScore = points.length > 0 ? Math.floor((maxScore / points.length) * 100) / 100 : maxScore;
+  let assigned = 0;
+
+  return points.map((point, index) => {
+    const criterionMaxScore = index === points.length - 1
+      ? Math.max(0, Number((maxScore - assigned).toFixed(2)))
+      : baseScore;
+    assigned = Number((assigned + criterionMaxScore).toFixed(2));
+
+    return {
+      criterionId: `Q${question.questionId}-C${index + 1}`,
+      mandatoryKeyPoint: point,
+      maxScore: criterionMaxScore,
+      criticalKeywords: extractRubricKeywords(point),
+      flexibleScoring: 'Award credit for equivalent wording only when the candidate expresses the same technical meaning. Give partial credit within this component for incomplete but relevant coverage.',
+    };
+  });
+};
 
 const buildEssayQuestionPromptPayload = (essayQuestions: SubmissionBatchEssayQuestion[]) => {
   return essayQuestions.map((question) => ({
-    ...question,
-    defaultRubric: DEFAULT_ESSAY_RUBRIC,
+    questionId: question.questionId,
+    questionContent: question.questionContent,
+    maxScore: question.maxScore,
+    sourceAnswerFromDatabase: question.expectedAnswer,
+    gradingRubric: buildRubricFromExpectedAnswer(question),
+    rubricInstructions: DEFAULT_ESSAY_RUBRIC,
   }));
 };
 
@@ -189,6 +284,49 @@ const normalizeEssayAnswers = (answers: unknown): Record<string, string> => {
   return result;
 };
 
+const normalizeTextArray = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => String(item || '').trim())
+    .filter(Boolean)
+    .slice(0, 20);
+};
+
+const normalizeComponentScores = (value: unknown, questionMaxScore: number): EssayRubricComponentScore[] => {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item, index) => {
+      if (!item || typeof item !== 'object') return null;
+      const raw = item as {
+        criterionId?: unknown;
+        description?: unknown;
+        mandatoryKeyPoint?: unknown;
+        score?: unknown;
+        maxScore?: unknown;
+        achieved?: unknown;
+        matchedKeywords?: unknown;
+        missingKeywords?: unknown;
+        comments?: unknown;
+      };
+      const maxScore = Math.max(0, Math.min(questionMaxScore, Number(raw.maxScore) || 0));
+      const score = Math.max(0, Math.min(maxScore, Number(raw.score) || 0));
+      const description = String(raw.description || raw.mandatoryKeyPoint || '').trim();
+      if (!description && maxScore <= 0) return null;
+
+      return {
+        criterionId: String(raw.criterionId || `C${index + 1}`).trim(),
+        description,
+        score: Number(score.toFixed(2)),
+        maxScore: Number(maxScore.toFixed(2)),
+        achieved: Boolean(raw.achieved) || (maxScore > 0 && score >= maxScore * 0.8),
+        matchedKeywords: normalizeTextArray(raw.matchedKeywords),
+        missingKeywords: normalizeTextArray(raw.missingKeywords),
+        comments: String(raw.comments || '').trim().slice(0, 500),
+      };
+    })
+    .filter((item): item is EssayRubricComponentScore => Boolean(item));
+};
+
 const normalizeEssayResults = (
   essayResults: unknown,
   essayQuestionMaxScore: Map<number, number>,
@@ -203,8 +341,13 @@ const normalizeEssayResults = (
     const raw = item as {
       questionId?: unknown;
       score?: unknown;
+      totalScore?: unknown;
       maxScore?: unknown;
       feedback?: unknown;
+      comments?: unknown;
+      componentScores?: unknown;
+      achievedCriteria?: unknown;
+      missingCriteria?: unknown;
     };
 
     const questionId = Number.parseInt(String(raw.questionId), 10);
@@ -219,18 +362,22 @@ const normalizeEssayResults = (
 
     const extractedAnswer = String(essayAnswersByQuestion[String(questionId)] || '').trim();
     const answerWordCount = extractedAnswer.split(/\s+/).filter(Boolean).length;
-    const incomingScore = Number(raw.score);
+    const incomingScore = Number(raw.totalScore ?? raw.score);
     const resolvedScore = Number.isFinite(incomingScore)
       ? Math.max(0, Math.min(resolvedMaxScore, incomingScore))
       : 0;
+    const componentScores = normalizeComponentScores(raw.componentScores, resolvedMaxScore);
+    const componentTotal = componentScores.length > 0
+      ? componentScores.reduce((acc, component) => acc + component.score, 0)
+      : resolvedScore;
     const feedbackText = String(raw.feedback || '').toLowerCase();
     const strongNegativeFeedback = /(sai|lạc đề|không đúng|không nêu|không trả lời|chưa giải thích|chưa đưa ra|né tránh|mơ hồ|không có bằng chứng)/i.test(feedbackText);
     const partialNegativeFeedback = /(thiếu|chưa đầy đủ|chung chung|một phần|sơ sài)/i.test(feedbackText);
     const cappedByAnswerLength = !extractedAnswer
       ? 0
       : answerWordCount < 6
-        ? Math.min(resolvedScore, resolvedMaxScore * 0.2)
-        : resolvedScore;
+        ? Math.min(resolvedScore, componentTotal, resolvedMaxScore * 0.2)
+        : Math.min(resolvedScore, componentTotal);
     const cappedByFeedback = strongNegativeFeedback
       ? Math.min(cappedByAnswerLength, resolvedMaxScore * 0.2)
       : partialNegativeFeedback
@@ -241,7 +388,10 @@ const normalizeEssayResults = (
       questionId,
       score: Number(cappedByFeedback.toFixed(2)),
       maxScore: Number(resolvedMaxScore.toFixed(2)),
-      feedback: String(raw.feedback || '').trim().slice(0, 1000),
+      feedback: String(raw.feedback || raw.comments || '').trim().slice(0, 1000),
+      componentScores,
+      achievedCriteria: normalizeTextArray(raw.achievedCriteria),
+      missingCriteria: normalizeTextArray(raw.missingCriteria),
     });
   }
 
@@ -290,7 +440,7 @@ export const extractAndGradeSubmissionFromScansBatch = async (
 
 Mục tiêu:
 1. Chỉ trích xuất câu trả lời tự luận từ các trang tự luận.
-2. Chấm điểm tự luận theo đáp án mẫu và defaultRubric cho từng câu.
+2. Chấm điểm tự luận bằng cách so sánh câu trả lời với từng tiêu chí trong gradingRubric của từng câu.
 3. Không nhận diện họ tên, MSSV, khuôn mặt, hoặc danh tính thí sinh.
 
 Ngữ cảnh bài thi:
@@ -309,11 +459,11 @@ ${JSON.stringify(
 Ràng buộc bắt buộc:
 1. Trả về DUY NHẤT JSON hợp lệ, không markdown, không giải thích.
 2. Không bịa dữ liệu. Không sử dụng ảnh để xác định thí sinh.
-3. Chấm NGHIÊM theo đáp án mẫu và defaultRubric. Chỉ cho điểm cao khi câu trả lời nêu đúng ý cốt lõi bằng nội dung cụ thể.
-4. Nếu câu trả lời sai, lạc đề, né tránh, chỉ lặp lại đề, quá chung chung, hoặc không có bằng chứng trong ảnh thì score phải là 0 hoặc tối đa 20% maxScore.
-5. Không suy diễn ý đúng từ câu trả lời mơ hồ. Không thưởng điểm cho văn phong nếu thiếu ý chính.
-6. score của essayResults phải trong khoảng [0, maxScore] từng câu.
-7. feedback phải nêu ngắn gọn ý nào đúng, ý nào thiếu/sai, và lý do điểm.
+3. Với MỖI tiêu chí trong gradingRubric, phải ghi rõ tiêu chí đạt hay thiếu trong componentScores.
+4. Chỉ cho điểm của một tiêu chí khi câu trả lời có cùng ý nghĩa kỹ thuật; chấp nhận diễn đạt khác nhưng không chấp nhận câu chung chung.
+5. Nếu câu trả lời sai, lạc đề, né tránh, chỉ lặp lại đề, quá chung chung, hoặc không có bằng chứng trong ảnh thì totalScore/score phải là 0 hoặc tối đa 20% maxScore.
+6. totalScore/score của essayResults phải bằng tổng score trong componentScores và nằm trong [0, maxScore] từng câu.
+7. feedback/comments phải nêu ngắn gọn tiêu chí nào đạt, tiêu chí nào thiếu/sai, và lý do điểm.
 8. Nếu ảnh mờ, lệch, thiếu góc hoặc khó đọc thì ghi rõ trong warnings.
 
 Output JSON format:
@@ -324,8 +474,23 @@ Output JSON format:
   "essayResults": [
     {
       "questionId": 34,
-      "score": 0.75,
       "maxScore": 1,
+      "score": 0.75,
+      "totalScore": 0.75,
+      "componentScores": [
+        {
+          "criterionId": "Q34-C1",
+          "description": "...",
+          "score": 0.5,
+          "maxScore": 0.5,
+          "achieved": true,
+          "matchedKeywords": ["..."],
+          "missingKeywords": [],
+          "comments": "..."
+        }
+      ],
+      "achievedCriteria": ["Q34-C1"],
+      "missingCriteria": ["Q34-C2"],
       "feedback": "..."
     }
   ],
@@ -453,7 +618,7 @@ ${imageManifest.map((m) => `  Ảnh ${m.imageIndex + 1}: ${m.studentLabel} - Tra
 
 Mục tiêu cho MỖI sinh viên:
 1. Chỉ trích xuất câu trả lời tự luận từ các trang tự luận của sinh viên đó.
-2. Chấm điểm theo đáp án mẫu và defaultRubric.
+2. Chấm điểm bằng cách so sánh câu trả lời với từng tiêu chí trong gradingRubric của từng câu.
 3. Không nhận diện họ tên, MSSV, khuôn mặt, hoặc danh tính thí sinh.
 
 Thông tin bài thi:
@@ -472,11 +637,11 @@ ${JSON.stringify(
 Ràng buộc bắt buộc:
 1. Trả về DUY NHẤT JSON hợp lệ, không markdown, không giải thích.
 2. Không bịa dữ liệu. Không sử dụng ảnh để xác định thí sinh.
-3. Chấm NGHIÊM theo đáp án mẫu và defaultRubric. Chỉ cho điểm cao khi câu trả lời nêu đúng ý cốt lõi bằng nội dung cụ thể.
-4. Nếu câu trả lời sai, lạc đề, né tránh, chỉ lặp lại đề, quá chung chung, hoặc không có bằng chứng trong ảnh thì score phải là 0 hoặc tối đa 20% maxScore.
-5. Không suy diễn ý đúng từ câu trả lời mơ hồ. Không thưởng điểm cho văn phong nếu thiếu ý chính.
-6. score phải trong khoảng [0, maxScore] cho mỗi câu.
-7. feedback phải nêu ngắn gọn ý nào đúng, ý nào thiếu/sai, và lý do điểm.
+3. Với MỖI tiêu chí trong gradingRubric, phải ghi rõ tiêu chí đạt hay thiếu trong componentScores.
+4. Chỉ cho điểm của một tiêu chí khi câu trả lời có cùng ý nghĩa kỹ thuật; chấp nhận diễn đạt khác nhưng không chấp nhận câu chung chung.
+5. Nếu câu trả lời sai, lạc đề, né tránh, chỉ lặp lại đề, quá chung chung, hoặc không có bằng chứng trong ảnh thì totalScore/score phải là 0 hoặc tối đa 20% maxScore.
+6. totalScore/score phải bằng tổng score trong componentScores và nằm trong [0, maxScore] cho mỗi câu.
+7. feedback/comments phải nêu ngắn gọn tiêu chí nào đạt, tiêu chí nào thiếu/sai, và lý do điểm.
 8. Nếu ảnh mờ hoặc khó đọc, ghi vào warnings.
 
 Output JSON format (mảng kết quả cho từng sinh viên):
@@ -490,8 +655,23 @@ Output JSON format (mảng kết quả cho từng sinh viên):
       "essayResults": [
         {
           "questionId": 34,
-          "score": 0.75,
           "maxScore": 1,
+          "score": 0.75,
+          "totalScore": 0.75,
+          "componentScores": [
+            {
+              "criterionId": "Q34-C1",
+              "description": "...",
+              "score": 0.5,
+              "maxScore": 0.5,
+              "achieved": true,
+              "matchedKeywords": ["..."],
+              "missingKeywords": [],
+              "comments": "..."
+            }
+          ],
+          "achievedCriteria": ["Q34-C1"],
+          "missingCriteria": ["Q34-C2"],
           "feedback": "..."
         }
       ],

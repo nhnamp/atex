@@ -3,7 +3,7 @@ OMR Flask Server — HTTP API for the Python OMR service.
 
 Endpoints:
   GET  /api/omr/health       → { "status": "ok" }
-  POST /api/omr/process      → { "studentCode": ..., "answers": ..., "confidence": ..., "warnings": [...] }
+  POST /api/omr/process      → { "studentCode": ..., "answers": ..., "mcqLayout": ..., "confidence": ..., "warnings": [...] }
 """
 
 import os
@@ -43,6 +43,8 @@ def process():
       {
         "studentCode": "22521000" | null,
         "answers": { "1": "A", "2": "C", ... },
+        "mcqLayout": { "referenceWidth": 800, "referenceHeight": 1131, "questions": [...] },
+        "identityLayout": { "referenceWidth": 800, "referenceHeight": 1131, "digits": [...] },
         "confidence": 0.92,
         "warnings": ["..."]
       }

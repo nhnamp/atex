@@ -19,6 +19,7 @@ import {
   listExamDraftScans,
   getSessionIssuesReport,
   getSessionReport,
+  getDraftGradingStatus,
   getSessionSubmissions,
   gradeSubmissionWithAI,
   gradeSubmissionWithOmr,
@@ -112,6 +113,7 @@ router.get('/sessions/:sessionId/report/export', requireRole('TEACHER'), exportS
 router.post('/sessions/:sessionId/report/finalize', requireRole('TEACHER'), finalizeSessionReport);
 router.post('/sessions/:sessionId/mobile-scan-link', requireRole('TEACHER'), createSessionMobileScanLink);
 router.get('/sessions/:sessionId/issues', requireRole('TEACHER'), getSessionIssuesReport);
+router.get('/sessions/:sessionId/grading-status', requireRole('TEACHER'), getDraftGradingStatus);
 router.get('/sessions/:sessionId/draft-scans', requireRole('TEACHER'), listExamDraftScans);
 router.post('/sessions/:sessionId/draft-scans/check-identity', requireRole('TEACHER'), checkDraftsIdentity);
 router.post('/sessions/:sessionId/bulk-upload', requireRole('TEACHER'), tempUpload.array('files', bulkScanFileLimit), uploadBulkExamScans);

@@ -12,6 +12,22 @@ import path from 'path';
 export interface OmrProcessResult {
   studentCode: string | null;
   answers: Record<string, string>;
+  mcqLayout?: {
+    referenceWidth: number;
+    referenceHeight: number;
+    source?: string;
+    table?: { left: number; top: number; right: number; bottom: number };
+    questions: Array<{
+      questionNumber: number;
+      bubbles: Array<{ option: string; cx: number; cy: number; r: number }>;
+    }>;
+  } | null;
+  identityLayout?: {
+    referenceWidth: number;
+    referenceHeight: number;
+    source?: string;
+    digits: Array<{ column: number; digit: number; cx: number; cy: number; r: number }>;
+  } | null;
   confidence: number;
   warnings: string[];
 }
@@ -57,6 +73,8 @@ export const processOmrImage = async (
     const result = await response.json() as {
       studentCode?: string | null;
       answers?: Record<string, string>;
+      mcqLayout?: OmrProcessResult['mcqLayout'];
+      identityLayout?: OmrProcessResult['identityLayout'];
       confidence?: number;
       warnings?: string[];
       error?: string;
@@ -69,6 +87,8 @@ export const processOmrImage = async (
     return {
       studentCode: result.studentCode ?? null,
       answers: result.answers ?? {},
+      mcqLayout: result.mcqLayout ?? null,
+      identityLayout: result.identityLayout ?? null,
       confidence: typeof result.confidence === 'number' ? result.confidence : 0,
       warnings: Array.isArray(result.warnings) ? result.warnings : [],
     };

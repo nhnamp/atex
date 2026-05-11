@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { AlertTriangle, ArrowLeft, BarChart3, Camera, CameraOff, CheckCircle2, ClipboardCheck, Download, Eye, GripVertical, RefreshCw, Upload, XCircle, Copy, Repeat, Search } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, BarChart3, Camera, CameraOff, CheckCircle2, ClipboardCheck, Download, Eye, GripVertical, Loader2, RefreshCw, Upload, XCircle, Copy, Repeat, Search } from 'lucide-react';
 import Layout from '../../components/Layout';
 import api from '../../api';
 import { BulkUploadResponse, BuiltExam, Class, ExamScanEntry, ExamSession, ExamSubmission, LearningOutcome, RegradeResponse, SessionIssuesReport, ExamDraftScan } from '../../types';
@@ -106,9 +106,26 @@ type SubmissionFeedbackPayload = {
   objectiveScore: number | null;
   essayScore: number | null;
   totalScore: number | null;
+  objectiveDetectedCount: number | null;
+  objectiveCorrectCount: number | null;
   objectiveAnswers: Record<string, string>;
   essayAnswers: Record<string, string>;
-  essayResults: Array<{ questionId: number; score: number; maxScore: number; feedback: string }>;
+  essayResults: Array<{
+    questionId: number;
+    score: number;
+    maxScore: number;
+    feedback: string;
+    componentScores?: Array<{
+      criterionId: string;
+      description: string;
+      score: number;
+      maxScore: number;
+      achieved: boolean;
+      matchedKeywords?: string[];
+      missingKeywords?: string[];
+      comments?: string;
+    }>;
+  }>;
   omrAnnotatedImageUrl: string | null;
   aiComments: string | null;
   mergedPdfUrl: string | null;
@@ -141,6 +158,23 @@ type AssignableStudent = {
   fullName: string;
 };
 
+type GradingJobStatus = {
+  jobId: string | null;
+  sessionId: number;
+  status: 'IDLE' | 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+  progress: number;
+  message: string;
+  totalDrafts: number;
+  gradedCount: number;
+  result?: {
+    gradedCount?: number;
+    totalSubmissions?: number;
+    totalDrafts?: number;
+    createdSubmissionIds?: number[];
+  };
+  error?: string;
+};
+
 const TeacherSessionManagement: React.FC = () => {
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
@@ -162,10 +196,12 @@ const TeacherSessionManagement: React.FC = () => {
   const [mobileScanLink, setMobileScanLink] = useState('');
   const [workflowSummary, setWorkflowSummary] = useState<any | null>(null);
   const [gradingInProgress, setGradingInProgress] = useState(false);
+  const [gradingProgress, setGradingProgress] = useState<GradingJobStatus | null>(null);
   const [gradingCompleteDialog, setGradingCompleteDialog] = useState<{ gradedCount: number; totalSubmissions: number } | null>(null);
   const [loading, setLoading] = useState(true);
   const [bulkUploading, setBulkUploading] = useState(false);
   const [isCheckingIdentity, setIsCheckingIdentity] = useState(false);
+  const [identityProgress, setIdentityProgress] = useState<{ processed: number; total: number } | null>(null);
   const [stagedFiles, setStagedFiles] = useState<{ id: string; file: File; preview: string }[]>([]);
   const [draggedIdx, setDraggedIdx] = useState<number | null>(null);
   const [viewingStagedImageIdx, setViewingStagedImageIdx] = useState<number | null>(null);
@@ -206,6 +242,8 @@ const TeacherSessionManagement: React.FC = () => {
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const qualityTimerRef = useRef<number | null>(null);
+  const gradingPollTimerRef = useRef<number | null>(null);
+  const identityPollTimerRef = useRef<number | null>(null);
 
   const selectedSession = useMemo(
     () => sessions.find((item) => item.id === selectedSessionId) || null,
@@ -392,6 +430,8 @@ const TeacherSessionManagement: React.FC = () => {
       objectiveScore: toNumberOrNull(submission.objectiveScore),
       essayScore: toNumberOrNull(submission.essayScore),
       totalScore: toNumberOrNull(submission.totalScore ?? submission.finalScore),
+      objectiveDetectedCount: toNumberOrNull(submission.objectiveDetectedCount),
+      objectiveCorrectCount: toNumberOrNull(submission.objectiveCorrectCount),
       objectiveAnswers: {},
       essayAnswers: {},
       essayResults: [],
@@ -410,6 +450,10 @@ const TeacherSessionManagement: React.FC = () => {
         objectiveScore?: unknown;
         essayScore?: unknown;
         totalScore?: unknown;
+        objectiveDetectedCount?: unknown;
+        objectiveCorrectCount?: unknown;
+        totalDetectedQuestions?: unknown;
+        totalCorrectAnswers?: unknown;
         objectiveAnswers?: Record<string, unknown>;
         essayAnswers?: Record<string, unknown>;
         essayResults?: unknown;
@@ -448,6 +492,18 @@ const TeacherSessionManagement: React.FC = () => {
             score: Number(item?.score || 0),
             maxScore: Number(item?.maxScore || 0),
             feedback: String(item?.feedback || '').trim(),
+            componentScores: Array.isArray(item?.componentScores)
+              ? item.componentScores.map((component: any) => ({
+                  criterionId: String(component?.criterionId || '').trim(),
+                  description: String(component?.description || '').trim(),
+                  score: Number(component?.score || 0),
+                  maxScore: Number(component?.maxScore || 0),
+                  achieved: Boolean(component?.achieved),
+                  matchedKeywords: Array.isArray(component?.matchedKeywords) ? component.matchedKeywords.map((keyword: any) => String(keyword || '').trim()).filter(Boolean) : [],
+                  missingKeywords: Array.isArray(component?.missingKeywords) ? component.missingKeywords.map((keyword: any) => String(keyword || '').trim()).filter(Boolean) : [],
+                  comments: String(component?.comments || '').trim(),
+                })).filter((component: any) => component.description || component.criterionId)
+              : [],
           })).filter((item) => item.questionId > 0)
         : [];
       const essayAnswers = parsed?.essayAnswers && typeof parsed.essayAnswers === 'object'
@@ -462,6 +518,8 @@ const TeacherSessionManagement: React.FC = () => {
         objectiveScore: toNumberOrNull(submission.objectiveScore ?? parsed?.objectiveScore),
         essayScore: toNumberOrNull(submission.essayScore ?? parsed?.essayScore),
         totalScore: toNumberOrNull(submission.totalScore ?? parsed?.totalScore),
+        objectiveDetectedCount: toNumberOrNull(submission.objectiveDetectedCount ?? parsed?.objectiveDetectedCount ?? parsed?.totalDetectedQuestions),
+        objectiveCorrectCount: toNumberOrNull(submission.objectiveCorrectCount ?? parsed?.objectiveCorrectCount ?? parsed?.totalCorrectAnswers),
         objectiveAnswers,
         essayAnswers,
         essayResults,
@@ -543,6 +601,23 @@ const TeacherSessionManagement: React.FC = () => {
                 </div>
                 {result.feedback && (
                   <p className="mt-1 text-xs text-blue-700">Feedback: {result.feedback}</p>
+                )}
+                {result.componentScores && result.componentScores.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    {result.componentScores.map((component, index) => (
+                      <div key={component.criterionId || index} className="rounded border border-gray-100 bg-white px-2 py-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[11px] font-medium text-gray-700">{component.description || component.criterionId}</p>
+                          <span className={component.achieved ? 'text-[11px] font-semibold text-green-700' : 'text-[11px] font-semibold text-red-600'}>
+                            {component.score}/{component.maxScore}
+                          </span>
+                        </div>
+                        {component.comments && (
+                          <p className="mt-0.5 text-[11px] text-gray-500">{component.comments}</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
             );
@@ -1012,24 +1087,79 @@ const TeacherSessionManagement: React.FC = () => {
     }
   };
 
+  const stopGradingPolling = () => {
+    if (gradingPollTimerRef.current) {
+      window.clearInterval(gradingPollTimerRef.current);
+      gradingPollTimerRef.current = null;
+    }
+  };
+
+  const pollGradingStatus = (sessionId: number) => {
+    stopGradingPolling();
+
+    const tick = async () => {
+      try {
+        const { data } = await api.get<GradingJobStatus>(`/exams/sessions/${sessionId}/grading-status`);
+        setGradingProgress(data);
+
+        if (data.status === 'QUEUED' || data.status === 'RUNNING') {
+          setGradingInProgress(true);
+          return;
+        }
+
+        stopGradingPolling();
+        setGradingInProgress(false);
+        localStorage.removeItem('activeGradingSessionId');
+
+        if (data.status === 'COMPLETED') {
+          const result = data.result || {};
+          setWorkflowSummary(result);
+          await fetchSessionDetails(sessionId);
+          await fetchSessions();
+          setGradingCompleteDialog({
+            gradedCount: Number(result.gradedCount || data.gradedCount || result.createdSubmissionIds?.length || 0),
+            totalSubmissions: Number(result.totalSubmissions || result.totalDrafts || data.totalDrafts || 0),
+          });
+          toast.success('Grading completed. Open the report to review scores.');
+        } else if (data.status === 'FAILED') {
+          toast.error(data.error || 'Grading failed');
+        }
+      } catch {
+        stopGradingPolling();
+        setGradingInProgress(false);
+        localStorage.removeItem('activeGradingSessionId');
+        toast.error('Failed to poll grading progress');
+      }
+    };
+
+    void tick();
+    gradingPollTimerRef.current = window.setInterval(() => void tick(), 2000);
+  };
+
   const completeScanningAndAutoGrade = async () => {
     if (!selectedSessionId) return;
     setGradingInProgress(true);
+    setGradingProgress({
+      jobId: null,
+      sessionId: selectedSessionId,
+      status: 'QUEUED',
+      progress: 0,
+      message: 'Starting grading job',
+      totalDrafts: draftScans.length,
+      gradedCount: 0,
+    });
     try {
       const { data } = await api.post(`/exams/sessions/${selectedSessionId}/start-grading`, {});
-      setWorkflowSummary(data);
-      await fetchSessionDetails(selectedSessionId);
-      await fetchSessions();
-      setGradingCompleteDialog({
-        gradedCount: Number(data.gradedCount || data.createdSubmissionIds?.length || 0),
-        totalSubmissions: Number(data.totalSubmissions || data.totalDrafts || 0),
-      });
-      setTab('REPORT');
+      const job = data?.job as GradingJobStatus | undefined;
+      if (job) {
+        setGradingProgress(job);
+      }
+      localStorage.setItem('activeGradingSessionId', String(selectedSessionId));
+      pollGradingStatus(selectedSessionId);
       setScanMode(false);
       stopCamera();
     } catch (err: any) {
       toast.error(err?.response?.data?.error || 'Failed to complete grading workflow');
-    } finally {
       setGradingInProgress(false);
     }
   };
@@ -1145,15 +1275,53 @@ const TeacherSessionManagement: React.FC = () => {
 
   const handleCheckIdentity = async () => {
     if (!selectedSessionId) return;
+    if (identityPollTimerRef.current) {
+      window.clearInterval(identityPollTimerRef.current);
+      identityPollTimerRef.current = null;
+    }
+    const totalPending = draftScans.filter((draft) => draft.status === 'PENDING').length;
     setIsCheckingIdentity(true);
+    setIdentityProgress({ processed: 0, total: totalPending });
     try {
       const { data } = await api.post(`/exams/sessions/${selectedSessionId}/draft-scans/check-identity`);
       toast.success(data.message || 'Started checking identities');
-      await fetchSessionDetails(selectedSessionId);
+      const pollSessionId = selectedSessionId;
+      const tick = async () => {
+        try {
+          const { data: draftData } = await api.get<{ drafts: ExamDraftScan[] }>(`/exams/sessions/${pollSessionId}/draft-scans`);
+          const drafts = draftData?.drafts || [];
+          setDraftScans(drafts);
+          const pending = drafts.filter((draft) => draft.status === 'PENDING').length;
+          const total = Math.max(totalPending, drafts.length);
+          setIdentityProgress({ processed: Math.max(0, total - pending), total });
+
+          if (pending === 0) {
+            if (identityPollTimerRef.current) {
+              window.clearInterval(identityPollTimerRef.current);
+              identityPollTimerRef.current = null;
+            }
+            setIsCheckingIdentity(false);
+            setIdentityProgress(null);
+            await fetchSessionDetails(pollSessionId);
+            toast.success('Identity check completed');
+          }
+        } catch {
+          if (identityPollTimerRef.current) {
+            window.clearInterval(identityPollTimerRef.current);
+            identityPollTimerRef.current = null;
+          }
+          setIsCheckingIdentity(false);
+          setIdentityProgress(null);
+          toast.error('Failed to poll identity check progress');
+        }
+      };
+
+      void tick();
+      identityPollTimerRef.current = window.setInterval(() => void tick(), 1500);
     } catch (err: any) {
       toast.error(err?.response?.data?.error || 'Failed to check identity');
-    } finally {
       setIsCheckingIdentity(false);
+      setIdentityProgress(null);
     }
   };
 
@@ -1494,6 +1662,10 @@ const TeacherSessionManagement: React.FC = () => {
     if (selectedSessionId) {
       setMobileScanLink('');
       fetchSessionDetails(selectedSessionId);
+      const activeGradingSessionId = Number(localStorage.getItem('activeGradingSessionId') || 0);
+      if (activeGradingSessionId === selectedSessionId) {
+        pollGradingStatus(selectedSessionId);
+      }
     }
   }, [selectedSessionId]);
 
@@ -1529,6 +1701,11 @@ const TeacherSessionManagement: React.FC = () => {
 
   useEffect(() => {
     return () => {
+      stopGradingPolling();
+      if (identityPollTimerRef.current) {
+        window.clearInterval(identityPollTimerRef.current);
+        identityPollTimerRef.current = null;
+      }
       stopCamera();
     };
   }, []);
@@ -1662,7 +1839,14 @@ const TeacherSessionManagement: React.FC = () => {
                   disabled={gradingInProgress || !selectedSessionId || !issuesReport || issuesReport.readyForGrading !== issuesReport.totalStudents || draftScans.some((d) => d.status === 'PENDING')}
                   title="Only available when all students have their exams correctly mapped and identified."
                 >
-                  {gradingInProgress ? 'Grading...' : 'Start Grading'}
+                  {gradingInProgress ? (
+                    <span className="inline-flex items-center gap-1">
+                      <Loader2 size={14} className="animate-spin" />
+                      Grading...
+                    </span>
+                  ) : (
+                    'Start Grading'
+                  )}
                 </button>
                 <button className="btn-secondary text-xs" onClick={fetchIssuesReport} disabled={!selectedSessionId || issuesLoading}>
                   <AlertTriangle size={14} className="inline mr-1" />
@@ -1673,6 +1857,29 @@ const TeacherSessionManagement: React.FC = () => {
             <p className="text-xs text-gray-600">
               Upload Full Set requires exactly {getTotalPasses()} image(s) per student. Page 1 is validated with OMR for identity and quality first; unreadable or ambiguous pages must be re-uploaded or assigned manually before grading starts. Gemini is used only for essay scoring after all sets are valid.
             </p>
+
+            {(gradingInProgress || gradingProgress) && (
+              <div className="rounded-lg border border-primary-100 bg-primary-50 px-3 py-2">
+                <div className="flex items-center justify-between gap-3 text-sm text-primary-900">
+                  <span className="inline-flex items-center gap-2 font-medium">
+                    {gradingInProgress && <Loader2 size={16} className="animate-spin" />}
+                    {gradingProgress?.message || 'Grading is running'}
+                  </span>
+                  <span className="text-xs">
+                    {Math.round(gradingProgress?.progress || 0)}%
+                  </span>
+                </div>
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-white">
+                  <div
+                    className="h-full rounded-full bg-primary-600 transition-all"
+                    style={{ width: `${Math.max(4, Math.min(100, gradingProgress?.progress || 0))}%` }}
+                  />
+                </div>
+                <p className="mt-1 text-[11px] text-primary-700">
+                  You can switch tabs while this runs. A popup will appear when the report is ready.
+                </p>
+              </div>
+            )}
 
             {/* Bulk Upload Section */}
             <div className="border border-dashed border-primary-300 bg-primary-50/50 rounded-lg p-4 space-y-2">
@@ -1783,7 +1990,11 @@ const TeacherSessionManagement: React.FC = () => {
                         onClick={handleCheckIdentity} 
                         disabled={isCheckingIdentity || revertingToPreUpload || savingDraftPageOrder}
                       >
-                        <Search size={14} className="inline mr-1" />
+                        {isCheckingIdentity ? (
+                          <Loader2 size={14} className="inline mr-1 animate-spin" />
+                        ) : (
+                          <Search size={14} className="inline mr-1" />
+                        )}
                         {isCheckingIdentity ? 'Checking...' : 'Check Identity'}
                       </button>
                     )}
@@ -1801,6 +2012,25 @@ const TeacherSessionManagement: React.FC = () => {
                 <div className="rounded-md bg-gray-50 border border-gray-100 p-2 text-[11px] text-gray-600">
                   Green means the first page passed quality checks and OMR read MSSV successfully. Red means the set needs re-upload or manual assignment before grading can begin.
                 </div>
+                {isCheckingIdentity && identityProgress && (
+                  <div className="rounded-md border border-indigo-100 bg-indigo-50 px-3 py-2">
+                    <div className="flex items-center justify-between text-xs text-indigo-900">
+                      <span className="inline-flex items-center gap-2 font-medium">
+                        <Loader2 size={14} className="animate-spin" />
+                        Checking identity
+                      </span>
+                      <span>{identityProgress.processed}/{identityProgress.total}</span>
+                    </div>
+                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white">
+                      <div
+                        className="h-full rounded-full bg-indigo-600 transition-all"
+                        style={{
+                          width: `${Math.max(6, Math.min(100, identityProgress.total > 0 ? (identityProgress.processed / identityProgress.total) * 100 : 6))}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
                 {draftScans.length > 0 && (
                   <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-96 overflow-auto pr-1">
                     {draftScans.map((draft, idx) => {
@@ -2185,6 +2415,8 @@ const TeacherSessionManagement: React.FC = () => {
                   const mergedPdfUrl = feedback.mergedPdfUrl || scans.find((scan) => !!scan.mergedPdfUrl)?.mergedPdfUrl || null;
                   const isExpanded = expandedSubmissionId === item.id;
                   const isInlineEditing = inlineEditScore?.submissionId === item.id;
+                  const detectedCount = item.objectiveDetectedCount ?? feedback.objectiveDetectedCount ?? Object.keys(feedback.objectiveAnswers).filter((key) => !!feedback.objectiveAnswers[key]).length;
+                  const correctCount = item.objectiveCorrectCount ?? feedback.objectiveCorrectCount;
                   return (
                     <div key={item.id} className="border border-gray-200 rounded-lg p-3 space-y-2">
                       <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -2195,6 +2427,8 @@ const TeacherSessionManagement: React.FC = () => {
                             <span>MCQ: <span className="font-medium text-blue-700">{feedback.objectiveScore ?? '-'}</span></span>
                             <span>Essay: <span className="font-medium text-orange-700">{feedback.essayScore ?? '-'}</span></span>
                             <span>Total: <span className="font-medium text-gray-900">{feedback.totalScore ?? item.finalScore ?? '-'}</span></span>
+                            <span>OMR detected: <span className="font-medium text-blue-700">{detectedCount ?? '-'}</span></span>
+                            <span>Correct MCQ: <span className="font-medium text-emerald-700">{correctCount ?? '-'}</span></span>
                             <span>Scans: {scans?.length ?? 0}</span>
                           </div>
                         </div>
@@ -2627,6 +2861,24 @@ const TeacherSessionManagement: React.FC = () => {
       )}
 
       {/* Staged Image Viewing Modal */}
+      {(isCheckingIdentity || gradingInProgress) && (
+        <div className="pointer-events-none fixed right-4 top-4 z-[70] w-[min(22rem,calc(100vw-2rem))] rounded-lg border border-gray-200 bg-white/95 p-3 shadow-xl">
+          <div className="flex items-start gap-2">
+            <Loader2 size={18} className="mt-0.5 animate-spin text-primary-700" />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold text-gray-900">
+                {gradingInProgress ? 'Grading in progress' : 'Checking identities'}
+              </p>
+              <p className="mt-0.5 text-xs text-gray-600">
+                {gradingInProgress
+                  ? `${Math.round(gradingProgress?.progress || 0)}% complete. You can continue working in other tabs.`
+                  : `${identityProgress?.processed ?? 0}/${identityProgress?.total ?? draftScans.length} drafts processed.`}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {viewingStagedImageIdx !== null && stagedFiles[viewingStagedImageIdx] && (
         <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setViewingStagedImageIdx(null)}>
           <div className="bg-white rounded-xl shadow-2xl max-w-4xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>

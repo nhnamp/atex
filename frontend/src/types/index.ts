@@ -156,6 +156,8 @@ export interface ExamSubmission {
   objectiveScore?: number | null;
   essayScore?: number | null;
   totalScore?: number | null;
+  objectiveDetectedCount?: number | null;
+  objectiveCorrectCount?: number | null;
   aiComments?: string | null;
   warnings?: string[];
   submittedAt: string;

@@ -270,19 +270,33 @@ const buildDefaultIdentityPlaceholders = () => {
 const buildDefaultOmrTemplate = (mcqs: Question[]) => {
   if (mcqs.length === 0) return undefined;
 
+  const columnCount = 4;
+  const rowsPerColumn = 13;
+  const mcqRoi = { x: 0.09, y: 0.467, width: 0.85, height: 0.452 };
+  const headerRatio = 0.07;
+  const bubbleStart = 0.17;
+  const bubbleEnd = 0.91;
+  const bubbleSpan = bubbleEnd - bubbleStart;
+  const roiX = mcqRoi.x * REFERENCE_WIDTH;
+  const roiY = mcqRoi.y * REFERENCE_HEIGHT;
+  const roiWidth = mcqRoi.width * REFERENCE_WIDTH;
+  const roiHeight = mcqRoi.height * REFERENCE_HEIGHT;
+  const columnWidth = roiWidth / columnCount;
+  const rowStartY = roiY + roiHeight * headerRatio;
+  const rowHeight = (roiHeight * (1 - headerRatio)) / rowsPerColumn;
+  const bubbleSize = 30;
+
   const questions: OmrQuestionRegion[] = mcqs.map((question, index) => {
-    const startX = 1460;
-    const bubbleSize = 30;
-    const optionGap = 54;
-    const startY = 970;
-    const rowHeight = 42;
-    const y = startY + index * rowHeight;
+    const columnIndex = Math.floor(index / rowsPerColumn);
+    const rowIndex = index % rowsPerColumn;
+    const columnX = roiX + columnIndex * columnWidth;
+    const y = rowStartY + (rowIndex + 0.5) * rowHeight - bubbleSize / 2;
 
     return {
       questionId: question.id,
       bubbles: ['A', 'B', 'C', 'D'].map((option, optionIndex) => ({
         option,
-        x: startX + optionIndex * optionGap,
+        x: columnX + (bubbleStart + ((optionIndex + 0.5) / 4) * bubbleSpan) * columnWidth - bubbleSize / 2,
         y,
         width: bubbleSize,
         height: bubbleSize,
