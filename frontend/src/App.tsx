@@ -15,10 +15,13 @@ import TeacherDashboard from './pages/teacher/Dashboard';
 import TeacherClasses from './pages/teacher/Classes';
 import TeacherClassDetail from './pages/teacher/ClassDetail';
 import TeacherSubjects from './pages/teacher/Subjects';
+import TeacherLearningOutcomes from './pages/teacher/LearningOutcomes';
 import TeacherQuestions from './pages/teacher/Questions';
 import TeacherExamGenerator from './pages/teacher/ExamGenerator';
 import TeacherFaceEnrollment from './pages/teacher/FaceEnrollment';
 import TeacherFaceAttendance from './pages/teacher/FaceAttendance';
+import TeacherSessionManagement from './pages/teacher/SessionManagement';
+import TeacherMobileScan from './pages/teacher/MobileScan';
 import TeacherSessionResults from './pages/teacher/SessionResults';
 import TeacherAttendanceSummary from './pages/teacher/AttendanceSummary';
 import TeacherAccount from './pages/teacher/Account';
@@ -42,6 +45,7 @@ function AppRoutes() {
     <Routes>
       <Route path="/" element={<RootRedirect />} />
       <Route path="/login" element={<Login />} />
+      <Route path="/mobile-scan" element={<TeacherMobileScan />} />
 
       {/* Admin */}
       <Route element={<ProtectedRoute role="ADMIN" />}>
@@ -59,8 +63,10 @@ function AppRoutes() {
         <Route path="/teacher/face-attendance/:sessionId" element={<TeacherFaceAttendance />} />
         <Route path="/teacher/sessions/:sessionId" element={<TeacherSessionResults />} />
         <Route path="/teacher/subjects" element={<TeacherSubjects />} />
+        <Route path="/teacher/subjects/:subjectId/outcomes" element={<TeacherLearningOutcomes />} />
         <Route path="/teacher/subjects/:subjectId/questions" element={<TeacherQuestions />} />
         <Route path="/teacher/exams" element={<TeacherExamGenerator />} />
+        <Route path="/teacher/exam-sessions" element={<TeacherSessionManagement />} />
         <Route path="/teacher/account" element={<TeacherAccount />} />
       </Route>
 

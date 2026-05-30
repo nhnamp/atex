@@ -9,4 +9,11 @@ dist/
 *.log
 prisma/dev.db
 prisma/dev.db-journal
+backend/uploads/scans/*
+!backend/uploads/scans/.gitkeep
+backend/uploads/temp/*
+!backend/uploads/temp/.gitkeep
+test/
+OMR_context.md
+test/debugOutputs/
 DEPLOY.md

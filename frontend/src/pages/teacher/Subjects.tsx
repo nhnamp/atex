@@ -112,6 +112,12 @@ const TeacherSubjects: React.FC = () => {
                 >
                   Manage Questions <ChevronRight size={14} />
                 </Link>
+                <Link
+                  to={`/teacher/subjects/${subject.id}/outcomes`}
+                  className="flex items-center justify-center gap-2 w-full py-2 mt-2 bg-primary-50 hover:bg-primary-100 text-primary-700 text-sm font-medium rounded-lg transition-colors"
+                >
+                  Manage Outcomes <ChevronRight size={14} />
+                </Link>
               </div>
             ))}
           </div>

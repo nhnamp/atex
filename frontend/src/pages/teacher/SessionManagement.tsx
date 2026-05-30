@@ -1,0 +1,2953 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import toast from 'react-hot-toast';
+import { AlertTriangle, ArrowLeft, BarChart3, Camera, CameraOff, CheckCircle2, ClipboardCheck, Download, Eye, GripVertical, Loader2, RefreshCw, Upload, XCircle, Copy, Repeat, Search } from 'lucide-react';
+import Layout from '../../components/Layout';
+import api from '../../api';
+import { BulkUploadResponse, BuiltExam, Class, ExamScanEntry, ExamSession, ExamSubmission, LearningOutcome, RegradeResponse, SessionIssuesReport, ExamDraftScan } from '../../types';
+
+type TabKey = 'AI_GRADING' | 'REPORT' | 'EXAM_VIEW';
+
+type ViewfinderVariant = 'omr' | 'identityEssay' | 'essayPage' | 'generic';
+type ViewfinderZone = {
+  id: string;
+  top: string;
+  left: string;
+  width: string;
+  height: string;
+  label?: string;
+};
+
+const VIEWFINDER_ZONES: Record<ViewfinderVariant, ViewfinderZone[]> = {
+  omr: [
+    { id: 'header', top: '3%', left: '8%', width: '84%', height: '8%', label: 'HEADER' },
+    { id: 'identity', top: '13%', left: '8%', width: '54%', height: '16%', label: 'INFO' },
+    { id: 'mssv', top: '13%', left: '66%', width: '26%', height: '20%', label: 'MSSV' },
+    { id: 'instructions', top: '31%', left: '8%', width: '54%', height: '12%', label: 'INSTRUCTIONS' },
+    { id: 'omr', top: '48%', left: '8%', width: '84%', height: '44%', label: 'OMR GRID' },
+  ],
+  identityEssay: [
+    { id: 'header', top: '3%', left: '8%', width: '84%', height: '8%', label: 'HEADER' },
+    { id: 'identity', top: '13%', left: '8%', width: '54%', height: '16%', label: 'INFO' },
+    { id: 'mssv', top: '13%', left: '66%', width: '26%', height: '20%', label: 'MSSV' },
+    { id: 'instructions', top: '31%', left: '8%', width: '54%', height: '12%', label: 'INSTRUCTIONS' },
+    { id: 'essay', top: '48%', left: '8%', width: '84%', height: '44%', label: 'ESSAY AREA' },
+  ],
+  essayPage: [
+    { id: 'essay-header', top: '4%', left: '8%', width: '84%', height: '10%', label: 'QUESTION HEADER' },
+    { id: 'essay-body', top: '18%', left: '8%', width: '84%', height: '68%', label: 'ANSWER AREA' },
+    { id: 'essay-footer', top: '88%', left: '8%', width: '84%', height: '6%', label: 'END LINE' },
+  ],
+  generic: [],
+};
+
+const ViewfinderOverlay: React.FC<{ variant: ViewfinderVariant }> = ({ variant }) => {
+  const zones = VIEWFINDER_ZONES[variant];
+  return (
+    <div className="absolute inset-0 pointer-events-none">
+      <div className="absolute inset-[4%] rounded-lg border border-white/40" />
+      {zones.map((zone) => (
+        <div
+          key={zone.id}
+          className="absolute rounded-md border border-dashed border-white/50 bg-white/5"
+          style={{ top: zone.top, left: zone.left, width: zone.width, height: zone.height }}
+        >
+          {zone.label && (
+            <span className="absolute left-1 top-1 text-[10px] uppercase tracking-wide text-white/70">
+              {zone.label}
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+};
+
+const sortUploadFiles = (files: File[]): File[] => {
+  return [...files].sort((left, right) => left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' }));
+};
+
+const toScanAccessUrl = (scan: ExamScanEntry): string | undefined => {
+  if (scan.accessUrl) return scan.accessUrl;
+  if (scan.url) return scan.url;
+  if (scan.filename) return `/uploads/scans/${encodeURIComponent(scan.filename)}`;
+  return undefined;
+};
+
+const parseDraftEssayPages = (essayPagesUrls: string[] | undefined): string[] => {
+  if (!Array.isArray(essayPagesUrls) || essayPagesUrls.length === 0) return [];
+  try {
+    const parsed = JSON.parse(essayPagesUrls[0] || '[]');
+    if (Array.isArray(parsed)) {
+      return parsed.map((item) => String(item));
+    }
+  } catch {
+    // fall through to the already-normalized array payload
+  }
+  return essayPagesUrls.map((item) => String(item));
+};
+
+const getDraftPagePaths = (draft: Pick<ExamDraftScan, 'frontPageUrl' | 'essayPagesUrls'>): string[] => {
+  return [draft.frontPageUrl, ...parseDraftEssayPages(draft.essayPagesUrls)];
+};
+
+const normalizeScanEntry = (scan: ExamScanEntry): ExamScanEntry => ({
+  ...scan,
+  accessUrl: toScanAccessUrl(scan),
+});
+
+type ExamScanBlueprintConfig = {
+  scannablePages?: number;
+  passPurposeByIndex?: Record<string, string>;
+};
+
+type SubmissionFeedbackPayload = {
+  warnings: string[];
+  objectiveScore: number | null;
+  essayScore: number | null;
+  totalScore: number | null;
+  objectiveDetectedCount: number | null;
+  objectiveCorrectCount: number | null;
+  objectiveAnswers: Record<string, string>;
+  essayAnswers: Record<string, string>;
+  essayResults: Array<{
+    questionId: number;
+    score: number;
+    maxScore: number;
+    feedback: string;
+    componentScores?: Array<{
+      criterionId: string;
+      description: string;
+      score: number;
+      maxScore: number;
+      achieved: boolean;
+      matchedKeywords?: string[];
+      missingKeywords?: string[];
+      comments?: string;
+    }>;
+  }>;
+  omrAnnotatedImageUrl: string | null;
+  aiComments: string | null;
+  mergedPdfUrl: string | null;
+  aiReport: {
+    summary: string;
+    strengths: string[];
+    weaknesses: string[];
+    recommendations: string[];
+    integrityFlags: string[];
+  } | null;
+};
+
+type ExamRequirementsSummary = {
+  total?: number;
+  multipleChoice?: number;
+  essay?: number;
+  difficultyDistribution?: {
+    multipleChoice?: { easy?: number; medium?: number; hard?: number };
+    essay?: { easy?: number; medium?: number; hard?: number };
+  };
+  outcomeRatios?: Array<{
+    learningOutcomeId?: number;
+    ratio?: number;
+  }>;
+};
+
+type AssignableStudent = {
+  id: number;
+  username: string;
+  fullName: string;
+};
+
+type GradingJobStatus = {
+  jobId: string | null;
+  sessionId: number;
+  status: 'IDLE' | 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+  progress: number;
+  message: string;
+  totalDrafts: number;
+  gradedCount: number;
+  result?: {
+    gradedCount?: number;
+    totalSubmissions?: number;
+    totalDrafts?: number;
+    createdSubmissionIds?: number[];
+  };
+  error?: string;
+};
+
+const TeacherSessionManagement: React.FC = () => {
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const [sessions, setSessions] = useState<ExamSession[]>([]);
+  const [classes, setClasses] = useState<Class[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState<number | null>(null);
+  const [selectedExam, setSelectedExam] = useState<BuiltExam | null>(null);
+  const [submissions, setSubmissions] = useState<ExamSubmission[]>([]);
+  const [report, setReport] = useState<any | null>(null);
+  const [tab, setTab] = useState<TabKey>('AI_GRADING');
+  const [scanMode, setScanMode] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [activeSubmissionId, setActiveSubmissionId] = useState<number | null>(null);
+  const [activePassIndex, setActivePassIndex] = useState(1);
+  const [captureReady, setCaptureReady] = useState(false);
+  const [captureHint, setCaptureHint] = useState('Camera is idle');
+  const [capturing, setCapturing] = useState(false);
+  const [publishingReport, setPublishingReport] = useState(false);
+  const [mobileScanLink, setMobileScanLink] = useState('');
+  const [workflowSummary, setWorkflowSummary] = useState<any | null>(null);
+  const [gradingInProgress, setGradingInProgress] = useState(false);
+  const [gradingProgress, setGradingProgress] = useState<GradingJobStatus | null>(null);
+  const [gradingCompleteDialog, setGradingCompleteDialog] = useState<{ gradedCount: number; totalSubmissions: number } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [bulkUploading, setBulkUploading] = useState(false);
+  const [isCheckingIdentity, setIsCheckingIdentity] = useState(false);
+  const [identityProgress, setIdentityProgress] = useState<{ processed: number; total: number } | null>(null);
+  const [stagedFiles, setStagedFiles] = useState<{ id: string; file: File; preview: string }[]>([]);
+  const [draggedIdx, setDraggedIdx] = useState<number | null>(null);
+  const [viewingStagedImageIdx, setViewingStagedImageIdx] = useState<number | null>(null);
+  const [replacingIdx, setReplacingIdx] = useState<number | null>(null);
+  const replaceInputRef = useRef<HTMLInputElement>(null);
+  const [bulkUploadResult, setBulkUploadResult] = useState<BulkUploadResponse | null>(null);
+  const [draftScans, setDraftScans] = useState<ExamDraftScan[]>([]);
+  const [viewingDraft, setViewingDraft] = useState<ExamDraftScan | null>(null);
+  const [viewingDraftImagePath, setViewingDraftImagePath] = useState<string | null>(null);
+  const [draftPageOrder, setDraftPageOrder] = useState<string[]>([]);
+  const [draftPageOrderInitial, setDraftPageOrderInitial] = useState<string[]>([]);
+  const [draggedDraftPageIdx, setDraggedDraftPageIdx] = useState<number | null>(null);
+  const [savingDraftPageOrder, setSavingDraftPageOrder] = useState(false);
+  const [revertingToPreUpload, setRevertingToPreUpload] = useState(false);
+  const [assigningDraftId, setAssigningDraftId] = useState<number | null>(null);
+  const [classStudentsForAssign, setClassStudentsForAssign] = useState<AssignableStudent[]>([]);
+  const [selectedAssignStudentId, setSelectedAssignStudentId] = useState<string>('');
+
+  const [issuesReport, setIssuesReport] = useState<SessionIssuesReport | null>(null);
+  const [issuesLoading, setIssuesLoading] = useState(false);
+  const [regradingSubmissionId, setRegradingSubmissionId] = useState<number | null>(null);
+  const [expandedSubmissionId, setExpandedSubmissionId] = useState<number | null>(null);
+  const [inlineEditScore, setInlineEditScore] = useState<{
+    submissionId: number;
+    objectiveScore: string;
+    essayScore: string;
+    totalScore: string;
+  } | null>(null);
+  const [classDialogMode, setClassDialogMode] = useState<'CLONE' | 'REUSE' | null>(null);
+  const [selectedTargetClassId, setSelectedTargetClassId] = useState<string>('');
+  const [transferTitle, setTransferTitle] = useState('');
+  const [transferDuration, setTransferDuration] = useState('');
+  const [transferLoading, setTransferLoading] = useState(false);
+  const [subjectOutcomes, setSubjectOutcomes] = useState<LearningOutcome[]>([]);
+
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
+  const probeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const qualityTimerRef = useRef<number | null>(null);
+  const gradingPollTimerRef = useRef<number | null>(null);
+  const identityPollTimerRef = useRef<number | null>(null);
+
+  const selectedSession = useMemo(
+    () => sessions.find((item) => item.id === selectedSessionId) || null,
+    [sessions, selectedSessionId]
+  );
+
+  const activeSubmission = useMemo(
+    () => submissions.find((item) => item.id === activeSubmissionId) || null,
+    [submissions, activeSubmissionId]
+  );
+
+  const parsedExamRequirements = useMemo<ExamRequirementsSummary | null>(() => {
+    const raw = selectedExam?.requirements || report?.session?.exam?.requirements;
+    if (typeof raw !== 'string' || !raw.trim()) return null;
+
+    try {
+      return JSON.parse(raw) as ExamRequirementsSummary;
+    } catch {
+      return null;
+    }
+  }, [selectedExam, report]);
+
+  const effectiveOutcomeRatios = useMemo(() => {
+    if (subjectOutcomes.length === 0) return [];
+
+    const configuredRatios = parsedExamRequirements?.outcomeRatios || [];
+    if (configuredRatios.length > 0) {
+      return configuredRatios
+        .filter((item) => Number(item.learningOutcomeId) > 0 && Number(item.ratio) > 0)
+        .map((item) => ({
+          learningOutcomeId: Number(item.learningOutcomeId),
+          ratio: Number(item.ratio),
+        }));
+    }
+
+    const evenRatio = 100 / subjectOutcomes.length;
+    return subjectOutcomes.map((outcome) => ({
+      learningOutcomeId: outcome.id,
+      ratio: evenRatio,
+    }));
+  }, [parsedExamRequirements, subjectOutcomes]);
+
+  const examQuestionStats = useMemo(() => {
+    const questions = selectedExam?.questions || [];
+    const mcq = questions.filter((item) => item.question.type === 'MULTIPLE_CHOICE').length;
+    const essay = questions.filter((item) => item.question.type === 'ESSAY').length;
+
+    return {
+      mcq,
+      essay,
+    };
+  }, [selectedExam]);
+
+  const essayQuestionById = useMemo(() => {
+    return new Map(
+      (selectedExam?.questions || [])
+        .filter((item) => item.question.type === 'ESSAY')
+        .map((item, index) => [
+          Number(item.question.id),
+          {
+            label: index + 1,
+            content: item.question.content,
+            expectedAnswer: item.question.answer,
+            maxScore: Number(item.points || 0),
+          },
+        ])
+    );
+  }, [selectedExam]);
+
+  const essayQuestionIds = useMemo(
+    () => (selectedExam?.questions || []).filter((item) => item.question.type === 'ESSAY').map((item) => item.question.id),
+    [selectedExam]
+  );
+
+  const hasMcq = useMemo(
+    () => (selectedExam?.questions || []).some((item) => item.question.type === 'MULTIPLE_CHOICE'),
+    [selectedExam]
+  );
+
+  const buildFallbackPassPurpose = (passIndex: number): string => {
+    if (essayQuestionIds.length === 0) {
+      return 'IDENTITY_OMR';
+    }
+    if (hasMcq) {
+      if (passIndex === 1) return 'IDENTITY_OMR';
+      const essayId = essayQuestionIds[passIndex - 2];
+      return essayId ? `ESSAY_${essayId}` : `PAGE_${passIndex}`;
+    }
+    const essayId = essayQuestionIds[passIndex - 1];
+    return essayId ? `IDENTITY_ESSAY_${essayId}` : `PAGE_${passIndex}`;
+  };
+
+  const fallbackExpectedPasses = useMemo(() => {
+    const inferred = hasMcq ? essayQuestionIds.length + 1 : essayQuestionIds.length;
+    return inferred > 0 ? inferred : 1;
+  }, [essayQuestionIds, hasMcq]);
+
+  const scanBlueprint = useMemo<ExamScanBlueprintConfig | null>(() => {
+    const requirementSources = [report?.session?.exam?.requirements, selectedExam?.requirements];
+    for (const raw of requirementSources) {
+      if (typeof raw !== 'string' || !raw.trim()) continue;
+      try {
+        const parsed = JSON.parse(raw) as { scanBlueprint?: ExamScanBlueprintConfig };
+        if (parsed?.scanBlueprint && typeof parsed.scanBlueprint === 'object') {
+          return parsed.scanBlueprint;
+        }
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }, [report, selectedExam]);
+
+  const expectedPasses = useMemo(() => {
+    const reportExpectedPages = Number.parseInt(String(report?.session?.exam?.expectedPages), 10);
+    if (Number.isFinite(reportExpectedPages) && reportExpectedPages > 0) {
+      return reportExpectedPages;
+    }
+
+    const configuredScannablePages = Number.parseInt(String(scanBlueprint?.scannablePages), 10);
+    if (Number.isFinite(configuredScannablePages) && configuredScannablePages > 0) {
+      return configuredScannablePages;
+    }
+
+    return fallbackExpectedPasses;
+  }, [report, scanBlueprint, fallbackExpectedPasses]);
+
+  const passPurposeByIndex = useMemo(() => {
+    const purposes: Record<number, string> = {};
+    const rawMap = scanBlueprint?.passPurposeByIndex || {};
+
+    for (const [rawIndex, rawPurpose] of Object.entries(rawMap)) {
+      const index = Number.parseInt(rawIndex, 10);
+      if (!Number.isFinite(index) || index < 1 || index > expectedPasses) continue;
+      const normalized = String(rawPurpose || '').trim();
+      if (!normalized) continue;
+      purposes[index] = normalized;
+    }
+
+    for (let passIndex = 1; passIndex <= expectedPasses; passIndex += 1) {
+      if (!purposes[passIndex]) {
+        purposes[passIndex] = buildFallbackPassPurpose(passIndex);
+      }
+    }
+
+    return purposes;
+  }, [scanBlueprint, expectedPasses, essayQuestionIds, hasMcq]);
+
+  const getTotalPasses = (): number => {
+    return expectedPasses;
+  };
+
+  const getPassPurpose = (passIndex: number): string => {
+    return passPurposeByIndex[passIndex] || `PAGE_${passIndex}`;
+  };
+
+  const getPassTitle = (passIndex: number): string => {
+    const purpose = getPassPurpose(passIndex);
+    if (purpose === 'IDENTITY_OMR') return 'Pass 1: Student Info + OMR';
+    if (purpose.startsWith('IDENTITY_ESSAY_')) {
+      return `Pass ${passIndex}: Student Info + ${purpose.replace('IDENTITY_', '')}`;
+    }
+    if (purpose.startsWith('ESSAY_')) return `Pass ${passIndex}: ${purpose}`;
+    if (purpose.startsWith('PAGE_')) return `Pass ${passIndex}: Additional Page`;
+    return `Pass ${passIndex}`;
+  };
+
+  const viewfinderVariant = useMemo<ViewfinderVariant>(() => {
+    const purpose = getPassPurpose(activePassIndex).toUpperCase();
+    if (purpose.includes('IDENTITY_ESSAY')) return 'identityEssay';
+    if (purpose.includes('ESSAY')) return 'essayPage';
+    if (purpose.includes('OMR')) return 'omr';
+    return 'generic';
+  }, [activePassIndex, passPurposeByIndex]);
+
+  const parseSubmissionFeedback = (submission: ExamSubmission): SubmissionFeedbackPayload => {
+    const toNumberOrNull = (value: unknown): number | null => {
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    };
+
+    const empty: SubmissionFeedbackPayload = {
+      warnings: [],
+      objectiveScore: toNumberOrNull(submission.objectiveScore),
+      essayScore: toNumberOrNull(submission.essayScore),
+      totalScore: toNumberOrNull(submission.totalScore ?? submission.finalScore),
+      objectiveDetectedCount: toNumberOrNull(submission.objectiveDetectedCount),
+      objectiveCorrectCount: toNumberOrNull(submission.objectiveCorrectCount),
+      objectiveAnswers: {},
+      essayAnswers: {},
+      essayResults: [],
+      omrAnnotatedImageUrl: null,
+      aiComments: submission.aiComments || null,
+      mergedPdfUrl: submission.mergedPdfUrl || null,
+      aiReport: null,
+    };
+
+    const raw = submission.feedback;
+    if (!raw || !raw.trim()) return empty;
+
+    try {
+      const parsed = JSON.parse(raw) as {
+        warnings?: unknown;
+        objectiveScore?: unknown;
+        essayScore?: unknown;
+        totalScore?: unknown;
+        objectiveDetectedCount?: unknown;
+        objectiveCorrectCount?: unknown;
+        totalDetectedQuestions?: unknown;
+        totalCorrectAnswers?: unknown;
+        objectiveAnswers?: Record<string, unknown>;
+        essayAnswers?: Record<string, unknown>;
+        essayResults?: unknown;
+        omrAnnotatedImageUrl?: unknown;
+        aiComments?: unknown;
+        mergedPdfUrl?: unknown;
+        aiReport?: {
+          summary?: unknown;
+          strengths?: unknown;
+          weaknesses?: unknown;
+          recommendations?: unknown;
+          integrityFlags?: unknown;
+        };
+      };
+
+      const normalizeTextArray = (value: unknown): string[] => {
+        if (!Array.isArray(value)) return [];
+        return value.map((item) => String(item || '').trim()).filter(Boolean);
+      };
+
+      const summary = String(parsed?.aiReport?.summary || '').trim();
+      const strengths = normalizeTextArray(parsed?.aiReport?.strengths);
+      const weaknesses = normalizeTextArray(parsed?.aiReport?.weaknesses);
+      const recommendations = normalizeTextArray(parsed?.aiReport?.recommendations);
+      const integrityFlags = normalizeTextArray(parsed?.aiReport?.integrityFlags);
+      const hasAiReport = summary || strengths.length || weaknesses.length || recommendations.length || integrityFlags.length;
+      const objectiveAnswers = parsed?.objectiveAnswers && typeof parsed.objectiveAnswers === 'object'
+        ? Object.entries(parsed.objectiveAnswers).reduce<Record<string, string>>((acc, [key, value]) => {
+            acc[String(key)] = String(value || '').trim().toUpperCase();
+            return acc;
+          }, {})
+        : {};
+      const essayResults = Array.isArray(parsed?.essayResults)
+        ? parsed.essayResults.map((item: any) => ({
+            questionId: Number(item?.questionId || 0),
+            score: Number(item?.score || 0),
+            maxScore: Number(item?.maxScore || 0),
+            feedback: String(item?.feedback || '').trim(),
+            componentScores: Array.isArray(item?.componentScores)
+              ? item.componentScores.map((component: any) => ({
+                  criterionId: String(component?.criterionId || '').trim(),
+                  description: String(component?.description || '').trim(),
+                  score: Number(component?.score || 0),
+                  maxScore: Number(component?.maxScore || 0),
+                  achieved: Boolean(component?.achieved),
+                  matchedKeywords: Array.isArray(component?.matchedKeywords) ? component.matchedKeywords.map((keyword: any) => String(keyword || '').trim()).filter(Boolean) : [],
+                  missingKeywords: Array.isArray(component?.missingKeywords) ? component.missingKeywords.map((keyword: any) => String(keyword || '').trim()).filter(Boolean) : [],
+                  comments: String(component?.comments || '').trim(),
+                })).filter((component: any) => component.description || component.criterionId)
+              : [],
+          })).filter((item) => item.questionId > 0)
+        : [];
+      const essayAnswers = parsed?.essayAnswers && typeof parsed.essayAnswers === 'object'
+        ? Object.entries(parsed.essayAnswers).reduce<Record<string, string>>((acc, [key, value]) => {
+            acc[String(key)] = String(value || '').trim();
+            return acc;
+          }, {})
+        : {};
+
+      return {
+        warnings: normalizeTextArray(parsed?.warnings),
+        objectiveScore: toNumberOrNull(submission.objectiveScore ?? parsed?.objectiveScore),
+        essayScore: toNumberOrNull(submission.essayScore ?? parsed?.essayScore),
+        totalScore: toNumberOrNull(submission.totalScore ?? parsed?.totalScore),
+        objectiveDetectedCount: toNumberOrNull(submission.objectiveDetectedCount ?? parsed?.objectiveDetectedCount ?? parsed?.totalDetectedQuestions),
+        objectiveCorrectCount: toNumberOrNull(submission.objectiveCorrectCount ?? parsed?.objectiveCorrectCount ?? parsed?.totalCorrectAnswers),
+        objectiveAnswers,
+        essayAnswers,
+        essayResults,
+        omrAnnotatedImageUrl: String(parsed?.omrAnnotatedImageUrl || '').trim() || null,
+        aiComments: String(submission.aiComments || parsed?.aiComments || '').trim() || null,
+        mergedPdfUrl: String(submission.mergedPdfUrl || parsed?.mergedPdfUrl || '').trim() || null,
+        aiReport: hasAiReport
+          ? {
+            summary,
+            strengths,
+            weaknesses,
+            recommendations,
+            integrityFlags,
+          }
+          : null,
+      };
+    } catch {
+      return empty;
+    }
+  };
+
+  const parseScanEntriesFromRaw = (scanFiles: string | undefined): ExamScanEntry[] => {
+    if (!scanFiles) return [];
+    try {
+      const parsed = JSON.parse(scanFiles) as unknown[];
+      if (!Array.isArray(parsed)) return [];
+
+      return parsed
+        .map((entry) => {
+          if (typeof entry === 'string') {
+            if (entry.startsWith('http://') || entry.startsWith('https://')) {
+              return { source: 'cloudinary', url: entry, accessUrl: entry } as ExamScanEntry;
+            }
+            return {
+              source: 'local',
+              filename: entry,
+              accessUrl: `/uploads/scans/${encodeURIComponent(entry)}`,
+            } as ExamScanEntry;
+          }
+
+          if (entry && typeof entry === 'object') {
+            return normalizeScanEntry(entry as ExamScanEntry);
+          }
+
+          return null;
+        })
+        .filter((entry): entry is ExamScanEntry => !!entry);
+    } catch {
+      return [];
+    }
+  };
+
+  const renderEssayGradingDetails = (feedback: SubmissionFeedbackPayload) => {
+    if (feedback.essayResults.length === 0 && Object.keys(feedback.essayAnswers).length === 0) return null;
+
+    return (
+      <div className="border border-gray-100 bg-white rounded-md p-2 space-y-2">
+        <p className="text-xs font-medium text-gray-900">Essay Grading Details</p>
+        <div className="space-y-2">
+          {feedback.essayResults.map((result) => {
+            const question = essayQuestionById.get(result.questionId);
+            const detectedAnswer = feedback.essayAnswers[String(result.questionId)] || '';
+            return (
+              <div key={result.questionId} className="rounded border border-gray-100 bg-gray-50 px-2 py-2">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-gray-800">
+                    Essay {question?.label ?? result.questionId}
+                  </span>
+                  <span className="text-xs font-semibold text-orange-700">
+                    {result.score}/{result.maxScore || question?.maxScore || '-'}
+                  </span>
+                </div>
+                {question?.content && (
+                  <p className="mt-1 text-[11px] text-gray-600">{question.content}</p>
+                )}
+                <div className="mt-2 rounded border border-gray-100 bg-white p-2">
+                  <p className="text-[11px] font-medium text-gray-700">AI detected answer</p>
+                  <p className="mt-1 whitespace-pre-wrap text-xs text-gray-700">{detectedAnswer || 'No answer detected.'}</p>
+                </div>
+                {result.feedback && (
+                  <p className="mt-1 text-xs text-blue-700">Feedback: {result.feedback}</p>
+                )}
+                {result.componentScores && result.componentScores.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    {result.componentScores.map((component, index) => (
+                      <div key={component.criterionId || index} className="rounded border border-gray-100 bg-white px-2 py-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[11px] font-medium text-gray-700">{component.description || component.criterionId}</p>
+                          <span className={component.achieved ? 'text-[11px] font-semibold text-green-700' : 'text-[11px] font-semibold text-red-600'}>
+                            {component.score}/{component.maxScore}
+                          </span>
+                        </div>
+                        {component.comments && (
+                          <p className="mt-0.5 text-[11px] text-gray-500">{component.comments}</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    );
+  };
+
+  const resolveScanEntries = (submission: ExamSubmission): ExamScanEntry[] => {
+    if (Array.isArray(submission.scanEntries) && submission.scanEntries.length > 0) {
+      return submission.scanEntries.map(normalizeScanEntry);
+    }
+    return parseScanEntriesFromRaw(submission.scanFiles);
+  };
+
+  const fetchSessions = async () => {
+    setLoading(true);
+    try {
+      const { data } = await api.get<ExamSession[]>('/exams/sessions');
+      setSessions(data);
+      if (data.length > 0 && !selectedSessionId) {
+        setSelectedSessionId(data[0].id);
+      }
+    } catch {
+      toast.error('Failed to load exam sessions');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchClasses = async () => {
+    try {
+      const { data } = await api.get<Class[]>('/classes');
+      setClasses(data);
+      if (!selectedTargetClassId && data.length > 0) {
+        setSelectedTargetClassId(String(data[0].id));
+      }
+    } catch {
+      toast.error('Failed to load classes');
+    }
+  };
+
+  const fetchSessionDetails = async (sessionId: number) => {
+    try {
+      const [submissionRes, reportRes, draftsRes, issuesRes] = await Promise.all([
+        api.get<ExamSubmission[]>(`/exams/sessions/${sessionId}/submissions`),
+        api.get(`/exams/sessions/${sessionId}/report`),
+        api.get<{ drafts: ExamDraftScan[] }>(`/exams/sessions/${sessionId}/draft-scans`),
+        api.get<SessionIssuesReport>(`/exams/sessions/${sessionId}/issues`).catch(() => ({ data: null })),
+      ]);
+      setSubmissions(submissionRes.data);
+      setReport(reportRes.data);
+      setDraftScans(draftsRes.data?.drafts || []);
+      if (issuesRes.data) setIssuesReport(issuesRes.data);
+
+      const reportClassId = Number(reportRes.data?.session?.class?.id || 0);
+      const fallbackClassId = Number(selectedSession?.classId || 0);
+      const classId = reportClassId > 0 ? reportClassId : fallbackClassId;
+      if (classId > 0) {
+        try {
+          const { data: classData } = await api.get(`/classes/${classId}`);
+          const students: AssignableStudent[] = Array.isArray(classData?.students)
+            ? classData.students
+                .map((item: any) => item?.student)
+                .filter((student: any) => student && Number(student.id) > 0)
+                .map((student: any) => ({
+                  id: Number(student.id),
+                  username: String(student.username || ''),
+                  fullName: String(student.fullName || ''),
+                }))
+            : [];
+          setClassStudentsForAssign(students);
+        } catch {
+          setClassStudentsForAssign([]);
+        }
+      } else {
+        setClassStudentsForAssign([]);
+      }
+
+      const examId = reportRes.data?.session?.exam?.id;
+      if (examId) {
+        const examRes = await api.get<BuiltExam>(`/exams/builder/${examId}`);
+        setSelectedExam(examRes.data);
+      }
+    } catch {
+      toast.error('Failed to load session details');
+    }
+  };
+
+  const fetchSubjectOutcomes = async (subjectId?: number) => {
+    if (!subjectId) {
+      setSubjectOutcomes([]);
+      return;
+    }
+
+    try {
+      const { data } = await api.get<LearningOutcome[]>(`/subjects/${subjectId}/outcomes`);
+      setSubjectOutcomes(data);
+    } catch {
+      setSubjectOutcomes([]);
+    }
+  };
+
+  const deleteSession = async (sessionId: number) => {
+    const confirmed = window.confirm(`Delete session #${sessionId}? This will remove related submissions.`);
+    if (!confirmed) return;
+
+    try {
+      await api.delete(`/exams/sessions/${sessionId}`);
+      toast.success(`Session #${sessionId} deleted`);
+      if (selectedSessionId === sessionId) {
+        setSelectedSessionId(null);
+        setSelectedExam(null);
+        setSubmissions([]);
+        setReport(null);
+      }
+      await fetchSessions();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to delete session');
+    }
+  };
+
+  const stopCamera = () => {
+    if (qualityTimerRef.current) {
+      window.clearInterval(qualityTimerRef.current);
+      qualityTimerRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((track) => track.stop());
+      streamRef.current = null;
+    }
+    setCameraOpen(false);
+    setCaptureReady(false);
+    setCaptureHint('Camera is idle');
+  };
+
+  const startCamera = async () => {
+    try {
+      if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        toast.error('Live camera needs HTTPS (or localhost). You can still use Upload Full Set below.');
+        return;
+      }
+
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+          },
+        });
+      } catch {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+        });
+      }
+
+      streamRef.current = stream;
+      if (cameraVideoRef.current) {
+        cameraVideoRef.current.srcObject = stream;
+        await cameraVideoRef.current.play();
+      }
+
+      setCameraOpen(true);
+      setCaptureHint('Align answer sheet and wait for green status');
+    } catch (error: any) {
+      const message = error?.message ? String(error.message) : 'Cannot access camera';
+      toast.error(message);
+    }
+  };
+
+  const evaluateCaptureQuality = () => {
+    const video = cameraVideoRef.current;
+    const canvas = probeCanvasRef.current;
+    if (!video || !canvas || video.videoWidth === 0 || video.videoHeight === 0) {
+      setCaptureReady(false);
+      setCaptureHint('Waiting for camera signal');
+      return;
+    }
+
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (!ctx) return;
+
+    canvas.width = 320;
+    canvas.height = 240;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+
+    let brightnessTotal = 0;
+    let edgeTotal = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      brightnessTotal += gray;
+      if (i >= 8) {
+        const prevGray = 0.299 * data[i - 4] + 0.587 * data[i - 3] + 0.114 * data[i - 2];
+        edgeTotal += Math.abs(gray - prevGray);
+      }
+    }
+
+    const pixels = data.length / 4;
+    const avgBrightness = brightnessTotal / Math.max(1, pixels);
+    const edgeScore = edgeTotal / Math.max(1, pixels);
+    const ready = avgBrightness > 65 && avgBrightness < 210 && edgeScore > 8;
+
+    setCaptureReady(ready);
+    if (ready) {
+      setCaptureHint('Green: readable, press Capture');
+    } else if (avgBrightness <= 65) {
+      setCaptureHint('Too dark, increase light');
+    } else if (avgBrightness >= 210) {
+      setCaptureHint('Too bright, avoid glare');
+    } else {
+      setCaptureHint('Hold device steady and fill frame with paper');
+    }
+  };
+
+  const validateUploadedImageQuality = async (file: File): Promise<{ ok: boolean; reason?: string }> => {
+    try {
+      const objectUrl = URL.createObjectURL(file);
+
+      const result = await new Promise<{ ok: boolean; reason?: string }>((resolve) => {
+        const image = new Image();
+
+        image.onload = () => {
+          try {
+            const width = image.naturalWidth;
+            const height = image.naturalHeight;
+
+            if (width < 900 || height < 1200) {
+              resolve({ ok: false, reason: 'resolution too low (minimum 900x1200)' });
+              return;
+            }
+
+            const probeWidth = 320;
+            const probeHeight = Math.max(180, Math.round((height / Math.max(1, width)) * probeWidth));
+            const canvas = document.createElement('canvas');
+            canvas.width = probeWidth;
+            canvas.height = probeHeight;
+
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
+            if (!ctx) {
+              resolve({ ok: false, reason: 'cannot analyze image' });
+              return;
+            }
+
+            ctx.drawImage(image, 0, 0, probeWidth, probeHeight);
+            const data = ctx.getImageData(0, 0, probeWidth, probeHeight).data;
+
+            let brightnessTotal = 0;
+            let edgeTotal = 0;
+            for (let i = 0; i < data.length; i += 4) {
+              const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+              brightnessTotal += gray;
+              if (i >= 8) {
+                const prevGray = 0.299 * data[i - 4] + 0.587 * data[i - 3] + 0.114 * data[i - 2];
+                edgeTotal += Math.abs(gray - prevGray);
+              }
+            }
+
+            const pixels = data.length / 4;
+            const avgBrightness = brightnessTotal / Math.max(1, pixels);
+            const edgeScore = edgeTotal / Math.max(1, pixels);
+
+            if (avgBrightness <= 60) {
+              resolve({ ok: false, reason: 'too dark' });
+              return;
+            }
+            if (avgBrightness >= 220) {
+              resolve({ ok: false, reason: 'too bright / glare' });
+              return;
+            }
+            if (edgeScore <= 7) {
+              resolve({ ok: false, reason: 'blurred or low edge contrast' });
+              return;
+            }
+
+            resolve({ ok: true });
+          } catch {
+            resolve({ ok: false, reason: 'cannot analyze image content' });
+          }
+        };
+
+        image.onerror = () => {
+          resolve({ ok: false, reason: 'invalid image file' });
+        };
+
+        image.src = objectUrl;
+      });
+
+      URL.revokeObjectURL(objectUrl);
+      return result;
+    } catch {
+      return { ok: false, reason: 'failed to read image file' };
+    }
+  };
+
+  const uploadScanForSubmission = async (
+    submission: ExamSubmission | null,
+    uploadInput?: File | FileList | null,
+    passIndex?: number,
+    totalPasses?: number,
+    purpose?: string
+  ) => {
+    if (!selectedSessionId || !uploadInput) return null;
+
+    const files = uploadInput instanceof File
+      ? [uploadInput]
+      : sortUploadFiles(Array.from(uploadInput));
+
+    if (files.length === 0) {
+      toast.error('No file selected');
+      return;
+    }
+
+    if (files.some((file) => !file.type.startsWith('image/'))) {
+      toast.error('Only image files are allowed for scan upload');
+      return;
+    }
+
+    const isCaptureMode = Number.isFinite(Number(passIndex));
+    const expectedPasses = getTotalPasses();
+
+    if (!isCaptureMode && files.length !== expectedPasses) {
+      toast.error(`Upload Full Set requires exactly ${expectedPasses} image(s). You selected ${files.length}.`);
+      return;
+    }
+
+    const formData = new FormData();
+    if (submission?.student?.id) {
+      formData.append('studentId', String(submission.student.id));
+    }
+    files.forEach((file) => formData.append('files', file));
+    if (isCaptureMode) {
+      formData.append('passIndex', String(passIndex));
+    }
+    formData.append(
+      'totalPasses',
+      String(Number.isFinite(Number(totalPasses)) ? Number(totalPasses) : expectedPasses)
+    );
+    if (purpose) {
+      formData.append('purpose', purpose);
+    }
+
+    try {
+      const { data } = await api.post(`/exams/sessions/${selectedSessionId}/submissions/scan-upload`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      const resolvedName = data?.resolvedStudent?.fullName || submission?.student?.fullName || 'detected student';
+      toast.success(
+        isCaptureMode
+          ? `Uploaded scan for ${resolvedName} (${data.scanCount || '-'})`
+          : `Uploaded full paper set for ${resolvedName} (${data.scanCount || '-'})`
+      );
+      await fetchSessionDetails(selectedSessionId);
+      return data;
+    } catch (err: any) {
+      const payload = err?.response?.data;
+      const invalidScans = Array.isArray(payload?.invalidScans) ? payload.invalidScans : [];
+
+      if (invalidScans.length > 0) {
+        toast.error(payload?.error || 'Ảnh bài làm bị mờ hoặc thiếu góc, vui lòng chụp lại rõ nét hơn.');
+        return null;
+      }
+
+      if (payload?.requiresManualSelection) {
+        toast.error(payload?.error || 'Không nhận diện được tên hoặc MSSV, vui lòng kiểm tra lại ảnh trang đầu.');
+
+        if (Array.isArray(payload?.candidates) && payload.candidates.length === 1) {
+          const inferredStudentId = Number(payload.candidates[0]?.id || 0);
+          const matchedSubmission = submissions.find((item) => item.student?.id === inferredStudentId);
+          if (matchedSubmission) {
+            setActiveSubmissionId(matchedSubmission.id);
+          }
+        }
+
+        return null;
+      }
+
+      toast.error(payload?.error || 'Failed to upload scan');
+      return null;
+    }
+  };
+
+  const openCameraForSubmission = async (submission: ExamSubmission) => {
+    setScanMode(true);
+    setActiveSubmissionId(submission.id);
+    setActivePassIndex(1);
+    if (!cameraOpen) {
+      await startCamera();
+    }
+  };
+
+  const openCameraForAutoScan = async () => {
+    setScanMode(true);
+    setActiveSubmissionId(null);
+    setActivePassIndex(1);
+    if (!cameraOpen) {
+      await startCamera();
+    }
+  };
+
+  const captureForActiveSubmission = async () => {
+    if (!captureReady) {
+      toast.error('Image quality is not ready yet. Wait for green indicator before capturing.');
+      return;
+    }
+
+    const video = cameraVideoRef.current;
+    const canvas = captureCanvasRef.current;
+    if (!video || !canvas || video.videoWidth === 0 || video.videoHeight === 0) {
+      toast.error('Camera frame unavailable');
+      return;
+    }
+
+    setCapturing(true);
+    try {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        toast.error('Cannot process captured frame');
+        return;
+      }
+
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+      if (!blob) {
+        toast.error('Failed to capture frame');
+        return;
+      }
+
+      const linkedStudent = activeSubmission?.studentId || 'auto';
+      const file = new File([blob], `scan_${linkedStudent}_${Date.now()}.jpg`, { type: 'image/jpeg' });
+      const totalPasses = getTotalPasses();
+      const purpose = getPassPurpose(activePassIndex);
+      const uploadResult = await uploadScanForSubmission(activeSubmission || null, file, activePassIndex, totalPasses, purpose);
+
+      const resolvedStudentId = Number(uploadResult?.resolvedStudentId || 0);
+      if (resolvedStudentId > 0) {
+        const matchedSubmission = submissions.find((item) => item.student?.id === resolvedStudentId);
+        if (matchedSubmission) {
+          setActiveSubmissionId(matchedSubmission.id);
+        }
+      }
+
+      if (activePassIndex < totalPasses) {
+        setActivePassIndex((prev) => prev + 1);
+      } else {
+        setActiveSubmissionId(null);
+        setActivePassIndex(1);
+        toast.success('Completed one paper set. Continue scanning the next student paper.');
+      }
+    } finally {
+      setCapturing(false);
+    }
+  };
+
+  const gradeAI = async (submissionId: number) => {
+    try {
+      await api.post(`/exams/submissions/${submissionId}/grade-ai`, { useScanExtraction: true });
+      toast.success('Batch AI grading completed');
+      if (selectedSessionId) fetchSessionDetails(selectedSessionId);
+    } catch {
+      toast.error('Failed to grade with AI');
+    }
+  };
+
+  const stopGradingPolling = () => {
+    if (gradingPollTimerRef.current) {
+      window.clearInterval(gradingPollTimerRef.current);
+      gradingPollTimerRef.current = null;
+    }
+  };
+
+  const pollGradingStatus = (sessionId: number) => {
+    stopGradingPolling();
+
+    const tick = async () => {
+      try {
+        const { data } = await api.get<GradingJobStatus>(`/exams/sessions/${sessionId}/grading-status`);
+        setGradingProgress(data);
+
+        if (data.status === 'QUEUED' || data.status === 'RUNNING') {
+          setGradingInProgress(true);
+          return;
+        }
+
+        stopGradingPolling();
+        setGradingInProgress(false);
+        localStorage.removeItem('activeGradingSessionId');
+
+        if (data.status === 'COMPLETED') {
+          const result = data.result || {};
+          setWorkflowSummary(result);
+          await fetchSessionDetails(sessionId);
+          await fetchSessions();
+          setGradingCompleteDialog({
+            gradedCount: Number(result.gradedCount || data.gradedCount || result.createdSubmissionIds?.length || 0),
+            totalSubmissions: Number(result.totalSubmissions || result.totalDrafts || data.totalDrafts || 0),
+          });
+          toast.success('Grading completed. Open the report to review scores.');
+        } else if (data.status === 'FAILED') {
+          toast.error(data.error || 'Grading failed');
+        }
+      } catch {
+        stopGradingPolling();
+        setGradingInProgress(false);
+        localStorage.removeItem('activeGradingSessionId');
+        toast.error('Failed to poll grading progress');
+      }
+    };
+
+    void tick();
+    gradingPollTimerRef.current = window.setInterval(() => void tick(), 2000);
+  };
+
+  const completeScanningAndAutoGrade = async () => {
+    if (!selectedSessionId) return;
+    setGradingInProgress(true);
+    setGradingProgress({
+      jobId: null,
+      sessionId: selectedSessionId,
+      status: 'QUEUED',
+      progress: 0,
+      message: 'Starting grading job',
+      totalDrafts: draftScans.length,
+      gradedCount: 0,
+    });
+    try {
+      const { data } = await api.post(`/exams/sessions/${selectedSessionId}/start-grading`, {});
+      const job = data?.job as GradingJobStatus | undefined;
+      if (job) {
+        setGradingProgress(job);
+      }
+      localStorage.setItem('activeGradingSessionId', String(selectedSessionId));
+      pollGradingStatus(selectedSessionId);
+      setScanMode(false);
+      stopCamera();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to complete grading workflow');
+      setGradingInProgress(false);
+    }
+  };
+
+  const reviewScore = async (submissionId: number, current: number | null | undefined) => {
+    const raw = prompt('Final score', String(current ?? 0));
+    if (!raw) return;
+    const score = Number(raw);
+    if (!Number.isFinite(score)) {
+      toast.error('Invalid score');
+      return;
+    }
+
+    try {
+      await api.post(`/exams/submissions/${submissionId}/review`, {
+        finalScore: score,
+        note: 'Manual review from session management',
+      });
+      toast.success('Final score updated');
+      if (selectedSessionId) fetchSessionDetails(selectedSessionId);
+    } catch {
+      toast.error('Failed to review score');
+    }
+  };
+
+  const exportExam = async () => {
+    if (!selectedExam) return;
+    try {
+      const response = await api.get(`/exams/builder/${selectedExam.id}/export`, { responseType: 'blob' });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `exam_session_${selectedExam.id}.docx`;
+      link.click();
+      window.URL.revokeObjectURL(url);
+      toast.success('Exam exported (.docx template)');
+    } catch {
+      toast.error('Failed to export exam');
+    }
+  };
+
+  const exportAnswerKey = async () => {
+    if (!selectedExam) return;
+    try {
+      const response = await api.get(`/exams/builder/${selectedExam.id}/export-answer-key`, { responseType: 'blob' });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `answer_key_${selectedExam.id}.docx`;
+      link.click();
+      window.URL.revokeObjectURL(url);
+      toast.success('Answer key exported (.docx template)');
+    } catch {
+      toast.error('Failed to export answer key');
+    }
+  };
+
+  const handleFileSelect = (files: FileList | null) => {
+    if (!files || files.length === 0 || !selectedSessionId) return;
+    setBulkUploadResult(null);
+
+    const fileArray = Array.from(files);
+    const sortedFiles = sortUploadFiles(fileArray);
+    
+    const newStaged = sortedFiles.map(f => ({
+      id: Math.random().toString(36).substr(2, 9),
+      file: f,
+      preview: URL.createObjectURL(f)
+    }));
+
+    setStagedFiles(newStaged);
+  };
+
+  const processStagedFiles = async () => {
+    if (stagedFiles.length === 0 || !selectedSessionId) return;
+
+    const expectedPasses = getTotalPasses();
+    if (stagedFiles.length % expectedPasses !== 0) {
+      toast.error(`Số ảnh phải chia hết cho ${expectedPasses} trang/bài. Bạn đã chọn ${stagedFiles.length} ảnh.`);
+      return;
+    }
+
+    setBulkUploading(true);
+    try {
+      const formData = new FormData();
+      stagedFiles.forEach(s => formData.append('files', s.file));
+
+      const { data } = await api.post<BulkUploadResponse>(
+        `/exams/sessions/${selectedSessionId}/bulk-upload`,
+        formData,
+        { headers: { 'Content-Type': 'multipart/form-data' } }
+      );
+      
+      setBulkUploadResult({
+        ...data,
+        matched: data.matched ?? 0,
+        ambiguous: data.ambiguous ?? 0,
+        qualityFailed: data.qualityFailed ?? 0,
+        unmatched: data.unmatched ?? 0,
+        classifications: data.classifications ?? [],
+        unmatchedFiles: data.unmatchedFiles ?? [],
+        drafts: data.drafts ?? [],
+      });
+      toast.success(data.message || 'Images successfully uploaded and drafts created');
+      setStagedFiles([]);
+      await fetchSessionDetails(selectedSessionId);
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to process images');
+    } finally {
+      setBulkUploading(false);
+    }
+  };
+
+  const handleCheckIdentity = async () => {
+    if (!selectedSessionId) return;
+    if (identityPollTimerRef.current) {
+      window.clearInterval(identityPollTimerRef.current);
+      identityPollTimerRef.current = null;
+    }
+    const totalPending = draftScans.filter((draft) => draft.status === 'PENDING').length;
+    setIsCheckingIdentity(true);
+    setIdentityProgress({ processed: 0, total: totalPending });
+    try {
+      const { data } = await api.post(`/exams/sessions/${selectedSessionId}/draft-scans/check-identity`);
+      toast.success(data.message || 'Started checking identities');
+      const pollSessionId = selectedSessionId;
+      const tick = async () => {
+        try {
+          const { data: draftData } = await api.get<{ drafts: ExamDraftScan[] }>(`/exams/sessions/${pollSessionId}/draft-scans`);
+          const drafts = draftData?.drafts || [];
+          setDraftScans(drafts);
+          const pending = drafts.filter((draft) => draft.status === 'PENDING').length;
+          const total = Math.max(totalPending, drafts.length);
+          setIdentityProgress({ processed: Math.max(0, total - pending), total });
+
+          if (pending === 0) {
+            if (identityPollTimerRef.current) {
+              window.clearInterval(identityPollTimerRef.current);
+              identityPollTimerRef.current = null;
+            }
+            setIsCheckingIdentity(false);
+            setIdentityProgress(null);
+            await fetchSessionDetails(pollSessionId);
+            toast.success('Identity check completed');
+          }
+        } catch {
+          if (identityPollTimerRef.current) {
+            window.clearInterval(identityPollTimerRef.current);
+            identityPollTimerRef.current = null;
+          }
+          setIsCheckingIdentity(false);
+          setIdentityProgress(null);
+          toast.error('Failed to poll identity check progress');
+        }
+      };
+
+      void tick();
+      identityPollTimerRef.current = window.setInterval(() => void tick(), 1500);
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to check identity');
+      setIsCheckingIdentity(false);
+      setIdentityProgress(null);
+    }
+  };
+
+  const handleReplaceFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!e.target.files || e.target.files.length === 0 || replacingIdx === null) return;
+    const newFile = e.target.files[0];
+    setStagedFiles(prev => {
+      const newArr = [...prev];
+      URL.revokeObjectURL(newArr[replacingIdx].preview);
+      newArr[replacingIdx] = {
+        id: Math.random().toString(36).substr(2, 9),
+        file: newFile,
+        preview: URL.createObjectURL(newFile)
+      };
+      return newArr;
+    });
+    setReplacingIdx(null);
+    e.target.value = '';
+  };
+
+  const handleDeleteDraft = async (draftId: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!window.confirm('Are you sure you want to delete this draft?')) return;
+    try {
+      await api.delete(`/exams/sessions/${selectedSessionId}/draft-scans/${draftId}`);
+      toast.success('Draft deleted');
+      setDraftScans(prev => prev.filter(d => d.id !== draftId));
+      fetchSessionDetails(selectedSessionId!);
+    } catch (err: any) {
+      toast.error('Failed to delete draft');
+    }
+  };
+
+  const openDraftDetail = (draft: ExamDraftScan) => {
+    const pages = getDraftPagePaths(draft);
+    setViewingDraft(draft);
+    setDraftPageOrder(pages);
+    setDraftPageOrderInitial(pages);
+    setDraggedDraftPageIdx(null);
+    setSelectedAssignStudentId(draft.studentId ? String(draft.studentId) : '');
+  };
+
+  const closeDraftDetail = () => {
+    setViewingDraft(null);
+    setViewingDraftImagePath(null);
+    setDraftPageOrder([]);
+    setDraftPageOrderInitial([]);
+    setDraggedDraftPageIdx(null);
+    setSelectedAssignStudentId('');
+  };
+
+  const handleAssignDraftStudent = async () => {
+    if (!selectedSessionId || !viewingDraft || !selectedAssignStudentId) return;
+
+    const studentId = Number(selectedAssignStudentId);
+    if (!Number.isFinite(studentId) || studentId <= 0) {
+      toast.error('Please select a valid student');
+      return;
+    }
+
+    setAssigningDraftId(viewingDraft.id);
+    try {
+      const { data } = await api.patch(`/exams/sessions/${selectedSessionId}/draft-scans/${viewingDraft.id}/assign-student`, {
+        studentId,
+      });
+      const updatedDraft: ExamDraftScan = data?.draft;
+      if (updatedDraft) {
+        setDraftScans((prev) => prev.map((item) => (item.id === updatedDraft.id ? updatedDraft : item)));
+        setViewingDraft(updatedDraft);
+      }
+      toast.success(data?.message || 'Draft assigned successfully');
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to assign draft to student');
+    } finally {
+      setAssigningDraftId(null);
+    }
+  };
+
+  const handleRevertToPreUpload = async () => {
+    if (!selectedSessionId || draftScans.length === 0) return;
+
+    const confirmed = window.confirm('Return to pre-upload drag & drop mode? Current pending drafts will be removed.');
+    if (!confirmed) return;
+
+    setRevertingToPreUpload(true);
+    try {
+      const orderedPagePaths = draftScans.flatMap((draft) => getDraftPagePaths(draft));
+      const staged = await Promise.all(
+        orderedPagePaths.map(async (pagePath, index) => {
+          const response = await fetch(`/${pagePath}`);
+          if (!response.ok) {
+            throw new Error('Failed to read staged draft page');
+          }
+          const blob = await response.blob();
+          const fallbackName = `draft_page_${index + 1}.jpg`;
+          const filename = pagePath.split('/').pop() || fallbackName;
+          const file = new File([blob], filename, { type: blob.type || 'image/jpeg' });
+          return {
+            id: Math.random().toString(36).substr(2, 9),
+            file,
+            preview: URL.createObjectURL(blob),
+          };
+        })
+      );
+
+      await Promise.all(
+        draftScans.map((draft) => api.delete(`/exams/sessions/${selectedSessionId}/draft-scans/${draft.id}`))
+      );
+
+      setStagedFiles((prev) => {
+        prev.forEach((item) => URL.revokeObjectURL(item.preview));
+        return staged;
+      });
+      setDraftScans([]);
+      setBulkUploadResult(null);
+      setViewingDraft(null);
+      setDraftPageOrder([]);
+      setDraftPageOrderInitial([]);
+      toast.success('Returned to pre-upload drag & drop mode');
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || err?.message || 'Failed to return to pre-upload mode');
+      await fetchSessionDetails(selectedSessionId);
+    } finally {
+      setRevertingToPreUpload(false);
+    }
+  };
+
+  const handleSaveDraftPageOrder = async () => {
+    if (!selectedSessionId || !viewingDraft || draftPageOrder.length === 0) return;
+
+    setSavingDraftPageOrder(true);
+    try {
+      const { data } = await api.patch(`/exams/sessions/${selectedSessionId}/draft-scans/${viewingDraft.id}/pages-order`, {
+        pagePaths: draftPageOrder,
+      });
+
+      const updatedDraft: ExamDraftScan = data?.draft;
+      if (updatedDraft) {
+        setDraftScans((prev) => prev.map((item) => (item.id === updatedDraft.id ? updatedDraft : item)));
+        setViewingDraft(updatedDraft);
+      }
+      setDraftPageOrderInitial([...draftPageOrder]);
+      toast.success(data?.message || 'Draft pages reordered');
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to reorder draft pages');
+    } finally {
+      setSavingDraftPageOrder(false);
+    }
+  };
+
+  const fetchIssuesReport = async () => {
+    if (!selectedSessionId) return;
+    setIssuesLoading(true);
+    try {
+      const { data } = await api.get<SessionIssuesReport>(`/exams/sessions/${selectedSessionId}/issues`);
+      setIssuesReport(data);
+    } catch {
+      toast.error('Failed to load issues report');
+    } finally {
+      setIssuesLoading(false);
+    }
+  };
+
+  const handleRegrade = async (submissionId: number) => {
+    setRegradingSubmissionId(submissionId);
+    try {
+      const { data } = await api.post<RegradeResponse>(`/exams/submissions/${submissionId}/regrade`);
+      if (data.status === 'GRADED') {
+        toast.success(`Regraded: ${data.studentName} — ${data.previousScore ?? '-'} → ${data.newScore}`);
+      } else {
+        toast.error(data.error || 'Regrade failed');
+      }
+      if (selectedSessionId) fetchSessionDetails(selectedSessionId);
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to regrade');
+    } finally {
+      setRegradingSubmissionId(null);
+    }
+  };
+
+  const handleUploadMissing = async (submissionId: number, files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    try {
+      const formData = new FormData();
+      Array.from(files).forEach((file) => formData.append('files', file));
+      const { data } = await api.post(`/exams/submissions/${submissionId}/upload-missing`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      toast.success(`Uploaded ${data.pagesUploaded} page(s) for ${data.studentName}`);
+      if (selectedSessionId) fetchSessionDetails(selectedSessionId);
+      fetchIssuesReport();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to upload missing pages');
+    }
+  };
+
+  const saveInlineScore = async () => {
+    if (!inlineEditScore) return;
+    const objectiveScore = Number(inlineEditScore.objectiveScore);
+    const essayScore = Number(inlineEditScore.essayScore);
+    const totalScore = Number(inlineEditScore.totalScore);
+    if (!Number.isFinite(objectiveScore) || !Number.isFinite(essayScore) || !Number.isFinite(totalScore)) {
+      toast.error('Invalid score value');
+      return;
+    }
+    try {
+      await api.post(`/exams/submissions/${inlineEditScore.submissionId}/review`, {
+        objectiveScore,
+        essayScore,
+        finalScore: totalScore,
+        note: 'Inline component score review from session management',
+      });
+      toast.success('Score updated');
+      setInlineEditScore(null);
+      if (selectedSessionId) fetchSessionDetails(selectedSessionId);
+    } catch {
+      toast.error('Failed to update score');
+    }
+  };
+
+  const downloadSessionReportFile = async () => {
+    if (!selectedSessionId) return;
+    try {
+      const response = await api.get(`/exams/sessions/${selectedSessionId}/report/export`, { responseType: 'blob' });
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `session_${selectedSessionId}_report.csv`;
+      link.click();
+      window.URL.revokeObjectURL(url);
+      toast.success('Report exported');
+    } catch {
+      toast.error('Failed to export report');
+    }
+  };
+
+  const generateMobileScanLink = async () => {
+    if (!selectedSessionId) return;
+
+    try {
+      const { data } = await api.post(`/exams/sessions/${selectedSessionId}/mobile-scan-link`);
+      const rawLink = String(data?.scanUrl || '').trim();
+      let normalizedLink = rawLink;
+
+      try {
+        const parsed = new URL(rawLink);
+        const isLoopback = ['localhost', '127.0.0.1', '::1'].includes(parsed.hostname);
+        const currentHostIsLoopback = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
+        if (isLoopback && !currentHostIsLoopback) {
+          parsed.protocol = window.location.protocol;
+          parsed.host = window.location.host;
+          normalizedLink = parsed.toString();
+        }
+      } catch {
+        normalizedLink = rawLink;
+      }
+
+      setMobileScanLink(normalizedLink);
+      toast.success('Mobile scan link created');
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to create mobile scan link');
+    }
+  };
+
+  const copyMobileScanLink = async () => {
+    if (!mobileScanLink) return;
+
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(mobileScanLink);
+        toast.success('Link copied');
+        return;
+      }
+
+      throw new Error('Clipboard API is unavailable');
+    } catch {
+      const tempTextArea = document.createElement('textarea');
+      tempTextArea.value = mobileScanLink;
+      tempTextArea.style.position = 'fixed';
+      tempTextArea.style.opacity = '0';
+      tempTextArea.style.pointerEvents = 'none';
+      document.body.appendChild(tempTextArea);
+      tempTextArea.focus();
+      tempTextArea.select();
+
+      const copied = document.execCommand('copy');
+      document.body.removeChild(tempTextArea);
+
+      if (copied) {
+        toast.success('Link copied');
+        return;
+      }
+
+      window.prompt('Copy this mobile scan link:', mobileScanLink);
+      toast('Manual copy dialog opened');
+    }
+  };
+
+  const confirmAndPublishReport = async () => {
+    if (!selectedSessionId) return;
+
+    const confirmed = window.confirm(
+      'Confirm report and publish final scores to students? This will finalize all submissions in this session.'
+    );
+    if (!confirmed) return;
+
+    setPublishingReport(true);
+    try {
+      const { data } = await api.post(`/exams/sessions/${selectedSessionId}/report/finalize`);
+      toast.success(`Published to students. Auto-filled from AI: ${data.autoFilledFromAiCount || 0}, zero-scored: ${data.autoFilledZeroCount || 0}`);
+      await fetchSessionDetails(selectedSessionId);
+      await fetchSessions();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to confirm and publish report');
+    } finally {
+      setPublishingReport(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchSessions();
+    void fetchClasses();
+  }, []);
+
+  useEffect(() => {
+    const requestedTab = searchParams.get('tab') as TabKey | null;
+    const requestedSessionId = parseInt(searchParams.get('sessionId') || '', 10);
+
+    if (requestedTab && ['AI_GRADING', 'REPORT', 'EXAM_VIEW'].includes(requestedTab)) {
+      setTab(requestedTab);
+    }
+    if (Number.isFinite(requestedSessionId)) {
+      setSelectedSessionId(requestedSessionId);
+    }
+  }, [searchParams]);
+
+  useEffect(() => {
+    if (selectedSessionId) {
+      setMobileScanLink('');
+      fetchSessionDetails(selectedSessionId);
+      const activeGradingSessionId = Number(localStorage.getItem('activeGradingSessionId') || 0);
+      if (activeGradingSessionId === selectedSessionId) {
+        pollGradingStatus(selectedSessionId);
+      }
+    }
+  }, [selectedSessionId]);
+
+  useEffect(() => {
+    void fetchSubjectOutcomes(selectedExam?.subjectId);
+  }, [selectedExam?.subjectId]);
+
+  useEffect(() => {
+    setActivePassIndex((prev) => Math.min(Math.max(prev, 1), expectedPasses));
+  }, [expectedPasses]);
+
+  useEffect(() => {
+    if (!cameraOpen) return;
+
+    qualityTimerRef.current = window.setInterval(evaluateCaptureQuality, 400);
+    return () => {
+      if (qualityTimerRef.current) {
+        window.clearInterval(qualityTimerRef.current);
+        qualityTimerRef.current = null;
+      }
+    };
+  }, [cameraOpen]);
+
+  useEffect(() => {
+    if (!scanMode || !cameraOpen || !streamRef.current || !cameraVideoRef.current) return;
+
+    const video = cameraVideoRef.current;
+    if (video.srcObject !== streamRef.current) {
+      video.srcObject = streamRef.current;
+      void video.play().catch(() => undefined);
+    }
+  }, [scanMode, cameraOpen, activeSubmissionId]);
+
+  useEffect(() => {
+    return () => {
+      stopGradingPolling();
+      if (identityPollTimerRef.current) {
+        window.clearInterval(identityPollTimerRef.current);
+        identityPollTimerRef.current = null;
+      }
+      stopCamera();
+    };
+  }, []);
+
+  const openTransferDialog = (mode: 'CLONE' | 'REUSE') => {
+    if (!selectedExam) return;
+    setClassDialogMode(mode);
+    setTransferTitle(mode === 'CLONE' ? `${selectedExam.title} (Copy)` : `${selectedExam.title} (Config Copy)`);
+    setTransferDuration(String(selectedExam.durationMinutes || 60));
+  };
+
+  const closeTransferDialog = () => {
+    setClassDialogMode(null);
+    setSelectedTargetClassId('');
+    setTransferTitle('');
+    setTransferDuration('');
+    setTransferLoading(false);
+  };
+
+  const executeTransfer = async () => {
+    if (!selectedExam || !selectedTargetClassId || !classDialogMode) {
+      toast.error('Please select a target class');
+      return;
+    }
+
+    setTransferLoading(true);
+    try {
+      const targetClassId = Number(selectedTargetClassId);
+      const endpoint = classDialogMode === 'CLONE'
+        ? `/exams/builder/${selectedExam.id}/clone-draft`
+        : `/exams/builder/${selectedExam.id}/clone-config-draft`;
+      const { data } = await api.post(endpoint, {
+        title: transferTitle.trim() || undefined,
+        durationMinutes: Number.parseInt(transferDuration, 10) || selectedExam.durationMinutes,
+      });
+      toast.success(classDialogMode === 'CLONE' ? 'Exam cloned to a new draft' : 'Exam configuration copied to a new draft');
+      closeTransferDialog();
+      navigate(`/teacher/exams?examId=${data.id}&classId=${targetClassId}`);
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to prepare the draft');
+    } finally {
+      setTransferLoading(false);
+    }
+  };
+
+  return (
+    <Layout>
+      <div className="space-y-6">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900">Session Management</h1>
+          <p className="text-gray-500 mt-1">Manage scanning, batch AI auto-grading, reports, and exam view for active sessions</p>
+        </div>
+
+        <div className="card p-4">
+          <div className="flex items-center justify-between gap-2">
+            <label className="block text-sm font-medium text-gray-700 mb-2">Select Session</label>
+            {selectedSessionId && (
+              <button className="btn-danger text-xs" onClick={() => deleteSession(selectedSessionId)}>
+                Delete Session
+              </button>
+            )}
+          </div>
+          <select
+            className="input-field"
+            value={selectedSessionId || ''}
+            onChange={(e) => setSelectedSessionId(parseInt(e.target.value, 10))}
+            disabled={loading || sessions.length === 0}
+          >
+            <option value="">-- Select Session --</option>
+            {sessions.map((session) => (
+              <option key={session.id} value={session.id}>
+                Session #{session.id} - {session.exam?.title} - {session.class?.name} ({session.status})
+              </option>
+            ))}
+          </select>
+          {sessions.length > 0 && (
+            <div className="mt-3 max-h-40 overflow-auto border border-gray-200 rounded-md">
+              {sessions.map((session) => (
+                <div key={session.id} className="px-3 py-2 border-b border-gray-100 last:border-0 flex items-center justify-between gap-2">
+                  <button
+                    className="text-left text-xs text-gray-700 hover:text-primary-700"
+                    onClick={() => setSelectedSessionId(session.id)}
+                  >
+                    #{session.id} • {session.exam?.title} • {session.class?.name} • {session.status}
+                  </button>
+                  <button className="btn-secondary text-xs" onClick={() => deleteSession(session.id)}>Delete</button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="flex gap-2 flex-wrap">
+          <button className={`btn-secondary ${tab === 'AI_GRADING' ? 'bg-primary-600 text-white border-primary-600' : ''}`} onClick={() => setTab('AI_GRADING')}>
+            <ClipboardCheck size={14} className="inline mr-1" /> Grade Papers
+          </button>
+          <button className={`btn-secondary ${tab === 'REPORT' ? 'bg-primary-600 text-white border-primary-600' : ''}`} onClick={() => setTab('REPORT')}>
+            <BarChart3 size={14} className="inline mr-1" /> View Report
+          </button>
+          <button className={`btn-secondary ${tab === 'EXAM_VIEW' ? 'bg-primary-600 text-white border-primary-600' : ''}`} onClick={() => setTab('EXAM_VIEW')}>
+            <Eye size={14} className="inline mr-1" /> View Exam
+          </button>
+        </div>
+
+        {tab === 'AI_GRADING' && (
+          <div className="card p-5 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="font-semibold text-gray-900">Bulk Upload and OMR-Based Grading</h2>
+              <div className="flex gap-2 flex-wrap">
+                <button className="btn-secondary text-xs" onClick={generateMobileScanLink} disabled={!selectedSessionId}>
+                  Create Mobile Link
+                </button>
+                <button
+                  className="btn-secondary text-xs"
+                  onClick={() => {
+                    if (submissions.length === 0) {
+                      toast.error('No submissions to scan');
+                      return;
+                    }
+                    setWorkflowSummary(null);
+                    void openCameraForAutoScan();
+                    toast.success('Scan mode started in auto-match mode.');
+                  }}
+                  disabled={!selectedSessionId || submissions.length === 0}
+                >
+                  Start Scan
+                </button>
+                <button 
+                  className={`btn-secondary text-xs ${(gradingInProgress || !issuesReport || issuesReport.readyForGrading !== issuesReport.totalStudents || draftScans.some((d) => d.status === 'PENDING')) ? 'opacity-50 cursor-not-allowed' : 'bg-primary-600 text-white hover:bg-primary-700'}`} 
+                  onClick={completeScanningAndAutoGrade} 
+                  disabled={gradingInProgress || !selectedSessionId || !issuesReport || issuesReport.readyForGrading !== issuesReport.totalStudents || draftScans.some((d) => d.status === 'PENDING')}
+                  title="Only available when all students have their exams correctly mapped and identified."
+                >
+                  {gradingInProgress ? (
+                    <span className="inline-flex items-center gap-1">
+                      <Loader2 size={14} className="animate-spin" />
+                      Grading...
+                    </span>
+                  ) : (
+                    'Start Grading'
+                  )}
+                </button>
+                <button className="btn-secondary text-xs" onClick={fetchIssuesReport} disabled={!selectedSessionId || issuesLoading}>
+                  <AlertTriangle size={14} className="inline mr-1" />
+                  {issuesLoading ? 'Loading...' : 'Check Issues'}
+                </button>
+              </div>
+            </div>
+            <p className="text-xs text-gray-600">
+              Upload Full Set requires exactly {getTotalPasses()} image(s) per student. Page 1 is validated with OMR for identity and quality first; unreadable or ambiguous pages must be re-uploaded or assigned manually before grading starts. Gemini is used only for essay scoring after all sets are valid.
+            </p>
+
+            {(gradingInProgress || gradingProgress) && (
+              <div className="rounded-lg border border-primary-100 bg-primary-50 px-3 py-2">
+                <div className="flex items-center justify-between gap-3 text-sm text-primary-900">
+                  <span className="inline-flex items-center gap-2 font-medium">
+                    {gradingInProgress && <Loader2 size={16} className="animate-spin" />}
+                    {gradingProgress?.message || 'Grading is running'}
+                  </span>
+                  <span className="text-xs">
+                    {Math.round(gradingProgress?.progress || 0)}%
+                  </span>
+                </div>
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-white">
+                  <div
+                    className="h-full rounded-full bg-primary-600 transition-all"
+                    style={{ width: `${Math.max(4, Math.min(100, gradingProgress?.progress || 0))}%` }}
+                  />
+                </div>
+                <p className="mt-1 text-[11px] text-primary-700">
+                  You can switch tabs while this runs. A popup will appear when the report is ready.
+                </p>
+              </div>
+            )}
+
+            {/* Bulk Upload Section */}
+            <div className="border border-dashed border-primary-300 bg-primary-50/50 rounded-lg p-4 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <p className="text-sm font-medium text-primary-800">Bulk Upload (All Students)</p>
+                  <p className="text-xs text-primary-600">Upload all exam images in sequential order. The system groups images by {getTotalPasses()} pages per student and reads MSSV from the OMR block on page 1 of each set.</p>
+                </div>
+                <label className={`btn-primary text-xs cursor-pointer whitespace-nowrap ${bulkUploading ? 'opacity-50 pointer-events-none' : ''}`}>
+                  <Upload size={14} className="inline mr-1" />
+                  {stagedFiles.length > 0 ? 'Reselect Images' : 'Select Images'}
+                  <input
+                    type="file"
+                    multiple
+                    accept="image/*"
+                    className="hidden"
+                    disabled={bulkUploading || !selectedSessionId}
+                    onChange={(e) => {
+                      handleFileSelect(e.target.files);
+                      e.currentTarget.value = '';
+                    }}
+                  />
+                </label>
+              </div>
+
+              {stagedFiles.length > 0 && (
+                <div className="flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs text-primary-700">
+                      You have selected <strong>{stagedFiles.length}</strong> images. Drag and drop to reorder them before uploading.
+                    </p>
+                    <button
+                      className="btn-primary text-xs whitespace-nowrap"
+                      onClick={processStagedFiles}
+                      disabled={bulkUploading}
+                    >
+                      {bulkUploading ? (
+                        <>
+                          <span className="animate-spin rounded-full h-3 w-3 border-b-2 border-white inline-block mr-2" />
+                          Uploading...
+                        </>
+                      ) : (
+                        'Upload Images'
+                      )}
+                    </button>
+                  </div>
+                  <div className="grid gap-2 grid-cols-3 sm:grid-cols-4 md:grid-cols-6 max-h-64 overflow-auto border border-primary-100 p-2 rounded-md bg-white">
+                    {stagedFiles.map((staged, idx) => (
+                      <div 
+                        key={staged.id} 
+                        className="relative aspect-[3/4] cursor-move border border-transparent hover:border-blue-500 rounded transition-colors group"
+                        draggable
+                        onDragStart={() => setDraggedIdx(idx)}
+                        onDragOver={(e) => e.preventDefault()}
+                        onDrop={(e) => {
+                          e.preventDefault();
+                          if (draggedIdx === null || draggedIdx === idx) return;
+                          setStagedFiles(prev => {
+                            const newArr = [...prev];
+                            const draggedItem = newArr[draggedIdx];
+                            newArr.splice(draggedIdx, 1);
+                            newArr.splice(idx, 0, draggedItem);
+                            return newArr;
+                          });
+                          setDraggedIdx(null);
+                        }}
+                        onDragEnd={() => setDraggedIdx(null)}
+                        onClick={() => setViewingStagedImageIdx(idx)}
+                      >
+                        <img src={staged.preview} className="w-full h-full object-cover rounded shadow-sm" alt={`preview-${idx}`} />
+                        <div className="absolute top-1 left-1 bg-black/50 text-white px-1.5 py-0.5 text-[10px] rounded backdrop-blur-sm">
+                          #{idx + 1}
+                        </div>
+                        <div className="absolute inset-0 bg-black/0 group-hover:bg-black/10 transition-colors rounded flex items-center justify-center opacity-0 group-hover:opacity-100 pointer-events-none">
+                          <p className="text-white text-[10px] font-medium drop-shadow-md text-center px-2">
+                            Click to view
+                          </p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Bulk Upload Results */}
+            {(bulkUploadResult || draftScans.length > 0) && (
+              <div className="border border-gray-200 rounded-lg p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-medium text-gray-900">Bulk Upload Results</p>
+                    {draftScans.length > 0 && (
+                      <button
+                        className="btn-secondary text-xs"
+                        onClick={handleRevertToPreUpload}
+                        disabled={revertingToPreUpload || savingDraftPageOrder}
+                        title="Back to pre-upload drag & drop"
+                      >
+                        <ArrowLeft size={14} className="inline mr-1" />
+                        {revertingToPreUpload ? 'Returning...' : 'Back To Drag & Drop'}
+                      </button>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {draftScans.some(d => d.status === 'PENDING') && (
+                      <button 
+                        className="btn-primary text-xs bg-indigo-600 hover:bg-indigo-700 text-white" 
+                        onClick={handleCheckIdentity} 
+                        disabled={isCheckingIdentity || revertingToPreUpload || savingDraftPageOrder}
+                      >
+                        {isCheckingIdentity ? (
+                          <Loader2 size={14} className="inline mr-1 animate-spin" />
+                        ) : (
+                          <Search size={14} className="inline mr-1" />
+                        )}
+                        {isCheckingIdentity ? 'Checking...' : 'Check Identity'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {bulkUploadResult && (
+                  <div className="flex gap-4 text-xs">
+                    <span className="text-green-700">✓ Matched: {bulkUploadResult?.matched}</span>
+                    <span className="text-amber-700">⚠ Ambiguous: {bulkUploadResult?.ambiguous}</span>
+                    <span className="text-red-700">✦ Quality failed: {bulkUploadResult?.qualityFailed || 0}</span>
+                    <span className="text-red-700">✗ Unmatched: {bulkUploadResult?.unmatched}</span>
+                    <span className="text-gray-600">Total: {bulkUploadResult?.totalImages} images</span>
+                  </div>
+                )}
+                <div className="rounded-md bg-gray-50 border border-gray-100 p-2 text-[11px] text-gray-600">
+                  Green means the first page passed quality checks and OMR read MSSV successfully. Red means the set needs re-upload or manual assignment before grading can begin.
+                </div>
+                {isCheckingIdentity && identityProgress && (
+                  <div className="rounded-md border border-indigo-100 bg-indigo-50 px-3 py-2">
+                    <div className="flex items-center justify-between text-xs text-indigo-900">
+                      <span className="inline-flex items-center gap-2 font-medium">
+                        <Loader2 size={14} className="animate-spin" />
+                        Checking identity
+                      </span>
+                      <span>{identityProgress.processed}/{identityProgress.total}</span>
+                    </div>
+                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white">
+                      <div
+                        className="h-full rounded-full bg-indigo-600 transition-all"
+                        style={{
+                          width: `${Math.max(6, Math.min(100, identityProgress.total > 0 ? (identityProgress.processed / identityProgress.total) * 100 : 6))}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+                )}
+                {draftScans.length > 0 && (
+                  <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3 max-h-96 overflow-auto pr-1">
+                    {draftScans.map((draft, idx) => {
+                      const essayPageCount = parseDraftEssayPages(draft.essayPagesUrls).length;
+
+                      const isMatched = draft.status === 'VALID';
+                      const isPending = draft.status === 'PENDING';
+                      
+                      return (
+                        <div 
+                          key={draft.id} 
+                          className={`text-xs p-3 rounded-lg border-l-4 flex flex-col gap-2 hover:shadow-md transition-shadow ${
+                            isMatched ? 'border-green-200 bg-green-50 border-l-green-500' :
+                            isPending ? 'border-blue-200 bg-blue-50 border-l-blue-500' :
+                            'border-amber-200 bg-amber-50 border-l-amber-500'
+                          } cursor-pointer`}
+                          onClick={() => openDraftDetail(draft)}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <div>
+                              <p className="font-medium text-gray-900 flex items-center gap-1">
+                                <GripVertical size={12} className="text-gray-500" />
+                                {isMatched && draft.student ? draft.student.fullName : `Draft #${idx + 1}`}
+                              </p>
+                              <p className="text-gray-500">
+                                {isMatched && draft.student ? draft.student.username : 'Click to reorder pages'}
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${
+                                isMatched ? 'bg-green-100 text-green-700' :
+                                isPending ? 'bg-blue-100 text-blue-700 animate-pulse' :
+                                'bg-amber-100 text-amber-700'
+                              }`}>
+                                {draft.status}
+                              </span>
+                              <button
+                                className="text-gray-400 hover:text-red-500 hover:bg-red-50 rounded p-1 transition-colors"
+                                onClick={(e) => handleDeleteDraft(draft.id, e)}
+                                title="Delete this draft"
+                              >
+                                <XCircle size={16} />
+                              </button>
+                            </div>
+                          </div>
+                          <p className="text-gray-700">Total pages: {1 + essayPageCount}</p>
+                          <img 
+                            src={`/${draft.frontPageUrl}`} 
+                            alt={`Draft ${idx + 1}`} 
+                            className="w-full h-32 object-cover rounded border border-gray-200 shadow-sm opacity-90" 
+                            loading="lazy" 
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {(bulkUploadResult?.unmatchedFiles ?? []).length > 0 && (
+                  <p className="text-xs text-red-600">Unmatched files: {(bulkUploadResult?.unmatchedFiles ?? []).join(', ')}</p>
+                )}
+              </div>
+            )}
+
+            {/* Issues Panel */}
+            {issuesReport && (
+              <div className="border border-amber-200 bg-amber-50 rounded-lg p-3 space-y-2">
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-medium text-amber-900">
+                    <AlertTriangle size={14} className="inline mr-1" />
+                    Session Issues ({issuesReport.studentsWithIssues} students)
+                  </p>
+                  <span className="text-xs text-green-700">Ready for grading: {issuesReport.readyForGrading}/{issuesReport.totalStudents}</span>
+                </div>
+                <div className="flex gap-3 text-xs">
+                  <span className="text-red-700">🔴 Missing: {issuesReport.summary.missingExams}</span>
+                  <span className="text-amber-700">🟡 Incomplete: {issuesReport.summary.incompletePages}</span>
+                  <span className="text-orange-700">🟠 Unreadable: {issuesReport.summary.unreadableImages}</span>
+                  <span className="text-purple-700">🟣 ID mismatch: {issuesReport.summary.identityMismatches}</span>
+                </div>
+                {issuesReport.issues.length > 0 && (
+                  <div className="space-y-1 max-h-48 overflow-auto">
+                    {issuesReport.issues.map((issue) => (
+                      <div key={issue.submissionId} className="flex items-center justify-between gap-2 text-xs border border-amber-100 rounded-md p-2 bg-white">
+                        <div>
+                          <span className="font-medium text-gray-900">{issue.studentName}</span>
+                          <span className="text-gray-500 ml-1">({issue.studentCode})</span>
+                          <span className={`ml-2 px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                            issue.issueType === 'MISSING_EXAM' ? 'bg-red-100 text-red-700' :
+                            issue.issueType === 'INCOMPLETE_PAGES' ? 'bg-amber-100 text-amber-700' :
+                            issue.issueType === 'UNREADABLE_IMAGE' ? 'bg-orange-100 text-orange-700' :
+                            'bg-purple-100 text-purple-700'
+                          }`}>{issue.issueType.replace(/_/g, ' ')}</span>
+                          <span className="text-gray-500 ml-2">{issue.description}</span>
+                        </div>
+                        <div className="flex gap-1">
+                          <label className="btn-secondary text-[10px] cursor-pointer">
+                            <Upload size={12} className="inline mr-0.5" />Re-upload
+                            <input
+                              type="file"
+                              multiple
+                              accept="image/*"
+                              className="hidden"
+                              onChange={(e) => {
+                                void handleUploadMissing(issue.submissionId, e.target.files);
+                                e.currentTarget.value = '';
+                              }}
+                            />
+                          </label>
+                          <button
+                            className="btn-secondary text-[10px]"
+                            onClick={() => handleRegrade(issue.submissionId)}
+                            disabled={regradingSubmissionId === issue.submissionId}
+                          >
+                            <RefreshCw size={12} className="inline mr-0.5" />
+                            {regradingSubmissionId === issue.submissionId ? 'Regrading...' : 'Regrade'}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {mobileScanLink && (
+              <div className="border border-primary-200 bg-primary-50 rounded-lg p-3 space-y-2">
+                <p className="text-xs text-primary-800 font-medium">Mobile scan link</p>
+                <a href={mobileScanLink} target="_blank" rel="noreferrer" className="text-xs text-primary-700 break-all underline">
+                  {mobileScanLink}
+                </a>
+                {/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])/i.test(mobileScanLink) && (
+                  <p className="text-xs text-amber-700">
+                    This link is localhost-only. Open frontend by your LAN IP/HTTPS to share with phone camera.
+                  </p>
+                )}
+                <div className="flex gap-2">
+                  <button className="btn-secondary text-xs" onClick={copyMobileScanLink}>Copy Link</button>
+                  <a href={mobileScanLink} target="_blank" rel="noreferrer" className="btn-secondary text-xs">Open Link</a>
+                </div>
+              </div>
+            )}
+
+            {scanMode && (
+              <div className="border border-gray-200 rounded-lg p-3 space-y-3">
+                <p className="text-xs text-primary-700">When indicator turns green, press Capture to upload this scan for the selected student.</p>
+                <div className="grid lg:grid-cols-3 gap-3">
+                  <div className="lg:col-span-2">
+                    <div className={`rounded-xl border-2 overflow-hidden ${captureReady ? 'border-green-500' : 'border-red-400'}`}>
+                      <div className="relative w-full aspect-[210/297] bg-black">
+                        <video ref={cameraVideoRef} autoPlay playsInline muted className="absolute inset-0 w-full h-full object-cover" />
+                        <ViewfinderOverlay variant={viewfinderVariant} />
+                      </div>
+                    </div>
+                    <div className="mt-2 flex items-center justify-between">
+                      <p className={`text-xs ${captureReady ? 'text-green-700' : 'text-amber-700'}`}>{captureHint}</p>
+                      <div className="flex gap-2">
+                        <button className="btn-secondary text-xs" onClick={() => (cameraOpen ? stopCamera() : startCamera())}>
+                          {cameraOpen ? <CameraOff size={14} className="inline mr-1" /> : <Camera size={14} className="inline mr-1" />}
+                          {cameraOpen ? 'Stop Camera' : 'Start Camera'}
+                        </button>
+                        <button className="btn-primary text-xs" onClick={captureForActiveSubmission} disabled={!cameraOpen || !captureReady || capturing}>
+                          {capturing ? 'Capturing...' : 'Capture'}
+                        </button>
+                      </div>
+                    </div>
+                    <p className="text-xs text-gray-600 mt-2">
+                      {activeSubmission ? getPassTitle(activePassIndex) : 'Auto match student from page 1'} / Total passes: {getTotalPasses()}
+                    </p>
+                    {/* Page progress indicator */}
+                    <div className="flex gap-1 mt-2">
+                      {Array.from({ length: getTotalPasses() }, (_, i) => i + 1).map((pageNum) => (
+                        <div
+                          key={pageNum}
+                          className={`h-2 flex-1 rounded-full transition-colors ${
+                            pageNum < activePassIndex ? 'bg-green-500' :
+                            pageNum === activePassIndex ? 'bg-primary-500 animate-pulse' :
+                            'bg-gray-200'
+                          }`}
+                          title={`Page ${pageNum}`}
+                        />
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <p className="text-xs text-gray-500">Selected student</p>
+                    <div className="border border-gray-200 rounded-lg p-2">
+                      {activeSubmission ? (
+                        <>
+                          <p className="text-sm font-medium text-gray-900">{activeSubmission.student?.fullName}</p>
+                          <p className="text-xs text-gray-500">{activeSubmission.student?.username}</p>
+                          <div className="flex gap-2 mt-2">
+                            <button
+                              className="btn-secondary text-xs"
+                              onClick={() => setActivePassIndex((prev) => Math.max(1, prev - 1))}
+                              disabled={activePassIndex <= 1}
+                            >
+                              Prev Pass
+                            </button>
+                            <button
+                              className="btn-secondary text-xs"
+                              onClick={() => setActivePassIndex((prev) => Math.min(getTotalPasses(), prev + 1))}
+                              disabled={activePassIndex >= getTotalPasses()}
+                            >
+                              Next Pass
+                            </button>
+                          </div>
+                        </>
+                      ) : (
+                        <p className="text-xs text-gray-500">Auto mode is active. The system matches the student from page 1 of each scanned set.</p>
+                      )}
+                    </div>
+                  </div>
+                </div>
+                <canvas ref={probeCanvasRef} className="hidden" />
+                <canvas ref={captureCanvasRef} className="hidden" />
+              </div>
+            )}
+
+            {workflowSummary && (
+              <div className="border border-gray-200 rounded-lg p-3 space-y-2">
+                <p className="text-sm font-medium text-gray-900">Auto Grading Summary</p>
+                <p className="text-xs text-gray-600">
+                  Graded: {workflowSummary.gradedCount || 0} • Failed: {workflowSummary.failedCount || 0} • Identity mismatch: {workflowSummary.identityMismatchCount || 0}
+                </p>
+                {Array.isArray(workflowSummary.results) && workflowSummary.results.length > 0 && (
+                  <div className="space-y-2 max-h-56 overflow-auto">
+                    {workflowSummary.results.map((item: any) => (
+                      <div key={item.submissionId} className="border border-gray-100 rounded-md p-2 text-xs">
+                        <p className="font-medium text-gray-900">{item.studentName} ({item.studentCode}) - {item.status}</p>
+                        <p className="text-gray-600">Objective: {item.objectiveScore} • Essay: {item.essayScore} • Total: {item.totalScore}</p>
+                        {Array.isArray(item.warnings) && item.warnings.length > 0 && <p className="text-amber-700">Warnings: {item.warnings.join(' | ')}</p>}
+                        {item.error && <p className="text-red-600">Error: {item.error}</p>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {submissions.length === 0 ? (
+              <p className="text-sm text-gray-500">No submissions for this session.</p>
+            ) : (
+              submissions.map((item) => {
+                const scans = resolveScanEntries(item) || [];
+                const feedback = parseSubmissionFeedback(item);
+                const mergedPdfUrl = feedback.mergedPdfUrl || scans.find((scan) => !!scan.mergedPdfUrl)?.mergedPdfUrl || null;
+
+                return (
+                  <div key={item.id} className="border border-gray-200 rounded-lg p-3 space-y-3">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <div>
+                        <p className="text-sm font-medium text-gray-900">{item.student?.fullName} ({item.student?.username})</p>
+                        <p className="text-xs text-gray-500">
+                          Objective: {feedback.objectiveScore ?? '-'} • Essay: {feedback.essayScore ?? '-'} • Total: {feedback.totalScore ?? item.finalScore ?? '-'}
+                        </p>
+                        <p className="text-xs text-gray-500">AI: {item.aiScore ?? '-'} • Final: {item.finalScore ?? '-'} • Scans: {scans?.length ?? 0}</p>
+                      </div>
+                      <div className="flex gap-2 flex-wrap">
+                        <button className="btn-secondary text-xs" onClick={() => void openCameraForSubmission(item)}>
+                          <Camera size={14} className="inline mr-1" />Camera
+                        </button>
+                        <label className="btn-secondary text-xs cursor-pointer">
+                          <Upload size={14} className="inline mr-1" />Upload Full Set
+                          <input
+                            type="file"
+                            multiple
+                            accept="image/*"
+                            className="hidden"
+                            onChange={(e) => {
+                              void uploadScanForSubmission(item, e.target.files);
+                              e.currentTarget.value = '';
+                            }}
+                          />
+                        </label>
+                        <button className="btn-secondary text-xs" onClick={() => gradeAI(item.id)}>Batch AI Grade</button>
+                        <button
+                          className="btn-secondary text-xs"
+                          onClick={() => handleRegrade(item.id)}
+                          disabled={regradingSubmissionId === item.id}
+                        >
+                          <RefreshCw size={14} className="inline mr-1" />
+                          {regradingSubmissionId === item.id ? 'Regrading...' : 'AI Regrade'}
+                        </button>
+                        <button className="btn-secondary text-xs" onClick={() => reviewScore(item.id, item.finalScore)}>Manual Review</button>
+                      </div>
+                    </div>
+
+                    {mergedPdfUrl && (
+                      <p className="text-xs text-primary-700">
+                        <a href={mergedPdfUrl} target="_blank" rel="noreferrer" className="underline">Merged PDF</a>
+                      </p>
+                    )}
+
+                    {scans?.length > 0 && (
+                      <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-2">
+                        {scans?.map?.((scan, idx) => {
+                          const href = scan.accessUrl || scan.url || (scan.filename ? `/uploads/scans/${encodeURIComponent(scan.filename)}` : '');
+                          if (!href) return null;
+
+                          return (
+                            <a
+                              key={`${item.id}-grading-${idx}`}
+                              href={href}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="border border-gray-200 rounded-md p-2 hover:border-primary-300 transition-colors"
+                            >
+                              <p className="text-xs text-primary-700 truncate">Uploaded {idx + 1} {scan.passIndex ? `(Pass ${scan.passIndex})` : ''}</p>
+                              <img src={href} alt={`grading-scan-${idx + 1}`} className="mt-1 w-full h-20 object-cover rounded" loading="lazy" />
+                            </a>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        )}
+
+        {tab === 'REPORT' && (
+          <div className="card p-5 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="font-semibold text-gray-900">Session Report</h2>
+              <div className="flex gap-2">
+                <button
+                  className="btn-primary text-xs"
+                  onClick={confirmAndPublishReport}
+                  disabled={!selectedSessionId || publishingReport || report?.publish?.isPublishedToStudents}
+                >
+                  <CheckCircle2 size={14} className="inline mr-1" />
+                  {report?.publish?.isPublishedToStudents ? 'Published' : publishingReport ? 'Publishing...' : 'Confirm & Publish'}
+                </button>
+                <button className="btn-secondary text-xs" onClick={downloadSessionReportFile} disabled={!selectedSessionId}>
+                  <Download size={14} className="inline mr-1" />Export CSV
+                </button>
+              </div>
+            </div>
+
+            {/* Summary Stats Table */}
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-3">
+              {[
+                { label: 'Total Students', value: report?.totals?.submissions ?? 0, color: 'text-gray-900' },
+                { label: 'Graded', value: report?.totals?.graded ?? 0, color: 'text-green-700' },
+                { label: 'Average', value: report?.scoreStats?.average != null ? Number(report.scoreStats.average).toFixed(1) : '-', color: 'text-primary-700' },
+                { label: 'Min', value: report?.scoreStats?.min ?? '-', color: 'text-amber-700' },
+                { label: 'Max', value: report?.scoreStats?.max ?? '-', color: 'text-green-700' },
+              ].map((stat) => (
+                <div key={stat.label} className="border border-gray-200 rounded-lg p-3 text-center">
+                  <p className="text-xs text-gray-500">{stat.label}</p>
+                  <p className={`text-xl font-bold ${stat.color}`}>{stat.value}</p>
+                </div>
+              ))}
+            </div>
+
+            <p className={`text-sm ${report?.publish?.isPublishedToStudents ? 'text-green-700' : 'text-amber-700'}`}>
+              {report?.publish?.isPublishedToStudents
+                ? 'Published to student portal'
+                : 'Not published yet. Confirm report to sync final results for students.'}
+            </p>
+            {workflowSummary && (
+              <p className="text-sm text-green-700 flex items-center gap-1">
+                <CheckCircle2 size={14} /> Latest auto grading run completed: {workflowSummary.gradedCount || 0} graded
+              </p>
+            )}
+            {gradingInProgress && (
+              <div className="rounded-md border border-primary-100 bg-primary-50 px-3 py-2 text-sm text-primary-800">
+                Auto grading is running. OMR is scoring the first page and Gemini is grading essay pages.
+              </div>
+            )}
+
+            <div className="border-t border-gray-100 pt-3 space-y-2">
+              <p className="text-sm font-medium text-gray-900">Submission Details</p>
+              {(Array.isArray(report?.submissions) ? report.submissions : submissions).length === 0 ? (
+                <p className="text-sm text-gray-500">No submissions available.</p>
+              ) : (
+                (Array.isArray(report?.submissions) ? report.submissions : submissions).map((item: ExamSubmission) => {
+                  const scans = resolveScanEntries(item) || [];
+                  const feedback = parseSubmissionFeedback(item);
+                  const mergedPdfUrl = feedback.mergedPdfUrl || scans.find((scan) => !!scan.mergedPdfUrl)?.mergedPdfUrl || null;
+                  const isExpanded = expandedSubmissionId === item.id;
+                  const isInlineEditing = inlineEditScore?.submissionId === item.id;
+                  const detectedCount = item.objectiveDetectedCount ?? feedback.objectiveDetectedCount ?? Object.keys(feedback.objectiveAnswers).filter((key) => !!feedback.objectiveAnswers[key]).length;
+                  const correctCount = item.objectiveCorrectCount ?? feedback.objectiveCorrectCount;
+                  return (
+                    <div key={item.id} className="border border-gray-200 rounded-lg p-3 space-y-2">
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <div className="flex-1">
+                          <p className="text-sm font-medium text-gray-900">{item.student?.fullName} ({item.student?.username})</p>
+                          <div className="flex gap-4 text-xs text-gray-500 mt-0.5">
+                            <span>Status: <span className={item.status === 'GRADED' ? 'text-green-700' : item.status === 'FINALIZED' ? 'text-primary-700' : 'text-gray-700'}>{item.status}</span></span>
+                            <span>MCQ: <span className="font-medium text-blue-700">{feedback.objectiveScore ?? '-'}</span></span>
+                            <span>Essay: <span className="font-medium text-orange-700">{feedback.essayScore ?? '-'}</span></span>
+                            <span>Total: <span className="font-medium text-gray-900">{feedback.totalScore ?? item.finalScore ?? '-'}</span></span>
+                            <span>OMR detected: <span className="font-medium text-blue-700">{detectedCount ?? '-'}</span></span>
+                            <span>Correct MCQ: <span className="font-medium text-emerald-700">{correctCount ?? '-'}</span></span>
+                            <span>Scans: {scans?.length ?? 0}</span>
+                          </div>
+                        </div>
+                        <div className="flex gap-1.5 flex-wrap">
+                          <button className="btn-secondary text-[11px]" onClick={() => setExpandedSubmissionId(isExpanded ? null : item.id)}>
+                            <Eye size={12} className="inline mr-0.5" />{isExpanded ? 'Hide' : 'Details'}
+                          </button>
+                          <button
+                            className="btn-secondary text-[11px]"
+                            onClick={() => handleRegrade(item.id)}
+                            disabled={regradingSubmissionId === item.id}
+                          >
+                            <RefreshCw size={12} className="inline mr-0.5" />
+                            {regradingSubmissionId === item.id ? '...' : 'AI Regrade'}
+                          </button>
+                          {isInlineEditing ? (
+                            <div className="flex gap-1 flex-wrap justify-end">
+                              <input
+                                type="number"
+                                className="input-field text-xs w-20 py-0.5"
+                                value={inlineEditScore.objectiveScore}
+                                onChange={(e) => {
+                                  const objectiveScore = e.target.value;
+                                  const nextTotal = Number(objectiveScore || 0) + Number(inlineEditScore.essayScore || 0);
+                                  setInlineEditScore({ ...inlineEditScore, objectiveScore, totalScore: Number(nextTotal.toFixed(2)).toString() });
+                                }}
+                                onKeyDown={(e) => e.key === 'Enter' && saveInlineScore()}
+                                aria-label="MCQ score"
+                                autoFocus
+                              />
+                              <input
+                                type="number"
+                                className="input-field text-xs w-20 py-0.5"
+                                value={inlineEditScore.essayScore}
+                                onChange={(e) => {
+                                  const essayScore = e.target.value;
+                                  const nextTotal = Number(inlineEditScore.objectiveScore || 0) + Number(essayScore || 0);
+                                  setInlineEditScore({ ...inlineEditScore, essayScore, totalScore: Number(nextTotal.toFixed(2)).toString() });
+                                }}
+                                onKeyDown={(e) => e.key === 'Enter' && saveInlineScore()}
+                                aria-label="Essay score"
+                              />
+                              <input
+                                type="number"
+                                className="input-field text-xs w-20 py-0.5"
+                                value={inlineEditScore.totalScore}
+                                onChange={(e) => setInlineEditScore({ ...inlineEditScore, totalScore: e.target.value })}
+                                onKeyDown={(e) => e.key === 'Enter' && saveInlineScore()}
+                                aria-label="Total score"
+                              />
+                              <button className="btn-primary text-[10px] px-2" onClick={saveInlineScore}>✓</button>
+                              <button className="btn-secondary text-[10px] px-2" onClick={() => setInlineEditScore(null)}>✗</button>
+                            </div>
+                          ) : (
+                            <button
+                              className="btn-secondary text-[11px]"
+                              onClick={() => setInlineEditScore({
+                                submissionId: item.id,
+                                objectiveScore: String(feedback.objectiveScore ?? 0),
+                                essayScore: String(feedback.essayScore ?? 0),
+                                totalScore: String(feedback.totalScore ?? item.finalScore ?? 0),
+                              })}
+                            >
+                              Edit Score
+                            </button>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Expanded Details */}
+                      {isExpanded && (
+                        <div className="border-t border-gray-100 pt-2 space-y-2">
+                          {mergedPdfUrl && (
+                            <p className="text-xs text-primary-700">
+                              <a href={mergedPdfUrl} target="_blank" rel="noreferrer" className="underline">Open merged submission PDF</a>
+                            </p>
+                          )}
+
+                          {scans?.length === 0 ? (
+                            <p className="text-xs text-gray-500">No scan images available for this submission.</p>
+                          ) : (
+                            <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                              {feedback.omrAnnotatedImageUrl && (
+                                <a
+                                  href={feedback.omrAnnotatedImageUrl}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="border border-primary-200 rounded-md p-2 hover:border-primary-400 transition-colors"
+                                >
+                                  <p className="text-xs text-primary-700 truncate">OMR annotated result</p>
+                                  <img src={feedback.omrAnnotatedImageUrl} alt="omr-annotated-result" className="mt-1 w-full h-24 object-cover rounded" loading="lazy" />
+                                </a>
+                              )}
+                              {scans?.map?.((scan, idx) => {
+                                const href = scan.accessUrl || scan.url || (scan.filename ? `/uploads/scans/${encodeURIComponent(scan.filename)}` : '');
+                                if (!href) return null;
+
+                                return (
+                                  <a
+                                    key={`${item.id}-${idx}`}
+                                    href={href}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="border border-gray-200 rounded-md p-2 hover:border-primary-300 transition-colors"
+                                  >
+                                    <p className="text-xs text-primary-700 truncate">Scan {idx + 1} {scan.passIndex ? `(Pass ${scan.passIndex})` : ''}</p>
+                                    <img src={href} alt={`scan-${idx + 1}`} className="mt-1 w-full h-24 object-cover rounded" loading="lazy" />
+                                  </a>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          {feedback.warnings.length > 0 && (
+                            <p className="text-xs text-amber-700">Warnings: {feedback.warnings.join(' | ')}</p>
+                          )}
+
+                          {renderEssayGradingDetails(feedback)}
+
+                          {feedback.aiComments && (
+                            <p className="text-xs text-blue-700">AI comments: {feedback.aiComments}</p>
+                          )}
+
+                          {feedback.aiReport && (
+                            <div className="border border-gray-100 bg-gray-50 rounded-md p-2 space-y-1">
+                              <p className="text-xs font-medium text-gray-900">AI Report</p>
+                              {feedback.aiReport.summary && (
+                                <p className="text-xs text-gray-700">Summary: {feedback.aiReport.summary}</p>
+                              )}
+                              {feedback.aiReport.strengths.length > 0 && (
+                                <p className="text-xs text-green-700">Strengths: {feedback.aiReport.strengths.join(' | ')}</p>
+                              )}
+                              {feedback.aiReport.weaknesses.length > 0 && (
+                                <p className="text-xs text-amber-700">Weaknesses: {feedback.aiReport.weaknesses.join(' | ')}</p>
+                              )}
+                              {feedback.aiReport.recommendations.length > 0 && (
+                                <p className="text-xs text-blue-700">Recommendations: {feedback.aiReport.recommendations.join(' | ')}</p>
+                              )}
+                              {feedback.aiReport.integrityFlags.length > 0 && (
+                                <p className="text-xs text-red-700">Integrity flags: {feedback.aiReport.integrityFlags.join(' | ')}</p>
+                              )}
+                            </div>
+                          )}
+
+                          {/* Grading Audit Log */}
+                          {Array.isArray(item.grades) && item.grades.length > 0 && (
+                            <div className="border border-gray-100 bg-gray-50 rounded-md p-2 space-y-1">
+                              <p className="text-xs font-medium text-gray-900">Grading History</p>
+                              {item.grades.map((grade) => (
+                                <p key={grade.id} className="text-xs text-gray-600">
+                                  {grade.method} — MCQ: {grade.objectiveScore} • Essay: {grade.essayScore} • Total: {grade.totalScore} • {new Date(grade.createdAt).toLocaleString()}
+                                </p>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+
+        {tab === 'EXAM_VIEW' && (
+          <div className="card p-5 space-y-3">
+            <div className="flex items-center justify-between">
+              <h2 className="font-semibold text-gray-900">Session Exam</h2>
+              <div className="flex gap-2">
+                <button className="btn-secondary text-xs" onClick={() => openTransferDialog('CLONE')} disabled={!selectedExam}>
+                  <Copy size={14} className="inline mr-1" /> Use This Exam For Another Session
+                </button>
+                <button className="btn-secondary text-xs" onClick={() => openTransferDialog('REUSE')} disabled={!selectedExam}>
+                  <Repeat size={14} className="inline mr-1" /> Use This Config For Another Session
+                </button>
+                <button className="btn-secondary text-xs" onClick={exportExam}>Print Exam</button>
+                <button className="btn-secondary text-xs" onClick={exportAnswerKey}>
+                  <Download size={14} className="inline mr-1" />Answer Key
+                </button>
+              </div>
+            </div>
+            {!selectedExam || !selectedExam.questions ? (
+              <p className="text-sm text-gray-500">No exam loaded.</p>
+            ) : (
+              <div className="space-y-4">
+                <div className="grid md:grid-cols-4 gap-3">
+                  <div className="border border-gray-200 rounded-lg p-3">
+                    <p className="text-xs text-gray-500">Multiple Choice</p>
+                    <p className="text-xl font-bold text-blue-700">{examQuestionStats.mcq}</p>
+                  </div>
+                  <div className="border border-gray-200 rounded-lg p-3">
+                    <p className="text-xs text-gray-500">Essay</p>
+                    <p className="text-xl font-bold text-orange-700">{examQuestionStats.essay}</p>
+                  </div>
+                  <div className="border border-gray-200 rounded-lg p-3">
+                    <p className="text-xs text-gray-500">Difficulty Mix</p>
+                    <p className="text-sm font-medium text-gray-900">
+                      MCQ {parsedExamRequirements?.difficultyDistribution?.multipleChoice ? `${parsedExamRequirements.difficultyDistribution.multipleChoice.easy ?? 0}/${parsedExamRequirements.difficultyDistribution.multipleChoice.medium ?? 0}/${parsedExamRequirements.difficultyDistribution.multipleChoice.hard ?? 0}` : 'n/a'}
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      Essay {parsedExamRequirements?.difficultyDistribution?.essay ? `${parsedExamRequirements.difficultyDistribution.essay.easy ?? 0}/${parsedExamRequirements.difficultyDistribution.essay.medium ?? 0}/${parsedExamRequirements.difficultyDistribution.essay.hard ?? 0}` : 'n/a'}
+                    </p>
+                  </div>
+                  <div className="border border-gray-200 rounded-lg p-3">
+                    <p className="text-xs text-gray-500">Outcome Allocation</p>
+                    <p className="text-sm font-medium text-gray-900">{effectiveOutcomeRatios.length > 0 ? `${effectiveOutcomeRatios.length} outcomes` : 'Not configured'}</p>
+                    {effectiveOutcomeRatios.length > 0 && !parsedExamRequirements?.outcomeRatios?.length && (
+                      <p className="text-xs text-gray-500">Default even split applied automatically.</p>
+                    )}
+                  </div>
+                </div>
+
+                {effectiveOutcomeRatios.length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {effectiveOutcomeRatios.map((item, idx) => (
+                      <span key={`${item.learningOutcomeId || idx}`} className="rounded-full bg-primary-50 border border-primary-200 px-3 py-1 text-xs text-primary-700">
+                        LO {item.learningOutcomeId ?? idx + 1}: {(Math.round(item.ratio * 100) / 100).toFixed(2)}%
+                      </span>
+                    ))}
+                  </div>
+                )}
+
+                <div className="space-y-2">
+                  {selectedExam.questions.map((item, idx) => (
+                    <div key={item.question.id} className="border border-gray-200 rounded-lg p-3">
+                      <p className="text-sm font-medium text-gray-900">Q{idx + 1}. {item.question.content}</p>
+                      <p className="text-xs text-gray-500">{item.question.type}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {classDialogMode && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
+            <div className="w-full max-w-lg rounded-xl bg-white p-5 shadow-2xl space-y-4">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900">
+                    {classDialogMode === 'CLONE' ? 'Clone Exam' : 'Reuse Config'}
+                  </h3>
+                  <p className="text-sm text-gray-500">
+                    {classDialogMode === 'CLONE'
+                      ? 'Choose the target class. The new draft will keep all questions from this session.'
+                      : 'Choose the target class. The new draft will keep the exam structure but start with an empty question list.'}
+                  </p>
+                </div>
+                <button className="btn-secondary text-xs" onClick={closeTransferDialog} disabled={transferLoading}>
+                  Close
+                </button>
+              </div>
+
+              <div className="space-y-2">
+                <label className="block text-sm font-medium text-gray-700">Target class</label>
+                <select
+                  className="input-field"
+                  value={selectedTargetClassId}
+                  onChange={(e) => setSelectedTargetClassId(e.target.value)}
+                  disabled={transferLoading}
+                >
+                  <option value="">-- Select class --</option>
+                  {classes.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="grid md:grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-700">Exam title</label>
+                  <input
+                    className="input-field"
+                    value={transferTitle}
+                    onChange={(e) => setTransferTitle(e.target.value)}
+                    placeholder="Enter exam title"
+                    disabled={transferLoading}
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="block text-sm font-medium text-gray-700">Duration (minutes)</label>
+                  <input
+                    className="input-field"
+                    type="number"
+                    min={15}
+                    value={transferDuration}
+                    onChange={(e) => setTransferDuration(e.target.value)}
+                    disabled={transferLoading}
+                  />
+                </div>
+              </div>
+
+              <div className="flex justify-end gap-2">
+                <button className="btn-secondary" onClick={closeTransferDialog} disabled={transferLoading}>Cancel</button>
+                <button className="btn-primary" onClick={executeTransfer} disabled={transferLoading || !selectedTargetClassId}>
+                  {transferLoading ? 'Preparing...' : 'Continue to Exam Builder'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Draft Viewing Modal */}
+      {viewingDraft && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4 backdrop-blur-sm" onClick={closeDraftDetail}>
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="p-4 border-b flex items-center justify-between bg-gray-50">
+              <div>
+                <h3 className="font-semibold text-gray-900">
+                {viewingDraft.status === 'VALID' && viewingDraft.student 
+                  ? `Exam Pages for ${viewingDraft.student.fullName} (${viewingDraft.student.username})` 
+                  : `Draft #${viewingDraft.id} Details`}
+                </h3>
+                <p className="text-xs text-gray-500">Drag and drop pages to reorder, then save.</p>
+                {(viewingDraft.status === 'UNIDENTIFIED' || viewingDraft.status === 'PENDING') && (
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
+                    <select
+                      className="input-field text-xs min-w-[240px]"
+                      value={selectedAssignStudentId}
+                      onChange={(e) => setSelectedAssignStudentId(e.target.value)}
+                      disabled={assigningDraftId === viewingDraft.id}
+                    >
+                      <option value="">Select student to assign</option>
+                      {classStudentsForAssign.map((student) => (
+                        <option key={student.id} value={student.id}>
+                          {student.fullName} ({student.username})
+                        </option>
+                      ))}
+                    </select>
+                    <button
+                      className="btn-secondary text-xs"
+                      onClick={handleAssignDraftStudent}
+                      disabled={!selectedAssignStudentId || assigningDraftId === viewingDraft.id}
+                    >
+                      {assigningDraftId === viewingDraft.id ? 'Assigning...' : 'Assign To Student'}
+                    </button>
+                  </div>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  className="btn-primary text-xs"
+                  onClick={handleSaveDraftPageOrder}
+                  disabled={
+                    savingDraftPageOrder
+                    || draftPageOrder.length === 0
+                    || JSON.stringify(draftPageOrder) === JSON.stringify(draftPageOrderInitial)
+                  }
+                >
+                  {savingDraftPageOrder ? 'Saving...' : 'Save Page Order'}
+                </button>
+                <button className="text-gray-500 hover:text-gray-700" onClick={closeDraftDetail}>
+                  <XCircle size={24} />
+                </button>
+              </div>
+            </div>
+            <div className="p-4 overflow-y-auto flex-1 bg-gray-200">
+              <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3 max-w-5xl mx-auto">
+                {draftPageOrder.map((url, pageIdx) => (
+                  <div
+                    key={`${url}-${pageIdx}`}
+                    className="bg-white p-2 rounded shadow-sm border border-gray-200 cursor-move"
+                    draggable
+                    onDragStart={() => setDraggedDraftPageIdx(pageIdx)}
+                    onDragOver={(e) => e.preventDefault()}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      if (draggedDraftPageIdx === null || draggedDraftPageIdx === pageIdx) return;
+                      setDraftPageOrder((prev) => {
+                        const reordered = [...prev];
+                        const [draggedItem] = reordered.splice(draggedDraftPageIdx, 1);
+                        reordered.splice(pageIdx, 0, draggedItem);
+                        return reordered;
+                      });
+                      setDraggedDraftPageIdx(null);
+                    }}
+                    onDragEnd={() => setDraggedDraftPageIdx(null)}
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-sm font-medium text-gray-700">Page {pageIdx + 1}</p>
+                      <div className="flex items-center gap-1">
+                        <button
+                          className="btn-secondary text-[10px] px-2 py-1"
+                          onClick={() => setViewingDraftImagePath(url)}
+                          title="View this image"
+                        >
+                          <Eye size={12} className="inline mr-1" />
+                          View
+                        </button>
+                        <GripVertical size={14} className="text-gray-500" />
+                      </div>
+                    </div>
+                    <img
+                      src={`/${url}`}
+                      alt={`Page ${pageIdx + 1}`}
+                      className="w-full h-44 object-cover border border-gray-300 rounded cursor-zoom-in"
+                      onClick={() => setViewingDraftImagePath(url)}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewingDraftImagePath && (
+        <div className="fixed inset-0 z-[70] bg-black/85 flex items-center justify-center p-4" onClick={() => setViewingDraftImagePath(null)}>
+          <div className="bg-white rounded-xl shadow-2xl max-w-5xl max-h-[92vh] flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()}>
+            <div className="p-3 border-b flex items-center justify-between bg-gray-50">
+              <h3 className="font-semibold text-gray-900">Draft Page Preview</h3>
+              <button className="text-gray-500 hover:text-gray-700" onClick={() => setViewingDraftImagePath(null)}>
+                <XCircle size={24} />
+              </button>
+            </div>
+            <div className="p-2 bg-gray-100 overflow-auto flex items-center justify-center">
+              <img
+                src={viewingDraftImagePath.startsWith('http://') || viewingDraftImagePath.startsWith('https://') ? viewingDraftImagePath : `/${viewingDraftImagePath}`}
+                alt="Draft page preview"
+                className="max-w-full max-h-[82vh] object-contain rounded"
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Staged Image Viewing Modal */}
+      {(isCheckingIdentity || gradingInProgress) && (
+        <div className="pointer-events-none fixed right-4 top-4 z-[70] w-[min(22rem,calc(100vw-2rem))] rounded-lg border border-gray-200 bg-white/95 p-3 shadow-xl">
+          <div className="flex items-start gap-2">
+            <Loader2 size={18} className="mt-0.5 animate-spin text-primary-700" />
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold text-gray-900">
+                {gradingInProgress ? 'Grading in progress' : 'Checking identities'}
+              </p>
+              <p className="mt-0.5 text-xs text-gray-600">
+                {gradingInProgress
+                  ? `${Math.round(gradingProgress?.progress || 0)}% complete. You can continue working in other tabs.`
+                  : `${identityProgress?.processed ?? 0}/${identityProgress?.total ?? draftScans.length} drafts processed.`}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewingStagedImageIdx !== null && stagedFiles[viewingStagedImageIdx] && (
+        <div className="fixed inset-0 z-[60] bg-black/80 flex items-center justify-center p-4 backdrop-blur-sm" onClick={() => setViewingStagedImageIdx(null)}>
+          <div className="bg-white rounded-xl shadow-2xl max-w-4xl max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+            <div className="p-3 border-b flex items-center justify-between bg-gray-50">
+              <h3 className="font-semibold text-gray-900">Image Preview</h3>
+              <div className="flex items-center gap-2">
+                <button
+                  className="btn-primary text-xs"
+                  onClick={() => {
+                    setReplacingIdx(viewingStagedImageIdx);
+                    replaceInputRef.current?.click();
+                  }}
+                >
+                  Replace Image
+                </button>
+                <button className="text-gray-500 hover:text-gray-700" onClick={() => setViewingStagedImageIdx(null)}>
+                  <XCircle size={24} />
+                </button>
+              </div>
+            </div>
+            <div className="p-2 overflow-auto flex items-center justify-center bg-gray-100">
+              <img src={stagedFiles[viewingStagedImageIdx].preview} alt="Preview" className="max-w-full max-h-[80vh] object-contain rounded" />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {gradingCompleteDialog && (
+        <div className="fixed inset-0 z-[65] flex items-center justify-center bg-black/50 px-4">
+          <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-2xl space-y-4">
+            <div className="flex items-start gap-3">
+              <div className="mt-0.5 rounded-full bg-green-100 p-2 text-green-700">
+                <CheckCircle2 size={20} />
+              </div>
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900">Grading Completed</h3>
+                <p className="mt-1 text-sm text-gray-600">
+                  {gradingCompleteDialog.gradedCount}/{gradingCompleteDialog.totalSubmissions} submissions are ready in the report.
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button className="btn-secondary text-sm" onClick={() => setGradingCompleteDialog(null)}>
+                Stay Here
+              </button>
+              <button
+                className="btn-primary text-sm"
+                onClick={() => {
+                  setGradingCompleteDialog(null);
+                  setTab('REPORT');
+                }}
+              >
+                View Report
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Hidden file input for replacing an image */}
+      <input
+        type="file"
+        ref={replaceInputRef}
+        className="hidden"
+        accept="image/*"
+        onChange={handleReplaceFile}
+      />
+    </Layout>
+  );
+};
+
+export default TeacherSessionManagement;

@@ -14,16 +14,25 @@
     "prisma:studio": "prisma studio",
     "setup": "npm install && npx prisma generate && npx prisma migrate dev --name init && ts-node prisma/seed.ts"
   },
+  "opencv4nodejs": {
+    "disableAutoBuild": "1"
+  },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
     "@prisma/client": "^5.22.0",
+    "@u4/opencv4nodejs": "^7.1.2",
     "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.9.0",
     "cors": "^2.8.5",
     "docx": "^8.5.0",
+    "docxtemplater": "^3.68.3",
     "dotenv": "^16.4.5",
     "express": "^4.21.0",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.1.1",
+    "pdf-lib": "^1.17.1",
+    "pizzip": "^3.2.0",
+    "sharp": "^0.34.5",
     "socket.io": "^4.7.5",
     "xlsx": "^0.18.5"
   },
@@ -34,6 +43,7 @@
     "@types/jsonwebtoken": "^9.0.7",
     "@types/multer": "^2.1.0",
     "@types/node": "^22.7.5",
+    "glob": "^11.1.0",
     "prisma": "^5.22.0",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",

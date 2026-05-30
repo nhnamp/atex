@@ -32,7 +32,7 @@ export const getSessionsByClass = async (req: AuthRequest, res: Response): Promi
 
 export const getClassAttendanceSummary = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const classId = parseInt(String(req.params.classId));
+    const classId = parseInt(String(req.params.classId), 10);
     const cls = await prisma.class.findUnique({ where: { id: classId } });
 
     if (!cls || cls.teacherId !== req.user!.id) {
@@ -110,7 +110,7 @@ export const getClassAttendanceSummary = async (req: AuthRequest, res: Response)
 
 export const getSessionStatus = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(String(req.params.id));
+    const id = parseInt(String(req.params.id), 10);
     const session = await prisma.attendanceSession.findUnique({
       where: { id },
       include: { class: true },
@@ -155,7 +155,7 @@ export const getSessionStatus = async (req: AuthRequest, res: Response): Promise
 
 export const endSession = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const id = parseInt(String(req.params.id));
+    const id = parseInt(String(req.params.id), 10);
     const session = await prisma.attendanceSession.findUnique({
       where: { id },
       include: { class: true },
@@ -237,7 +237,7 @@ export const deleteSession = async (req: AuthRequest, res: Response): Promise<vo
 
 export const getSessionRecords = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const sessionId = parseInt(String(req.params.id));
+    const sessionId = parseInt(String(req.params.id), 10);
     const session = await prisma.attendanceSession.findUnique({
       where: { id: sessionId },
       include: { class: true },
@@ -374,7 +374,7 @@ export const createFaceSession = async (req: AuthRequest, res: Response): Promis
  */
 export const submitFaceAttendance = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const sessionId = parseInt(String(req.params.id));
+    const sessionId = parseInt(String(req.params.id), 10);
     const { studentIds } = req.body;
 
     if (!studentIds || !Array.isArray(studentIds) || studentIds.length === 0) {

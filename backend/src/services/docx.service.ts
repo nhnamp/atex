@@ -1,17 +1,22 @@
+import fs from 'fs';
+import path from 'path';
+import PizZip from 'pizzip';
+import Docxtemplater from 'docxtemplater';
+import sharp from 'sharp';
 import {
-  Document,
-  Packer,
-  Paragraph,
-  TextRun,
-  HeadingLevel,
   AlignmentType,
   BorderStyle,
+  Document,
+  HeadingLevel,
+  Packer,
+  PageBreak,
+  Paragraph,
   Table,
-  TableRow,
   TableCell,
+  TableRow,
+  TextRun,
+  VerticalAlign,
   WidthType,
-  ShadingType,
-  NumberFormat,
 } from 'docx';
 
 interface Question {
@@ -20,237 +25,721 @@ interface Question {
   content: string;
   answer: string;
   options: string | null;
+  learningOutcome?: { code?: string; description?: string } | null;
 }
 
-export const generateExamDocx = async (
-  examTitle: string,
-  subjectName: string,
-  teacherName: string,
-  questions: Question[]
+type RenderQuestion = {
+  question_id: number;
+  index: number;
+  title: string;
+  question: string;
+  content: string;
+  score: string;
+  essay_score: string;
+  outcomes_text: string;
+  marker_code: string;
+  marker_label: string;
+  answer_start_marker: string;
+  answer_end_marker: string;
+};
+
+type RenderMcq = RenderQuestion & {
+  [key: string]: unknown;
+  options: {
+    A: string;
+    B: string;
+    C: string;
+    D: string;
+  };
+  option_a: string;
+  option_b: string;
+  option_c: string;
+  option_d: string;
+  optionsA: string;
+  optionsB: string;
+  optionsC: string;
+  optionsD: string;
+};
+
+type RenderEssay = RenderQuestion;
+
+type OmrBubble = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  option: string;
+};
+
+type OmrQuestionRegion = {
+  questionId: number;
+  bubbles: OmrBubble[];
+};
+
+export interface ExamScanBlueprint {
+  version: number;
+  scannablePages: number;
+  hasMcq: boolean;
+  passPurposeByIndex: Record<string, string>;
+  identityPlaceholders: Array<{
+    key: string;
+    label: string;
+    pageIndex: number;
+    region: { x: number; y: number; width: number; height: number };
+  }>;
+  markerAnchors: Array<{
+    questionId: number;
+    markerCode: string;
+    markerLabel: string;
+    answerStartMarker: string;
+    answerEndMarker: string;
+    passIndex: number;
+    pageIndex: number;
+    purpose: string;
+  }>;
+  omrTemplate?: {
+    referenceWidth: number;
+    referenceHeight: number;
+    darknessThreshold: number;
+    questions: OmrQuestionRegion[];
+  };
+}
+
+const ALLOWED_TEMPLATE_FILES = new Set([
+  'template-omr-essay-ai-scan.docx',
+  'template-full-essay-ai-scan.docx',
+  'template-answer-key.docx',
+]);
+
+const resolveTemplatePath = (templateFileName: string): string => {
+  if (!ALLOWED_TEMPLATE_FILES.has(templateFileName)) {
+    throw new Error(`Unsupported template file: ${templateFileName}`);
+  }
+
+  const candidates = [
+    // Prefer workspace-level template folder so updates in repository take effect first
+    path.join(process.cwd(), 'template', templateFileName),
+    // Fallbacks for different runtime layouts (compiled JS under backend/dist/...)
+    path.resolve(__dirname, '../../../template', templateFileName),
+    path.join(process.cwd(), '..', 'template', templateFileName),
+  ];
+
+  const found = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!found) {
+    throw new Error(`Template file not found: ${templateFileName}`);
+  }
+
+  return found;
+};
+
+const sanitizeMultiline = (value: unknown): string => {
+  return String(value ?? '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim();
+};
+
+const parseOptions = (rawOptions: string | null): string[] => {
+  if (!rawOptions) return [];
+  try {
+    const parsed = JSON.parse(rawOptions) as unknown;
+    if (Array.isArray(parsed)) {
+      return parsed.map((item) => sanitizeMultiline(item));
+    }
+
+    if (parsed && typeof parsed === 'object') {
+      const obj = parsed as Record<string, unknown>;
+      return [
+        sanitizeMultiline(obj.A || obj.a || ''),
+        sanitizeMultiline(obj.B || obj.b || ''),
+        sanitizeMultiline(obj.C || obj.c || ''),
+        sanitizeMultiline(obj.D || obj.d || ''),
+      ];
+    }
+
+    return [];
+  } catch {
+    const lines = String(rawOptions)
+      .split(/\n|\r\n|\r/)
+      .map((line) => line.replace(/^\s*[A-D][\).:\-]?\s*/i, '').trim())
+      .filter(Boolean);
+    return lines.slice(0, 4);
+  }
+};
+
+const buildOutcomesText = (question: Question): string => {
+  const code = sanitizeMultiline(question.learningOutcome?.code || '');
+  const description = sanitizeMultiline(question.learningOutcome?.description || '');
+
+  if (code && description) return `${code} - ${description}`;
+  if (code) return code;
+  if (description) return description;
+  return '';
+};
+
+const buildAggregatedOutcomesText = (questions: Question[]): string => {
+  const seen = new Set<string>();
+  const parts: string[] = [];
+  for (const question of questions) {
+    const text = buildOutcomesText(question);
+    if (text && !seen.has(text)) {
+      seen.add(text);
+      parts.push(text);
+    }
+  }
+  return parts.join('\n');
+};
+
+const toRenderableQuestion = (question: Question, index: number, points?: number): RenderQuestion => {
+  const resolvedPoints = Number.isFinite(points) && points! > 0 ? points! : 1;
+  return {
+    question_id: question.id,
+    index: index + 1,
+    title: `Question ${index + 1}`,
+    question: sanitizeMultiline(question.content),
+    content: sanitizeMultiline(question.content),
+    score: resolvedPoints.toFixed(2),
+    essay_score: resolvedPoints.toFixed(2),
+    outcomes_text: buildOutcomesText(question),
+    marker_code: `${question.type === 'MULTIPLE_CHOICE' ? 'MCQ' : 'ESSAY'}_${question.id}`,
+    marker_label: `Mã câu: ${question.type === 'MULTIPLE_CHOICE' ? 'MCQ' : 'ESSAY'}_${question.id}`,
+    answer_start_marker: `BẮT ĐẦU TRẢ LỜI CÂU ${question.id}`,
+    answer_end_marker: `KẾT THÚC TRẢ LỜI CÂU ${question.id}`,
+  };
+};
+
+const REFERENCE_WIDTH = 2480;
+const REFERENCE_HEIGHT = 3508;
+
+const inferScannablePages = (hasMcq: boolean, essayCount: number): number => {
+  return hasMcq ? 1 + essayCount : essayCount;
+};
+
+const normalizeScannablePages = (value: unknown, fallback: number): number => {
+  const normalized = Number.parseInt(String(value), 10);
+  if (Number.isFinite(normalized) && normalized > 0) return normalized;
+  return fallback;
+};
+
+const buildBasePassPurposeByIndex = (mcqs: Question[], essays: Question[]): Record<string, string> => {
+  const hasMcq = mcqs.length > 0;
+  const map: Record<string, string> = {};
+
+  if (essays.length === 0) {
+    map['1'] = 'IDENTITY_OMR';
+    return map;
+  }
+
+  if (hasMcq) {
+    map['1'] = 'IDENTITY_OMR';
+    essays.forEach((essay, index) => {
+      map[String(index + 2)] = `ESSAY_${essay.id}`;
+    });
+    return map;
+  }
+
+  essays.forEach((essay, index) => {
+    map[String(index + 1)] = `IDENTITY_ESSAY_${essay.id}`;
+  });
+  return map;
+};
+
+const buildDefaultIdentityPlaceholders = () => {
+  return [
+    {
+      key: 'student_order',
+      label: 'Số thứ tự',
+      pageIndex: 1,
+      region: { x: 220, y: 320, width: 420, height: 90 },
+    },
+    {
+      key: 'student_name',
+      label: 'Họ tên sinh viên',
+      pageIndex: 1,
+      region: { x: 700, y: 320, width: 1020, height: 90 },
+    },
+    {
+      key: 'student_id',
+      label: 'Mã số sinh viên',
+      pageIndex: 1,
+      region: { x: 1780, y: 320, width: 480, height: 90 },
+    },
+  ];
+};
+
+const buildDefaultOmrTemplate = (mcqs: Question[]) => {
+  if (mcqs.length === 0) return undefined;
+
+  const columnCount = 4;
+  const rowsPerColumn = 13;
+  const mcqRoi = { x: 0.09, y: 0.467, width: 0.85, height: 0.452 };
+  const headerRatio = 0.07;
+  const bubbleStart = 0.17;
+  const bubbleEnd = 0.91;
+  const bubbleSpan = bubbleEnd - bubbleStart;
+  const roiX = mcqRoi.x * REFERENCE_WIDTH;
+  const roiY = mcqRoi.y * REFERENCE_HEIGHT;
+  const roiWidth = mcqRoi.width * REFERENCE_WIDTH;
+  const roiHeight = mcqRoi.height * REFERENCE_HEIGHT;
+  const columnWidth = roiWidth / columnCount;
+  const rowStartY = roiY + roiHeight * headerRatio;
+  const rowHeight = (roiHeight * (1 - headerRatio)) / rowsPerColumn;
+  const bubbleSize = 30;
+
+  const questions: OmrQuestionRegion[] = mcqs.map((question, index) => {
+    const columnIndex = Math.floor(index / rowsPerColumn);
+    const rowIndex = index % rowsPerColumn;
+    const columnX = roiX + columnIndex * columnWidth;
+    const y = rowStartY + (rowIndex + 0.5) * rowHeight - bubbleSize / 2;
+
+    return {
+      questionId: question.id,
+      bubbles: ['A', 'B', 'C', 'D'].map((option, optionIndex) => ({
+        option,
+        x: columnX + (bubbleStart + ((optionIndex + 0.5) / 4) * bubbleSpan) * columnWidth - bubbleSize / 2,
+        y,
+        width: bubbleSize,
+        height: bubbleSize,
+      })),
+    };
+  });
+
+  return {
+    referenceWidth: REFERENCE_WIDTH,
+    referenceHeight: REFERENCE_HEIGHT,
+    darknessThreshold: 165,
+    questions,
+  };
+};
+
+export const buildExamScanBlueprint = (
+  mcqs: Question[],
+  essays: Question[],
+  overrides?: Partial<ExamScanBlueprint>
+): ExamScanBlueprint => {
+  const hasMcq = mcqs.length > 0;
+  const inferredScannablePages = inferScannablePages(hasMcq, essays.length);
+  const scannablePages = inferredScannablePages > 0 ? inferredScannablePages : 1;
+
+  const passPurposeByIndex = {
+    ...buildBasePassPurposeByIndex(mcqs, essays),
+    ...(overrides?.passPurposeByIndex || {}),
+  };
+
+  for (let pageIndex = 1; pageIndex <= scannablePages; pageIndex += 1) {
+    const key = String(pageIndex);
+    if (!passPurposeByIndex[key]) {
+      passPurposeByIndex[key] = `PAGE_${pageIndex}`;
+    }
+  }
+
+  const markerAnchors = [
+    ...mcqs.map((question) => ({
+      questionId: question.id,
+      markerCode: `MCQ_${question.id}`,
+      markerLabel: `Mã câu: MCQ_${question.id}`,
+      answerStartMarker: '',
+      answerEndMarker: '',
+      passIndex: 1,
+      pageIndex: 1,
+      purpose: passPurposeByIndex['1'] || 'IDENTITY_OMR',
+    })),
+    ...essays.map((question, index) => {
+      const passIndex = hasMcq ? index + 2 : index + 1;
+      const purpose = passPurposeByIndex[String(passIndex)]
+        || (hasMcq ? `ESSAY_${question.id}` : `IDENTITY_ESSAY_${question.id}`);
+
+      return {
+        questionId: question.id,
+        markerCode: `ESSAY_${question.id}`,
+        markerLabel: `Mã câu: ESSAY_${question.id}`,
+        answerStartMarker: `BẮT ĐẦU TRẢ LỜI CÂU ${question.id}`,
+        answerEndMarker: `KẾT THÚC TRẢ LỜI CÂU ${question.id}`,
+        passIndex,
+        pageIndex: passIndex,
+        purpose,
+      };
+    }),
+  ];
+
+  return {
+    version: 1,
+    scannablePages,
+    hasMcq,
+    passPurposeByIndex,
+    identityPlaceholders: overrides?.identityPlaceholders || buildDefaultIdentityPlaceholders(),
+    markerAnchors: overrides?.markerAnchors || markerAnchors,
+    omrTemplate: overrides?.omrTemplate || buildDefaultOmrTemplate(mcqs),
+  };
+};
+
+const buildExamCoverBlock = (subject: string, duration: number, examCode: string): Array<Paragraph | Table> => {
+  return [
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      heading: HeadingLevel.HEADING_1,
+      children: [new TextRun({ text: 'EXAM PAPER', bold: true })],
+      spacing: { after: 160 },
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      children: [new TextRun({ text: `Subject: ${sanitizeMultiline(subject)}`, bold: true })],
+      spacing: { after: 80 },
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      children: [new TextRun({ text: `Duration: ${duration} minutes` })],
+      spacing: { after: 80 },
+    }),
+    new Paragraph({
+      alignment: AlignmentType.CENTER,
+      children: [new TextRun({ text: `Exam Code: ${examCode}` })],
+      spacing: { after: 220 },
+    }),
+    new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE },
+      rows: [
+        new TableRow({
+          children: [
+            new TableCell({ children: [new Paragraph({ text: 'Order No:' })] }),
+            new TableCell({ children: [new Paragraph({ text: 'Full Name:' })] }),
+            new TableCell({ children: [new Paragraph({ text: 'Student ID:' })] }),
+          ],
+        }),
+        new TableRow({
+          children: [
+            new TableCell({ children: [new Paragraph({ text: '____________________' })] }),
+            new TableCell({ children: [new Paragraph({ text: '______________________________' })] }),
+            new TableCell({ children: [new Paragraph({ text: '____________________' })] }),
+          ],
+        }),
+      ],
+    }),
+    new Paragraph({ text: '', spacing: { after: 120 } }),
+  ];
+};
+
+const buildOmrTable = (mcqs: Question[]): Table => {
+  const header = new TableRow({
+    children: [
+      new TableCell({
+        children: [new Paragraph({ text: 'Question', alignment: AlignmentType.CENTER })],
+        verticalAlign: VerticalAlign.CENTER,
+      }),
+      new TableCell({ children: [new Paragraph({ text: 'A', alignment: AlignmentType.CENTER })] }),
+      new TableCell({ children: [new Paragraph({ text: 'B', alignment: AlignmentType.CENTER })] }),
+      new TableCell({ children: [new Paragraph({ text: 'C', alignment: AlignmentType.CENTER })] }),
+      new TableCell({ children: [new Paragraph({ text: 'D', alignment: AlignmentType.CENTER })] }),
+    ],
+    tableHeader: true,
+  });
+
+  const rows = mcqs.map((mcq, index) => new TableRow({
+    children: [
+      new TableCell({
+        children: [new Paragraph({ text: `${index + 1}. MCQ_${mcq.id}` })],
+        verticalAlign: VerticalAlign.CENTER,
+      }),
+      new TableCell({ children: [new Paragraph({ text: '○', alignment: AlignmentType.CENTER })] }),
+      new TableCell({ children: [new Paragraph({ text: '○', alignment: AlignmentType.CENTER })] }),
+      new TableCell({ children: [new Paragraph({ text: '○', alignment: AlignmentType.CENTER })] }),
+      new TableCell({ children: [new Paragraph({ text: '○', alignment: AlignmentType.CENTER })] }),
+    ],
+  }));
+
+  return new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    rows: [header, ...rows],
+    borders: {
+      top: { style: BorderStyle.SINGLE, size: 1, color: '888888' },
+      bottom: { style: BorderStyle.SINGLE, size: 1, color: '888888' },
+      left: { style: BorderStyle.SINGLE, size: 1, color: '888888' },
+      right: { style: BorderStyle.SINGLE, size: 1, color: '888888' },
+      insideHorizontal: { style: BorderStyle.SINGLE, size: 1, color: 'CCCCCC' },
+      insideVertical: { style: BorderStyle.SINGLE, size: 1, color: 'CCCCCC' },
+    },
+  });
+};
+
+const buildEssayAnswerLines = (lineCount: number): Paragraph[] => {
+  const lines: Paragraph[] = [];
+  for (let i = 0; i < lineCount; i += 1) {
+    lines.push(new Paragraph({
+      children: [new TextRun({ text: '....................................................................................................' })],
+      spacing: { after: 100 },
+    }));
+  }
+  return lines;
+};
+
+const buildEssayQuestionBlock = (essay: Question, label: string): Paragraph[] => {
+  return [
+    new Paragraph({
+      heading: HeadingLevel.HEADING_2,
+      children: [new TextRun({ text: label, bold: true })],
+      spacing: { after: 120 },
+    }),
+    new Paragraph({
+      children: [new TextRun({ text: `Mã câu: ESSAY_${essay.id}`, bold: true })],
+      spacing: { after: 80 },
+    }),
+    new Paragraph({
+      children: [new TextRun({ text: sanitizeMultiline(essay.content) })],
+      spacing: { after: 160 },
+    }),
+    new Paragraph({
+      children: [new TextRun({ text: `BẮT ĐẦU TRẢ LỜI CÂU ${essay.id}`, italics: true })],
+      spacing: { after: 80 },
+    }),
+    ...buildEssayAnswerLines(18),
+    new Paragraph({
+      children: [new TextRun({ text: `KẾT THÚC TRẢ LỜI CÂU ${essay.id}`, italics: true })],
+      spacing: { before: 80 },
+    }),
+  ];
+};
+
+const buildLearningOutcomesMappingRows = (mcqs: Question[], essays: Question[]) => {
+  const mapping = new Map<string, string[]>();
+
+  const pushLabel = (outcomeText: string, label: string) => {
+    const key = outcomeText || 'UNMAPPED';
+    const existing = mapping.get(key) || [];
+    existing.push(label);
+    mapping.set(key, existing);
+  };
+
+  mcqs.forEach((question, index) => {
+    pushLabel(buildOutcomesText(question), `MCQ ${index + 1}`);
+  });
+
+  essays.forEach((question, index) => {
+    pushLabel(buildOutcomesText(question), `Essay ${index + 1}`);
+  });
+
+  if (mapping.size === 0) {
+    mapping.set('UNMAPPED', ['No question mapping available']);
+  }
+
+  return Array.from(mapping.entries()).map(([outcome, labels]) => ({
+    outcome,
+    labels: labels.join(', '),
+  }));
+};
+
+const buildLearningOutcomePage = (mcqs: Question[], essays: Question[]): Array<Paragraph | Table> => {
+  const rows = buildLearningOutcomesMappingRows(mcqs, essays);
+
+  const mappingTable = new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    rows: [
+      new TableRow({
+        children: [
+          new TableCell({ children: [new Paragraph({ text: 'Outcome', alignment: AlignmentType.CENTER })] }),
+          new TableCell({ children: [new Paragraph({ text: 'Questions', alignment: AlignmentType.CENTER })] }),
+        ],
+        tableHeader: true,
+      }),
+      ...rows.map((row) => new TableRow({
+        children: [
+          new TableCell({ children: [new Paragraph({ text: row.outcome })] }),
+          new TableCell({ children: [new Paragraph({ text: row.labels })] }),
+        ],
+      })),
+    ],
+    borders: {
+      top: { style: BorderStyle.SINGLE, size: 1, color: '888888' },
+      bottom: { style: BorderStyle.SINGLE, size: 1, color: '888888' },
+      left: { style: BorderStyle.SINGLE, size: 1, color: '888888' },
+      right: { style: BorderStyle.SINGLE, size: 1, color: '888888' },
+      insideHorizontal: { style: BorderStyle.SINGLE, size: 1, color: 'CCCCCC' },
+      insideVertical: { style: BorderStyle.SINGLE, size: 1, color: 'CCCCCC' },
+    },
+  });
+
+  return [
+    new Paragraph({
+      heading: HeadingLevel.HEADING_1,
+      children: [new TextRun({ text: 'Learning Outcomes Mapping' })],
+      spacing: { after: 160 },
+    }),
+    new Paragraph({
+      children: [new TextRun({ text: 'Teacher reference page only - DO NOT SCAN this page.', bold: true })],
+      spacing: { after: 160 },
+    }),
+    mappingTable,
+  ];
+};
+
+const buildOutcomeMappingTableText = (mcqs: Question[], essays: Question[]): string => {
+  const rows = buildLearningOutcomesMappingRows(mcqs, essays).map((row) => ({
+    outcome: sanitizeMultiline(row.outcome || 'UNMAPPED'),
+    labels: sanitizeMultiline(row.labels || '-'),
+  }));
+
+  const outcomeHeader = 'Outcome';
+  const questionsHeader = 'Questions (MCQ & Essay)';
+  const outcomeWidth = Math.min(
+    60,
+    Math.max(outcomeHeader.length, ...rows.map((row) => row.outcome.length))
+  );
+
+  const header = `${outcomeHeader.padEnd(outcomeWidth, ' ')} | ${questionsHeader}`;
+  const divider = `${'-'.repeat(outcomeWidth)}-|-${'-'.repeat(Math.max(questionsHeader.length, 12))}`;
+  const body = rows.map((row) => `${row.outcome.padEnd(outcomeWidth, ' ')} | ${row.labels}`);
+
+  return [header, divider, ...body].join('\n');
+};
+
+const mapEssaysForTemplate = (essays: Question[], pointsMap?: Map<number, number>): RenderEssay[] => {
+  return essays.map((question, index) => ({
+    ...toRenderableQuestion(question, index, pointsMap?.get(question.id)),
+    title: `Essay ${index + 1}`,
+    question: sanitizeMultiline(question.content),
+    content: sanitizeMultiline(question.content),
+  }));
+};
+
+const mapMcqsForTemplate = (mcqs: Question[], pointsMap?: Map<number, number>): RenderMcq[] => {
+  return mcqs.map((question, index) => {
+    const options = parseOptions(question.options);
+    const optionA = options[0] || '';
+    const optionB = options[1] || '';
+    const optionC = options[2] || '';
+    const optionD = options[3] || '';
+
+    return {
+      ...toRenderableQuestion(question, index, pointsMap?.get(question.id)),
+      title: `MCQ ${index + 1}`,
+      question: sanitizeMultiline(question.content),
+      content: sanitizeMultiline(question.content),
+      options: {
+        A: optionA,
+        B: optionB,
+        C: optionC,
+        D: optionD,
+      },
+      option_a: optionA,
+      option_b: optionB,
+      option_c: optionC,
+      option_d: optionD,
+      optionsA: optionA,
+      optionsB: optionB,
+      optionsC: optionC,
+      optionsD: optionD,
+      'options.A': optionA,
+      'options.B': optionB,
+      'options.C': optionC,
+      'options.D': optionD,
+    };
+  });
+};
+
+const generateTemplateExamDocx = async (
+  subject: string,
+  duration: number,
+  mcqs: Question[],
+  essays: Question[],
+  pointsMap?: Map<number, number>
 ): Promise<Buffer> => {
-  const children: Paragraph[] = [];
+  const hasMcq = mcqs.length > 0;
+  const examCode = `EX-${Date.now().toString().slice(-8)}`;
+  const mappedMcqs = mapMcqsForTemplate(mcqs, pointsMap);
+  const mappedEssays = mapEssaysForTemplate(essays, pointsMap);
+  const firstEssayQuestions = mappedEssays.slice(0, 1);
+  const remainingEssayQuestions = mappedEssays.slice(1);
+  const outcomesText = buildOutcomeMappingTableText(mcqs, essays);
 
-  // Header
-  children.push(
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [
-        new TextRun({
-          text: 'UNIVERSITY EXAMINATION',
-          bold: true,
-          size: 28,
-          color: '1D4ED8',
-        }),
-      ],
-      spacing: { after: 100 },
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [
-        new TextRun({
-          text: examTitle,
-          bold: true,
-          size: 32,
-        }),
-      ],
-      spacing: { after: 100 },
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [
-        new TextRun({
-          text: `Subject: ${subjectName}`,
-          size: 24,
-          italics: true,
-        }),
-      ],
-      spacing: { after: 100 },
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [
-        new TextRun({
-          text: `Teacher: ${teacherName}  |  Date: ${new Date().toLocaleDateString('en-US', {
-            year: 'numeric',
-            month: 'long',
-            day: 'numeric',
-          })}`,
-          size: 22,
-        }),
-      ],
-      spacing: { after: 200 },
-    }),
-    new Paragraph({
-      children: [
-        new TextRun({
-          text: '─'.repeat(80),
-          color: '1D4ED8',
-        }),
-      ],
-      spacing: { after: 200 },
-    })
-  );
+  // Compute section totals for template placeholders
+  const mcqFullScore = mappedMcqs.reduce((acc, q) => acc + Number(q.score), 0);
+  const essayFullScore = mappedEssays.reduce((acc, q) => acc + Number(q.score), 0);
 
-  // Student info section
-  children.push(
-    new Paragraph({
-      children: [
-        new TextRun({ text: 'Full Name: ', bold: true, size: 22 }),
-        new TextRun({ text: '_'.repeat(40), size: 22 }),
-        new TextRun({ text: '     Student ID: ', bold: true, size: 22 }),
-        new TextRun({ text: '_'.repeat(15), size: 22 }),
-      ],
-      spacing: { after: 300 },
-    })
-  );
-
-  // Group questions by type
-  const mcQuestions = questions.filter((q) => q.type === 'MULTIPLE_CHOICE');
-  const tfQuestions = questions.filter((q) => q.type === 'TRUE_FALSE');
-  const essayQuestions = questions.filter((q) => q.type === 'ESSAY');
-
-  let questionNumber = 1;
-
-  // Section I: Multiple Choice
-  if (mcQuestions.length > 0) {
-    children.push(
-      new Paragraph({
-        heading: HeadingLevel.HEADING_2,
-        children: [
-          new TextRun({
-            text: `SECTION I: MULTIPLE CHOICE (${mcQuestions.length} questions)`,
-            bold: true,
-            size: 24,
-            color: '1D4ED8',
-          }),
-        ],
-        spacing: { before: 200, after: 200 },
-      })
-    );
-
-    for (const q of mcQuestions) {
-      const opts: string[] = q.options ? JSON.parse(q.options) : [];
-
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: `${questionNumber}. `, bold: true, size: 22 }),
-            new TextRun({ text: q.content, size: 22 }),
-          ],
-          spacing: { before: 150, after: 80 },
-        })
-      );
-
-      const labels = ['A', 'B', 'C', 'D', 'E'];
-      opts.forEach((opt, i) => {
-        children.push(
-          new Paragraph({
-            indent: { left: 360 },
-            children: [
-              new TextRun({ text: `${labels[i]}. ${opt}`, size: 22 }),
-            ],
-            spacing: { after: 40 },
-          })
-        );
-      });
-
-      children.push(new Paragraph({ children: [new TextRun({ text: '' })], spacing: { after: 80 } }));
-      questionNumber++;
-    }
+  if (hasMcq) {
+    const blueprint = buildExamScanBlueprint(mcqs, essays);
+    return await renderDocxTemplate('template-omr-essay-ai-scan.docx', {
+      subject: sanitizeMultiline(subject),
+      duration: String(duration),
+      exam_code: examCode,
+      student_order: '',
+      student_name: '',
+      student_id: '',
+      mcq_fullscore: mcqFullScore.toFixed(2),
+      essay_fullscore: essayFullScore.toFixed(2),
+      mcqs: mappedMcqs,
+      essays: mappedEssays,
+      essay_questions: mappedEssays,
+      first_essay_questions: firstEssayQuestions,
+      remaining_essay_questions: remainingEssayQuestions,
+      outcomes_text: outcomesText,
+    }, { blurOmr: true, blurStudentId: true, blueprint, padding: 8 });
   }
 
-  // Section II: True/False
-  if (tfQuestions.length > 0) {
-    children.push(
-      new Paragraph({
-        heading: HeadingLevel.HEADING_2,
-        children: [
-          new TextRun({
-            text: `SECTION II: TRUE / FALSE (${tfQuestions.length} questions)`,
-            bold: true,
-            size: 24,
-            color: '1D4ED8',
-          }),
-        ],
-        spacing: { before: 300, after: 200 },
-      })
-    );
+  return await renderDocxTemplate('template-full-essay-ai-scan.docx', {
+    subject: sanitizeMultiline(subject),
+    duration: String(duration),
+    exam_code: examCode,
+    student_order: '',
+    student_name: '',
+    student_id: '',
+    mcq_fullscore: '0.00',
+    essay_fullscore: essayFullScore.toFixed(2),
+    mcqs: [],
+    essays: mappedEssays,
+    essay_questions: mappedEssays,
+    first_essay_questions: firstEssayQuestions,
+    remaining_essay_questions: remainingEssayQuestions,
+    outcomes_text: outcomesText,
+  });
+};
 
-    for (const q of tfQuestions) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: `${questionNumber}. `, bold: true, size: 22 }),
-            new TextRun({ text: q.content, size: 22 }),
-            new TextRun({ text: '     [ True ]   [ False ]', size: 22, italics: true }),
-          ],
-          spacing: { before: 120, after: 120 },
-        })
-      );
-      questionNumber++;
-    }
-  }
+const generateStructuredExamDocx = async (
+  subject: string,
+  duration: number,
+  mcqs: Question[],
+  essays: Question[]
+): Promise<Buffer> => {
+  const examCode = `EX-${Date.now().toString().slice(-8)}`;
+  const hasMcq = mcqs.length > 0;
 
-  // Section III: Essay
-  if (essayQuestions.length > 0) {
-    children.push(
-      new Paragraph({
-        heading: HeadingLevel.HEADING_2,
-        children: [
-          new TextRun({
-            text: `SECTION III: ESSAY (${essayQuestions.length} questions)`,
-            bold: true,
-            size: 24,
-            color: '1D4ED8',
-          }),
-        ],
-        spacing: { before: 300, after: 200 },
-      })
-    );
+  const children: Array<Paragraph | Table> = [];
 
-    for (const q of essayQuestions) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({ text: `${questionNumber}. `, bold: true, size: 22 }),
-            new TextRun({ text: q.content, size: 22 }),
-          ],
-          spacing: { before: 150, after: 80 },
-        })
-      );
+  if (hasMcq) {
+    children.push(...buildExamCoverBlock(subject, duration, examCode));
+    children.push(new Paragraph({
+      heading: HeadingLevel.HEADING_2,
+      children: [new TextRun({ text: 'Page 1: Student Information + OMR Sheet' })],
+      spacing: { after: 120 },
+    }));
+    children.push(new Paragraph({
+      children: [new TextRun({ text: 'Fill one bubble for each multiple-choice question.' })],
+      spacing: { after: 120 },
+    }));
+    children.push(buildOmrTable(mcqs));
 
-      // Answer lines
-      for (let i = 0; i < 5; i++) {
-        children.push(
-          new Paragraph({
-            indent: { left: 360 },
-            children: [new TextRun({ text: '_'.repeat(90), size: 20, color: 'AAAAAA' })],
-            spacing: { after: 60 },
-          })
-        );
+    essays.forEach((essay, index) => {
+      children.push(new Paragraph({ children: [new PageBreak()] }));
+      children.push(...buildEssayQuestionBlock(essay, `Essay ${index + 1}`));
+    });
+  } else {
+    children.push(...buildExamCoverBlock(subject, duration, examCode));
+
+    if (essays.length > 0) {
+      children.push(...buildEssayQuestionBlock(essays[0], 'Essay 1'));
+
+      for (let index = 1; index < essays.length; index += 1) {
+        children.push(new Paragraph({ children: [new PageBreak()] }));
+        children.push(...buildEssayQuestionBlock(essays[index], `Essay ${index + 1}`));
       }
-      questionNumber++;
+    } else {
+      children.push(new Paragraph({
+        heading: HeadingLevel.HEADING_2,
+        children: [new TextRun({ text: 'No essay questions available in this exam.' })],
+      }));
     }
   }
 
-  // Footer separator
-  children.push(
-    new Paragraph({
-      children: [new TextRun({ text: '─'.repeat(80), color: '1D4ED8' })],
-      spacing: { before: 400, after: 100 },
-    }),
-    new Paragraph({
-      alignment: AlignmentType.CENTER,
-      children: [
-        new TextRun({
-          text: `Total Questions: ${questions.length}  |  Generated by NT208 Attendance System`,
-          size: 18,
-          italics: true,
-          color: '888888',
-        }),
-      ],
-    })
-  );
+  children.push(new Paragraph({ children: [new PageBreak()] }));
+  children.push(...buildLearningOutcomePage(mcqs, essays));
 
   const doc = new Document({
     sections: [
@@ -261,5 +750,185 @@ export const generateExamDocx = async (
     ],
   });
 
-  return await Packer.toBuffer(doc);
+  return Packer.toBuffer(doc);
+};
+
+type BlurOptions = {
+  blurOmr?: boolean;
+  blurStudentId?: boolean;
+  blueprint?: ExamScanBlueprint | undefined;
+  padding?: number; // extra padding in reference pixels
+};
+
+const processDocxBufferBlurAreas = async (docxBuffer: Buffer, blueprint: ExamScanBlueprint, options?: { padding?: number }): Promise<Buffer> => {
+  const zip = new PizZip(docxBuffer);
+  const files = Object.keys(zip.files).filter((name) => name.startsWith('word/media/') && /\.(png|jpe?g)$/i.test(name));
+
+  for (const fileName of files) {
+    try {
+      const file = zip.files[fileName];
+      const data = file.asBinary();
+      const imgBuffer = Buffer.from(data, 'binary');
+      const meta = await sharp(imgBuffer).metadata();
+      const imgW = Number(meta.width || 0);
+      const imgH = Number(meta.height || 0);
+      if (!imgW || !imgH) continue;
+
+      // If image appears like a full page scan (approx aspect to reference), process blur
+      const aspectDiff = Math.abs(imgW / imgH - REFERENCE_WIDTH / REFERENCE_HEIGHT);
+      if (aspectDiff > 0.2) continue;
+
+      // compute scale from reference space to actual image
+      const refW = blueprint.omrTemplate?.referenceWidth || REFERENCE_WIDTH;
+      const refH = blueprint.omrTemplate?.referenceHeight || REFERENCE_HEIGHT;
+      const scaleX = imgW / refW;
+      const scaleY = imgH / refH;
+
+      let composites: Array<{ input: Buffer; left: number; top: number }> = [];
+
+      const padding = options?.padding || 8;
+
+      // Blur OMR region (if provided)
+      if (blueprint.omrTemplate && Array.isArray(blueprint.omrTemplate.questions) && blueprint.omrTemplate.questions.length > 0) {
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        for (const q of blueprint.omrTemplate.questions) {
+          for (const b of q.bubbles) {
+            minX = Math.min(minX, b.x);
+            minY = Math.min(minY, b.y);
+            maxX = Math.max(maxX, b.x + (b.width || 0));
+            maxY = Math.max(maxY, b.y + (b.height || 0));
+          }
+        }
+        if (minX < Infinity && minY < Infinity && maxX > -Infinity && maxY > -Infinity) {
+          const left = Math.max(0, Math.floor((minX - padding) * scaleX));
+          const top = Math.max(0, Math.floor((minY - padding) * scaleY));
+          const width = Math.min(imgW - left, Math.ceil((maxX - minX + padding * 2) * scaleX));
+          const height = Math.min(imgH - top, Math.ceil((maxY - minY + padding * 2) * scaleY));
+          if (width > 4 && height > 4) {
+            const region = await sharp(imgBuffer).extract({ left, top, width, height }).resize(Math.max(1, Math.round(width / 8)), Math.max(1, Math.round(height / 8))).blur(2).resize(width, height).png().toBuffer();
+            composites.push({ input: region, left, top });
+          }
+        }
+      }
+
+      // Blur student id region if present in identityPlaceholders
+      if (Array.isArray(blueprint.identityPlaceholders)) {
+        const idPlaceholder = blueprint.identityPlaceholders.find((p) => String(p.key).toLowerCase().includes('student_id') || String(p.key).toLowerCase().includes('studentcode') || String(p.key).toLowerCase().includes('mssv'));
+        if (idPlaceholder && idPlaceholder.region) {
+          const r = idPlaceholder.region;
+          const left = Math.max(0, Math.floor((r.x - padding) * scaleX));
+          const top = Math.max(0, Math.floor((r.y - padding) * scaleY));
+          const width = Math.min(imgW - left, Math.ceil((r.width + padding * 2) * scaleX));
+          const height = Math.min(imgH - top, Math.ceil((r.height + padding * 2) * scaleY));
+          if (width > 4 && height > 4) {
+            const region = await sharp(imgBuffer).extract({ left, top, width, height }).resize(Math.max(1, Math.round(width / 6)), Math.max(1, Math.round(height / 6))).blur(2).resize(width, height).png().toBuffer();
+            composites.push({ input: region, left, top });
+          }
+        }
+      }
+
+      if (composites.length > 0) {
+        let worked = sharp(imgBuffer);
+        worked = worked.composite(composites as any);
+        const outBuf = await worked.toBuffer();
+        zip.file(fileName, outBuf);
+      }
+    } catch (err) {
+      // ignore per-image failures
+    }
+  }
+
+  return Buffer.from(zip.generate({ type: 'nodebuffer' } as any));
+};
+
+const renderDocxTemplate = async (templateFileName: string, data: Record<string, unknown>, blurOptions?: BlurOptions): Promise<Buffer> => {
+  const templatePath = resolveTemplatePath(templateFileName);
+  const content = fs.readFileSync(templatePath, 'binary');
+  const zip = new PizZip(content);
+
+  const doc = new Docxtemplater(zip, {
+    paragraphLoop: true,
+    linebreaks: true,
+    nullGetter: () => '',
+  });
+
+  try {
+    doc.render(data);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to render template "${templateFileName}": ${message}`);
+  }
+
+  let generated = doc.getZip().generate({ type: 'nodebuffer' }) as Buffer;
+
+  if (blurOptions && (blurOptions.blurOmr || blurOptions.blurStudentId) && blurOptions.blueprint) {
+    try {
+      generated = await processDocxBufferBlurAreas(generated, blurOptions.blueprint, { padding: blurOptions?.padding || 8 });
+    } catch {
+      // ignore blur failures and return original buffer
+    }
+  }
+
+  return generated;
+};
+
+export const generateEssayExamDocx = async (
+  subject: string,
+  duration: number,
+  essayQuestions: Question[],
+  pointsMap?: Map<number, number>
+): Promise<Buffer> => {
+  return generateTemplateExamDocx(subject, duration, [], essayQuestions, pointsMap);
+};
+
+export const generateMcqEssayExamDocx = async (
+  subject: string,
+  duration: number,
+  mcqs: Question[],
+  essays: Question[],
+  pointsMap?: Map<number, number>
+): Promise<Buffer> => {
+  return generateTemplateExamDocx(subject, duration, mcqs, essays, pointsMap);
+};
+
+export const generateAnswerKeyDocx = async (
+  subject: string,
+  duration: number,
+  mcqs: Question[],
+  essays: Question[],
+  pointsMap?: Map<number, number>
+): Promise<Buffer> => {
+  const examCode = 'ANSWER-KEY';
+  const templateFile = 'template-answer-key.docx';
+
+  const mappedMcqs = mcqs.map((question, index) => ({
+    index: index + 1,
+    correct_answer: (question.answer || '').trim().toUpperCase(),
+    score: Number(pointsMap?.get(question.id) ?? 1).toFixed(2),
+  }));
+
+  const mappedEssays = essays.map((question, index) => ({
+    index: index + 1,
+    answer: sanitizeMultiline(question.answer),
+    score: Number(pointsMap?.get(question.id) ?? 1).toFixed(2),
+  }));
+
+  const mcqFullScore = mappedMcqs.reduce((total, question) => total + Number(question.score), 0).toFixed(2);
+  const essayFullScore = mappedEssays.reduce((total, question) => total + Number(question.score), 0).toFixed(2);
+
+  return renderDocxTemplate(templateFile, {
+    subject: `${sanitizeMultiline(subject)} — ANSWER KEY`,
+    duration: String(duration),
+    exam_code: examCode,
+    total_count: mappedMcqs.length + mappedEssays.length,
+    mcq_count: mcqs.length,
+    essay_count: essays.length,
+    mcq_fullscore: mcqFullScore,
+    essay_fullscore: essayFullScore,
+    mcqs: mappedMcqs,
+    essays: mappedEssays,
+  });
 };

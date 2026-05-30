@@ -61,7 +61,7 @@ export const enrollFace = async (req: AuthRequest, res: Response): Promise<void>
  */
 export const getClassDescriptors = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const classId = parseInt(String(req.params.classId));
+    const classId = parseInt(String(req.params.classId), 10);
 
     // Verify teacher owns this class
     const cls = await prisma.class.findUnique({ where: { id: classId } });
@@ -113,7 +113,7 @@ export const getClassDescriptors = async (req: AuthRequest, res: Response): Prom
  */
 export const deleteFaceData = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const studentId = parseInt(String(req.params.studentId));
+    const studentId = parseInt(String(req.params.studentId), 10);
 
     const deleted = await prisma.faceDescriptor.deleteMany({ where: { studentId } });
 
@@ -133,7 +133,7 @@ export const deleteFaceData = async (req: AuthRequest, res: Response): Promise<v
  */
 export const getFaceStatus = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const studentId = parseInt(String(req.params.studentId));
+    const studentId = parseInt(String(req.params.studentId), 10);
 
     const count = await prisma.faceDescriptor.count({ where: { studentId } });
 
