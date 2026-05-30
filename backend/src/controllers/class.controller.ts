@@ -105,7 +105,7 @@ export const getClassById = async (req: AuthRequest, res: Response): Promise<voi
     }
 
     if (req.user!.role === 'STUDENT') {
-      const enrolled = cls.students.some((s) => s.studentId === req.user!.id);
+      const enrolled = cls.students.some((s: { studentId: number }) => s.studentId === req.user!.id);
       if (!enrolled) {
         res.status(403).json({ error: 'Access denied' });
         return;
@@ -154,8 +154,7 @@ export const deleteClass = async (req: AuthRequest, res: Response): Promise<void
       res.status(404).json({ error: 'Class not found' });
       return;
     }
-    // Admin can delete any class; teacher only their own
-    if (req.user!.role !== 'ADMIN' && cls.teacherId !== req.user!.id) {
+    if (req.user!.role !== 'ADMIN') {
       res.status(403).json({ error: 'Access denied' });
       return;
     }
@@ -269,7 +268,7 @@ export const getStudentClasses = async (req: AuthRequest, res: Response): Promis
         },
       },
     });
-    res.json(enrollments.map((e) => e.class));
+    res.json(enrollments.map((e: { class: unknown }) => e.class));
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Internal server error' });
@@ -278,7 +277,7 @@ export const getStudentClasses = async (req: AuthRequest, res: Response): Promis
 
 export const addStudentsByClass = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
-    const courseId = parseInt(req.params.id as string);
+    const courseId = parseInt(String(req.params.id));
     const { studentClassId } = req.body;
 
     if (!studentClassId) {

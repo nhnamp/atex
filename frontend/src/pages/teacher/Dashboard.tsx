@@ -73,9 +73,9 @@ const TeacherDashboard: React.FC = () => {
             <h3 className="font-semibold text-gray-900 mb-3">Quick Actions</h3>
             <div className="space-y-2">
               {[
-                { label: 'Create New Class', to: '/teacher/classes', icon: <Users size={16} /> },
-                { label: 'Manage Subjects & Questions', to: '/teacher/subjects', icon: <BookOpen size={16} /> },
-                { label: 'Build Exam & Grade', to: '/teacher/exams', icon: <FileText size={16} /> },
+                { label: 'Manage classes', to: '/teacher/classes', icon: <Users size={16} /> },
+                { label: 'Manage subjects & questions', to: '/teacher/subjects', icon: <BookOpen size={16} /> },
+                { label: 'Generate AI exam', to: '/teacher/exams', icon: <FileText size={16} /> },
               ].map((action) => (
                 <Link
                   key={action.to}

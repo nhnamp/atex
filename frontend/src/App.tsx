@@ -14,7 +14,6 @@ import AdminClasses from './pages/admin/Classes';
 import TeacherDashboard from './pages/teacher/Dashboard';
 import TeacherClasses from './pages/teacher/Classes';
 import TeacherClassDetail from './pages/teacher/ClassDetail';
-import TeacherAttendanceSession from './pages/teacher/AttendanceSession';
 import TeacherSubjects from './pages/teacher/Subjects';
 import TeacherLearningOutcomes from './pages/teacher/LearningOutcomes';
 import TeacherQuestions from './pages/teacher/Questions';
@@ -23,10 +22,14 @@ import TeacherFaceEnrollment from './pages/teacher/FaceEnrollment';
 import TeacherFaceAttendance from './pages/teacher/FaceAttendance';
 import TeacherSessionManagement from './pages/teacher/SessionManagement';
 import TeacherMobileScan from './pages/teacher/MobileScan';
+import TeacherSessionResults from './pages/teacher/SessionResults';
+import TeacherAttendanceSummary from './pages/teacher/AttendanceSummary';
+import TeacherAccount from './pages/teacher/Account';
 
 // Student pages
 import StudentDashboard from './pages/student/Dashboard';
-import StudentAttendance from './pages/student/Attendance';
+import StudentClassDetail from './pages/student/ClassDetail';
+import StudentAccount from './pages/student/Account';
 
 function RootRedirect() {
   const { user, loading } = useAuth();
@@ -56,19 +59,22 @@ function AppRoutes() {
         <Route path="/teacher/classes" element={<TeacherClasses />} />
         <Route path="/teacher/classes/:id" element={<TeacherClassDetail />} />
         <Route path="/teacher/classes/:id/face-enroll" element={<TeacherFaceEnrollment />} />
-        <Route path="/teacher/attendance/:sessionId" element={<TeacherAttendanceSession />} />
+        <Route path="/teacher/classes/:id/attendance-summary" element={<TeacherAttendanceSummary />} />
         <Route path="/teacher/face-attendance/:sessionId" element={<TeacherFaceAttendance />} />
+        <Route path="/teacher/sessions/:sessionId" element={<TeacherSessionResults />} />
         <Route path="/teacher/subjects" element={<TeacherSubjects />} />
         <Route path="/teacher/subjects/:subjectId/outcomes" element={<TeacherLearningOutcomes />} />
         <Route path="/teacher/subjects/:subjectId/questions" element={<TeacherQuestions />} />
         <Route path="/teacher/exams" element={<TeacherExamGenerator />} />
         <Route path="/teacher/exam-sessions" element={<TeacherSessionManagement />} />
+        <Route path="/teacher/account" element={<TeacherAccount />} />
       </Route>
 
       {/* Student */}
       <Route element={<ProtectedRoute role="STUDENT" />}>
         <Route path="/student" element={<StudentDashboard />} />
-        <Route path="/student/attendance/:sessionId" element={<StudentAttendance />} />
+        <Route path="/student/classes/:id" element={<StudentClassDetail />} />
+        <Route path="/student/account" element={<StudentAccount />} />
       </Route>
 
       <Route path="*" element={<Navigate to="/" replace />} />

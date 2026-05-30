@@ -80,7 +80,7 @@ export const getClassDescriptors = async (req: AuthRequest, res: Response): Prom
       },
     });
 
-    const studentIds = classStudents.map((cs) => cs.student.id);
+    const studentIds = classStudents.map((cs: { student: { id: number } }) => cs.student.id);
 
     // Get all face descriptors for these students
     const allDescriptors = await prisma.faceDescriptor.findMany({
@@ -95,10 +95,10 @@ export const getClassDescriptors = async (req: AuthRequest, res: Response): Prom
       descriptorMap.set(fd.studentId, arr);
     }
 
-    const result = classStudents.map(({ student }) => ({
-      student,
-      descriptors: descriptorMap.get(student.id) || [],
-      enrolled: descriptorMap.has(student.id),
+    const result = classStudents.map((item: { student: { id: number; username: string; fullName: string } }) => ({
+      student: item.student,
+      descriptors: descriptorMap.get(item.student.id) || [],
+      enrolled: descriptorMap.has(item.student.id),
     }));
 
     res.json(result);

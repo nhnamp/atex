@@ -1,7 +1,7 @@
 {
-  "name": "nt208-attendance-system",
+  "name": "attendance",
   "version": "1.0.0",
-  "description": "NT208 Student Attendance System with AI Exam Generation",
+  "description": "Student Attendance System and AI Exam Generation",
   "private": true,
   "scripts": {
     "install:all": "cd backend && npm install && cd ../frontend && npm install",
@@ -11,5 +11,14 @@
     "build:backend": "cd backend && npm run build",
     "build:frontend": "cd frontend && npm run build"
   },
-  "workspaces": ["backend", "frontend"]
+  "workspaces": [
+    "backend",
+    "frontend"
+  ],
+  "devDependencies": {
+    "@types/node": "^25.6.0"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2"
+  }
 }

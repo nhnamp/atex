@@ -12,6 +12,7 @@ import {
   GraduationCap,
   CheckSquare,
   UserPlus,
+  KeyRound,
 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 
@@ -38,10 +39,13 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     { label: 'Subjects & Q&A', to: '/teacher/subjects', icon: <BookOpen size={18} /> },
     { label: 'Exam Builder', to: '/teacher/exams', icon: <FileText size={18} /> },
     { label: 'Session Management', to: '/teacher/exam-sessions', icon: <ClipboardList size={18} /> },
+    { label: 'Exam Generator', to: '/teacher/exams', icon: <FileText size={18} /> },
+    { label: 'Account', to: '/teacher/account', icon: <KeyRound size={18} /> },
   ];
 
   const studentNavItems: NavItem[] = [
     { label: 'Dashboard', to: '/student', icon: <LayoutDashboard size={18} /> },
+    { label: 'Account', to: '/student/account', icon: <KeyRound size={18} /> },
   ];
 
   const navItems =

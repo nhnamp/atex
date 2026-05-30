@@ -92,7 +92,7 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
       return;
     }
 
-    const subject = await prisma.subject.findUnique({ where: { id: parseInt(subjectId) } });
+    const subject = await prisma.subject.findUnique({ where: { id: subjectId } });
     if (!subject || subject.teacherId !== req.user!.id) {
       res.status(404).json({ error: 'Subject not found' });
       return;
@@ -105,7 +105,7 @@ export const createQuestion = async (req: AuthRequest, res: Response): Promise<v
 
     const question = await prisma.question.create({
       data: {
-        subjectId: parseInt(subjectId),
+        subjectId,
         type,
         content,
         answer,

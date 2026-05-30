@@ -1,7 +1,7 @@
 {
-  "name": "nt208-backend",
+  "name": "backend",
   "version": "1.0.0",
-  "description": "NT208 Student Attendance System - Backend",
+  "description": "Student Attendance System - Backend",
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
@@ -10,6 +10,7 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev --name init",
     "prisma:seed": "ts-node prisma/seed.ts",
+    "prisma:reset-admin": "ts-node prisma/reset-admin.ts",
     "prisma:studio": "prisma studio",
     "setup": "npm install && npx prisma generate && npx prisma migrate dev --name init && ts-node prisma/seed.ts"
   },

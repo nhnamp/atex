@@ -16,3 +16,4 @@ backend/uploads/temp/*
 test/
 OMR_context.md
 test/debugOutputs/
+DEPLOY.md

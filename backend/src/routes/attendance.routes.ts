@@ -1,15 +1,15 @@
 import { Router } from 'express';
 import {
-  createSession,
   getSessionsByClass,
+  getClassAttendanceSummary,
   getSessionStatus,
   endSession,
-  submitCode,
-  getSessionRecords,
-  getActiveSessionsForStudent,
-  getStudentAttendanceRecord,
   createFaceSession,
   submitFaceAttendance,
+  getSessionRecords,
+  getStudentAttendanceRecord,
+  renameSession,
+  deleteSession,
 } from '../controllers/attendance.controller';
 import { authenticate, requireRole, requireApproved } from '../middleware/auth';
 
@@ -17,10 +17,12 @@ const router = Router();
 router.use(authenticate, requireApproved);
 
 // Teacher routes
-router.post('/sessions', requireRole('TEACHER'), createSession);
 router.post('/sessions/face', requireRole('TEACHER'), createFaceSession);
 router.get('/sessions/class/:classId', requireRole('TEACHER'), getSessionsByClass);
+router.get('/sessions/class/:classId/summary', requireRole('TEACHER'), getClassAttendanceSummary);
 router.put('/sessions/:id/end', requireRole('TEACHER'), endSession);
+router.put('/sessions/:id', requireRole('TEACHER'), renameSession);
+router.delete('/sessions/:id', requireRole('TEACHER'), deleteSession);
 router.get('/sessions/:id/records', requireRole('TEACHER'), getSessionRecords);
 router.post('/sessions/:id/face-submit', requireRole('TEACHER'), submitFaceAttendance);
 
@@ -28,8 +30,6 @@ router.post('/sessions/:id/face-submit', requireRole('TEACHER'), submitFaceAtten
 router.get('/sessions/:id/status', getSessionStatus);
 
 // Student routes
-router.post('/sessions/:id/submit', requireRole('STUDENT'), submitCode);
-router.get('/sessions/student/active', requireRole('STUDENT'), getActiveSessionsForStudent);
 router.get('/sessions/:id/my-record', requireRole('STUDENT'), getStudentAttendanceRecord);
 
 export default router;
