@@ -112,7 +112,7 @@ const bootstrap = async () => {
     httpServer.listen(PORT, () => {
       console.log(`\n🚀 Server running on http://localhost:${PORT}`);
       console.log(`📡 Socket.IO enabled`);
-      console.log(`🗄️  Database: SQLite (Prisma)\n`);
+      console.log(`🗄️  Database: PostgreSQL (Prisma)\n`);
     });
   } catch (error) {
     console.error('Failed during server bootstrap:', error);

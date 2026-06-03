@@ -16,6 +16,7 @@ import {
   getMobileScanContext,
   getMyPublishedExamResults,
   getExamPreview,
+  probeMobileScanFrame,
   listExamDraftScans,
   getSessionIssuesReport,
   getSessionReport,
@@ -83,6 +84,7 @@ const missingPageFileLimit = config.uploadLimits.missingPageFiles;
 
 // Mobile scan public endpoints (token-based)
 router.get('/mobile-scan/context', getMobileScanContext);
+router.post('/mobile-scan/probe', tempUpload.single('frame'), probeMobileScanFrame);
 router.post('/mobile-scan/upload', upload.array('files', mobileScanFileLimit), uploadMobileSubmissionScans);
 
 router.use(authenticate, requireApproved);

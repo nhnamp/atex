@@ -281,6 +281,11 @@ const TEACHER_BUSY_MESSAGE = 'Hệ thống đang quá tải, vui lòng đợi 1 
 const TEACHER_IDENTITY_MESSAGE = 'Không nhận diện được tên hoặc MSSV, vui lòng kiểm tra lại ảnh trang đầu.';
 const TEACHER_QUALITY_MESSAGE = 'Ảnh bài làm bị mờ hoặc thiếu góc, vui lòng chụp lại rõ nét hơn.';
 
+// Minimum OMR confidence for a live probe frame to count as a confident identity read.
+// Aligned anchors (4/4) and a unique MSSV match are the stronger signals; this guards
+// against a frame that aligned but read the digit grid poorly.
+const MOBILE_PROBE_MIN_CONFIDENCE = 0.45;
+
 const isIdentityFailureMessage = (message: string): boolean => {
   const normalized = message.toLowerCase();
   return (
@@ -2916,6 +2921,9 @@ export const getMobileScanContext = async (req: Request, res: Response): Promise
           id: session.exam.id,
           title: session.exam.title,
           hasMcq: session.exam.questions.some((item) => item.question.type === 'MULTIPLE_CHOICE'),
+          mcqQuestionCount: session.exam.questions.filter(
+            (item) => item.question.type === 'MULTIPLE_CHOICE'
+          ).length,
           essayQuestionIds: session.exam.questions
             .filter((item) => item.question.type === 'ESSAY')
             .map((item) => item.question.id),
@@ -2945,6 +2953,130 @@ export const getMobileScanContext = async (req: Request, res: Response): Promise
     }
     console.error('Get mobile scan context error:', error);
     res.status(500).json({ error: 'Failed to load mobile scan context' });
+  }
+};
+
+/**
+ * Live recognition probe for the mobile scanner (token-based, public).
+ *
+ * The phone streams downscaled preview frames here while pointing at the
+ * identity/MCQ page. Each frame is run through the real OMR pipeline and the
+ * detection signals are returned so the client can auto-capture the instant the
+ * sheet is aligned (4/4 anchors), the MSSV resolves to a unique enrolled
+ * student, and OMR confidence is high. Frames are never persisted — the temp
+ * file is deleted immediately. A frame that simply isn't aligned yet is a normal
+ * outcome, so OMR failures degrade to `recognized: false` rather than HTTP 500.
+ */
+export const probeMobileScanFrame = async (req: Request, res: Response): Promise<void> => {
+  const frame = (req as Request & { file?: Express.Multer.File }).file;
+  const framePath = frame?.path || null;
+
+  const cleanup = () => {
+    if (framePath && fs.existsSync(framePath)) {
+      try {
+        fs.unlinkSync(framePath);
+      } catch {
+        /* best-effort temp cleanup */
+      }
+    }
+  };
+
+  try {
+    const token = String(req.body.token || '');
+    if (!token || !frame) {
+      res.status(400).json({ error: 'token and a frame image are required' });
+      cleanup();
+      return;
+    }
+
+    const payload = verifyMobileScanToken(token);
+
+    const session = await prisma.examSession.findUnique({
+      where: { id: payload.sessionId },
+      include: {
+        exam: {
+          include: {
+            questions: {
+              include: { question: { select: { id: true, type: true } } },
+              orderBy: { position: 'asc' },
+            },
+          },
+        },
+      },
+    });
+
+    if (!session || session.exam.teacherId !== payload.teacherId) {
+      res.status(404).json({ error: 'Session not found' });
+      cleanup();
+      return;
+    }
+
+    const enrolledStudents = await prisma.classStudent.findMany({
+      where: { classId: session.classId },
+      select: { student: { select: { id: true, username: true, fullName: true } } },
+    });
+
+    const mcqCount = session.exam.questions.filter(
+      (item) => item.question.type === 'MULTIPLE_CHOICE'
+    ).length;
+
+    const omr = await processOmrImage(framePath as string, mcqCount > 0 ? mcqCount : 20);
+
+    const answeredCount = Object.values(omr.answers || {}).filter((value) =>
+      /^[A-D]$/i.test(String(value))
+    ).length;
+    const aligned = typeof omr.aligned === 'number' ? omr.aligned : 0;
+
+    const resolved = resolveStudentFromIdentity(
+      enrolledStudents.map((item) => item.student),
+      { studentCode: omr.studentCode, fullName: null }
+    );
+    const matched = resolved.matched;
+
+    const recognized = aligned >= 4 && !!matched && omr.confidence >= MOBILE_PROBE_MIN_CONFIDENCE;
+
+    res.json({
+      aligned,
+      studentCode: omr.studentCode,
+      confidence: Number((omr.confidence || 0).toFixed(2)),
+      answeredCount,
+      mcqCount,
+      recognized,
+      resolvedStudentId: matched?.id ?? null,
+      resolvedStudent: matched
+        ? { id: matched.id, username: matched.username, fullName: matched.fullName }
+        : null,
+      candidates: resolved.ambiguous.map((student) => ({
+        id: student.id,
+        username: student.username,
+        fullName: student.fullName,
+      })),
+      warnings: omr.warnings || [],
+    });
+  } catch (error) {
+    const httpError = error as HttpError;
+    if (httpError.statusCode) {
+      res.status(httpError.statusCode).json({ error: httpError.message });
+      cleanup();
+      return;
+    }
+
+    // A non-aligned / unreadable preview frame is expected while the user is still
+    // framing the sheet — report it as "not recognized" so the loop keeps polling.
+    res.json({
+      aligned: 0,
+      studentCode: null,
+      confidence: 0,
+      answeredCount: 0,
+      mcqCount: 0,
+      recognized: false,
+      resolvedStudentId: null,
+      resolvedStudent: null,
+      candidates: [],
+      warnings: [(error as Error).message],
+    });
+  } finally {
+    cleanup();
   }
 };
 
@@ -3005,6 +3137,58 @@ export const uploadMobileSubmissionScans = async (req: Request, res: Response): 
 
     if (!Number.isFinite(expectedPages) || expectedPages <= 0) {
       res.status(400).json({ error: 'Exam scannable page count is invalid. Please export exam again before scanning.' });
+      return;
+    }
+
+    // Full-set finalize mode: the mobile scanner buffers every page of one paper
+    // and uploads them together with an already-resolved studentId (resolved live
+    // by the recognition probe, or corrected by the teacher). The student is
+    // trusted here, so we skip identity OMR and just persist the ordered set.
+    if (String(req.body.fullSet || '') === '1') {
+      if (!studentId) {
+        res.status(400).json({ error: 'studentId is required to finalize a full paper set' });
+        return;
+      }
+      if (!enrolledStudents.some((item) => item.student.id === studentId)) {
+        res.status(400).json({ error: 'Student is not enrolled in this class' });
+        return;
+      }
+      if (files.length !== expectedPages) {
+        res.status(400).json({
+          error: `Full paper set requires exactly ${expectedPages} image(s). Received ${files.length}.`,
+        });
+        return;
+      }
+
+      const invalidScans = await collectInvalidScans(files, 1);
+      if (invalidScans.length > 0) {
+        throw createHttpError(422, TEACHER_QUALITY_MESSAGE, {
+          errorCode: 'QUALITY_FAIL',
+          invalidScans,
+          requiresRetake: true,
+        });
+      }
+
+      const { submission, mergedScans, mergedPdfUrl } = await persistSubmissionScans({
+        sessionId: session.id,
+        studentId,
+        files,
+        totalPasses: expectedPages,
+        replaceExisting: true,
+        sequentialPasses: true,
+        passPurposeResolver: (passIdx: number) => getScanPassPurpose(passIdx, passPlan),
+      });
+
+      const resolvedStudent = enrolledStudents.find((item) => item.student.id === studentId)?.student || null;
+
+      res.status(201).json({
+        ...submission,
+        resolvedStudent,
+        resolvedStudentId: studentId,
+        scanCount: mergedScans.length,
+        scanEntries: mergedScans.map(toAccessibleScanEntry),
+        mergedPdfUrl,
+      });
       return;
     }
 
