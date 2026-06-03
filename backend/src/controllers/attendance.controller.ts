@@ -1,8 +1,6 @@
 import { Response } from 'express';
-import { PrismaClient } from '@prisma/client';
 import { AuthRequest } from '../middleware/auth';
-
-const prisma = new PrismaClient();
+import { prisma } from '../lib/prisma';
 
 const formatSessionName = (date: Date): string =>
   date.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });

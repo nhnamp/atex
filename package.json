@@ -4,12 +4,12 @@
   "description": "Student Attendance System and AI Exam Generation",
   "private": true,
   "scripts": {
-    "install:all": "cd backend && npm install && cd ../frontend && npm install",
-    "setup:db": "cd backend && npx prisma generate && npx prisma migrate dev --name init && npx ts-node prisma/seed.ts",
-    "dev:backend": "cd backend && npm run dev",
-    "dev:frontend": "cd frontend && npm run dev",
-    "build:backend": "cd backend && npm run build",
-    "build:frontend": "cd frontend && npm run build"
+    "install:all": "npm install --workspaces",
+    "setup:db": "npm run prisma:generate -w backend && npm run prisma:migrate -w backend && npm run prisma:seed -w backend",
+    "dev:backend": "npm run dev -w backend",
+    "dev:frontend": "npm run dev -w frontend",
+    "build:backend": "npm run build -w backend",
+    "build:frontend": "npm run build -w frontend"
   },
   "workspaces": [
     "backend",

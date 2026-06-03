@@ -1,10 +1,9 @@
 import { Response } from 'express';
-import { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import bcrypt from 'bcryptjs';
 import * as XLSX from 'xlsx';
 import { AuthRequest } from '../middleware/auth';
-
-const prisma = new PrismaClient();
+import { prisma } from '../lib/prisma';
 
 // ── Helper: cascade-delete a user by cleaning up all relations first ──
 async function cascadeDeleteUser(id: number): Promise<void> {

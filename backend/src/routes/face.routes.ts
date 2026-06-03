@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Router as ExpressRouter } from 'express';
 import {
   enrollFace,
   getClassDescriptors,
@@ -7,7 +7,7 @@ import {
 } from '../controllers/face.controller';
 import { authenticate, requireRole, requireApproved } from '../middleware/auth';
 
-const router = Router();
+const router: ExpressRouter = Router();
 router.use(authenticate, requireApproved);
 
 // All face routes are teacher-only

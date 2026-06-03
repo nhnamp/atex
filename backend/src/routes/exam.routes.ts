@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Router as ExpressRouter } from 'express';
 import {
   cloneExamToDraft,
   cloneExamConfigToDraft,
@@ -48,7 +48,7 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 
-const router = Router();
+const router: ExpressRouter = Router();
 
 const scanStoragePath = path.join(process.cwd(), 'uploads', 'scans');
 fs.mkdirSync(scanStoragePath, { recursive: true });

@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Router as ExpressRouter } from 'express';
 import {
   createLearningOutcome,
   getSubjects,
@@ -12,7 +12,7 @@ import {
 } from '../controllers/subject.controller';
 import { authenticate, requireRole, requireApproved } from '../middleware/auth';
 
-const router = Router();
+const router: ExpressRouter = Router();
 router.use(authenticate, requireApproved, requireRole('TEACHER'));
 
 router.get('/', getSubjects);

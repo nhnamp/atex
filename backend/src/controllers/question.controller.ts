@@ -1,11 +1,9 @@
 import { Response } from 'express';
-import { PrismaClient } from '@prisma/client';
 import { AuthRequest } from '../middleware/auth';
 import * as XLSX from 'xlsx';
 import * as path from 'path';
 import * as fs from 'fs';
-
-const prisma = new PrismaClient();
+import { prisma } from '../lib/prisma';
 const EXCEL_MAX_ROWS = 500;
 
 const normalizeQuestionType = (raw: string): 'MULTIPLE_CHOICE' | 'ESSAY' | null => {
