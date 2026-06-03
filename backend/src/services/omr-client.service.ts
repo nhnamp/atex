@@ -29,8 +29,22 @@ export interface OmrProcessResult {
     digits: Array<{ column: number; digit: number; cx: number; cy: number; r: number }>;
   } | null;
   confidence: number;
+  /** How many of the 4 corner anchors locked onto their canonical position (0-4). */
+  aligned?: number;
   warnings: string[];
 }
+
+/**
+ * Derive the 6-digit sheet code (first 2 + last 4 digits of the MSSV) used by
+ * the OMR answer sheet. The 3rd/4th digits of the full code are dropped on the
+ * sheet, so e.g. "22521003" -> "221003". Non-digit characters are ignored.
+ * Codes of 6 digits or fewer (already in sheet form) are returned unchanged.
+ */
+export const deriveMssvSixDigits = (value: unknown): string => {
+  const digits = String(value ?? '').replace(/\D/g, '');
+  if (digits.length <= 6) return digits;
+  return digits.slice(0, 2) + digits.slice(-4);
+};
 
 /**
  * Call the Python OMR service to process a front page scan image.
@@ -90,6 +104,9 @@ export const processOmrImage = async (
       mcqLayout: result.mcqLayout ?? null,
       identityLayout: result.identityLayout ?? null,
       confidence: typeof result.confidence === 'number' ? result.confidence : 0,
+      aligned: typeof (result as { aligned?: number }).aligned === 'number'
+        ? (result as { aligned?: number }).aligned
+        : undefined,
       warnings: Array.isArray(result.warnings) ? result.warnings : [],
     };
   } catch (error) {
@@ -124,34 +141,42 @@ export const checkOmrServiceHealth = async (): Promise<boolean> => {
 };
 
 /**
- * Match a partial student code (with '?' wildcards) against a list of enrolled students.
+ * Match a detected MSSV (with '?' wildcards) against a list of enrolled students.
+ * The OMR sheet encodes only 6 digits (first 2 + last 4 of the full MSSV), so
+ * each student's username is reduced the same way before comparing positionally.
  * Returns the best matching student ID, or null if no unique match is found.
  */
 export const fuzzyMatchStudentCode = (
   detectedCode: string,
   enrolledStudents: Array<{ id: number; username: string; fullName: string }>,
 ): { studentId: number | null; matchCount: number; candidates: Array<{ id: number; username: string; fullName: string }> } => {
-  if (!detectedCode || detectedCode.replace(/\?/g, '').length === 0) {
+  const detected = String(detectedCode || '').trim();
+  if (!detected || detected.replace(/\?/g, '').length === 0) {
     return { studentId: null, matchCount: 0, candidates: [] };
   }
 
   const candidates: Array<{ id: number; username: string; fullName: string; score: number }> = [];
 
   for (const student of enrolledStudents) {
-    // Match against username (typically contains the MSSV)
-    const username = student.username || '';
+    // Reduce the enrolled MSSV to the same 6-digit sheet code before comparing.
+    const expected = deriveMssvSixDigits(student.username);
+    if (!expected || expected.length !== detected.length) continue;
+
     let matchDigits = 0;
     let totalDigits = 0;
-
-    for (let i = 0; i < detectedCode.length; i++) {
-      if (detectedCode[i] === '?') continue;
+    let allMatch = true;
+    for (let i = 0; i < detected.length; i++) {
+      if (detected[i] === '?') continue;
       totalDigits++;
-      if (i < username.length && detectedCode[i] === username[i]) {
+      if (detected[i] === expected[i]) {
         matchDigits++;
+      } else {
+        allMatch = false;
+        break;
       }
     }
 
-    if (totalDigits > 0 && matchDigits === totalDigits) {
+    if (allMatch && totalDigits > 0) {
       candidates.push({ ...student, score: matchDigits });
     }
   }

@@ -6,6 +6,8 @@ import Layout from '../../components/Layout';
 import api from '../../api';
 import { BuiltExam, Class, ExamRequirements, ExamSession, LearningOutcome, Question, Subject } from '../../types';
 
+const TOTAL_EXAM_POINTS = 10;
+
 const TeacherExamGenerator: React.FC = () => {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
@@ -18,7 +20,6 @@ const TeacherExamGenerator: React.FC = () => {
   const [subjectOutcomes, setSubjectOutcomes] = useState<LearningOutcome[]>([]);
   const [outcomeRatios, setOutcomeRatios] = useState<Record<number, number>>({});
   const [examTitle, setExamTitle] = useState('');
-  const [examType, setExamType] = useState('MIXED');
   const [durationMinutes, setDurationMinutes] = useState(60);
   const [requirements, setRequirements] = useState<ExamRequirements>({
     total: 10,
@@ -29,6 +30,9 @@ const TeacherExamGenerator: React.FC = () => {
       essay: { easy: 50, medium: 35, hard: 15 },
     },
   });
+
+  const examType = requirements.multipleChoice === 0 ? 'FULL_ESSAY' : 'MIXED';
+
   const [sectionPoints, setSectionPoints] = useState<{ multipleChoice: number; essay: number }>({ multipleChoice: 7, essay: 3 });
   const [generating, setGenerating] = useState(false);
   const [creatingSession, setCreatingSession] = useState(false);
@@ -109,7 +113,6 @@ const TeacherExamGenerator: React.FC = () => {
 
     setSelectedSubjectId(String(selectedExam.subjectId));
     setExamTitle(selectedExam.title);
-    setExamType(selectedExam.examType || 'MIXED');
     setDurationMinutes(selectedExam.durationMinutes || 60);
 
     if (parsedRequirements) {
@@ -124,10 +127,17 @@ const TeacherExamGenerator: React.FC = () => {
       });
 
       const nextSectionPoints = parsedRequirements.sectionPoints || { multipleChoice: 7, essay: 3 };
-      setSectionPoints({
+      const loadedSectionPoints = {
         multipleChoice: Number(nextSectionPoints.multipleChoice ?? 7),
         essay: Number(nextSectionPoints.essay ?? 3),
-      });
+      };
+      setSectionPoints(
+        parsedRequirements.multipleChoice === 0
+          ? { multipleChoice: 0, essay: TOTAL_EXAM_POINTS }
+          : parsedRequirements.essay === 0
+            ? { multipleChoice: TOTAL_EXAM_POINTS, essay: 0 }
+            : loadedSectionPoints
+      );
 
       const nextOutcomeRatios: Record<number, number> = {};
       (parsedRequirements.outcomeRatios || []).forEach((item) => {
@@ -197,6 +207,10 @@ const TeacherExamGenerator: React.FC = () => {
     }
     if (requirements.total <= 0) {
       toast.error('Total questions must be greater than 0');
+      return false;
+    }
+    if (Math.abs(sectionPoints.multipleChoice + sectionPoints.essay - TOTAL_EXAM_POINTS) > 0.0001) {
+      toast.error(`Section points must total ${TOTAL_EXAM_POINTS}`);
       return false;
     }
 
@@ -414,6 +428,10 @@ const TeacherExamGenerator: React.FC = () => {
 
   const saveExamConfig = async () => {
     if (!selectedExam) return;
+    if (Math.abs(sectionPoints.multipleChoice + sectionPoints.essay - TOTAL_EXAM_POINTS) > 0.0001) {
+      toast.error(`Section points must total ${TOTAL_EXAM_POINTS}`);
+      return;
+    }
     try {
       // include sectionPoints when present
       const parsedReq = selectedExam.requirements ? JSON.parse(selectedExam.requirements as unknown as string) : {};
@@ -608,10 +626,21 @@ const TeacherExamGenerator: React.FC = () => {
       newReq.total = newReq.multipleChoice + newReq.essay;
     }
     setRequirements(newReq);
+    if (field === 'multipleChoice' || field === 'essay') {
+      if (newReq.multipleChoice === 0) {
+        setSectionPoints({ multipleChoice: 0, essay: TOTAL_EXAM_POINTS });
+      } else if (newReq.essay === 0) {
+        setSectionPoints({ multipleChoice: TOTAL_EXAM_POINTS, essay: 0 });
+      }
+    }
   };
 
   const sum = requirements.multipleChoice + requirements.essay;
-  const isValid = sum === requirements.total && requirements.total > 0 && !!selectedSubjectId;
+  const sectionPointsTotal = sectionPoints.multipleChoice + sectionPoints.essay;
+  const isValid = sum === requirements.total
+    && requirements.total > 0
+    && Math.abs(sectionPointsTotal - TOTAL_EXAM_POINTS) <= 0.0001
+    && !!selectedSubjectId;
 
   const selectedSubjectData = subjects.find((s) => s.id === parseInt(selectedSubjectId));
   const totalQuestions = selectedSubjectData?._count?.questions ?? 0;
@@ -677,48 +706,26 @@ const TeacherExamGenerator: React.FC = () => {
             )}
           </div>
 
-          {/* Exam Title */}
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1.5">
-              Exam Title *
-            </label>
-            <input
-              type="text"
-              className="input-field"
-              placeholder={selectedSubjectData ? `${selectedSubjectData.name} Midterm` : 'Exam title...'}
-              value={examTitle}
-              onChange={(e) => setExamTitle(e.target.value)}
-            />
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-medium text-gray-700 mb-1">Exam Type</label>
-              <select
-                className="input-field"
-                value={examType}
-                onChange={(e) => {
-                  const nextType = e.target.value;
-                  setExamType(nextType);
-                  if (nextType === 'FULL_ESSAY') {
-                    setRequirements((prev) => ({
-                      ...prev,
-                      multipleChoice: 0,
-                      essay: prev.total,
-                    }));
-                  }
-                }}
-              >
-                <option value="FULL_ESSAY">Full Essay</option>
-                <option value="MIXED">Mixed (Essay + MCQ)</option>
-              </select>
+          {/* Exam Title & Duration Grid */}
+          <div className="grid grid-cols-3 gap-3">
+            <div className="col-span-2">
+              <label className="block text-sm font-medium text-gray-700 mb-1.5">
+                Exam Title *
+              </label>
+              <input
+                type="text"
+                className="input-field py-2.5"
+                placeholder={selectedSubjectData ? `${selectedSubjectData.name} Midterm` : 'Exam title...'}
+                value={examTitle}
+                onChange={(e) => setExamTitle(e.target.value)}
+              />
             </div>
             <div>
-              <label className="block text-xs font-medium text-gray-700 mb-1">Duration (minutes)</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1.5">Duration (min)</label>
               <input
                 type="number"
                 min={15}
-                className="input-field"
+                className="input-field py-2.5"
                 value={durationMinutes}
                 onChange={(e) => setDurationMinutes(parseInt(e.target.value, 10) || 60)}
               />
@@ -777,7 +784,6 @@ const TeacherExamGenerator: React.FC = () => {
                     type="number"
                     min={0}
                     className="input-field"
-                    disabled={examType === 'FULL_ESSAY' && field === 'multipleChoice'}
                     value={requirements[field]}
                     onChange={(e) => handleReqChange(field, parseInt(e.target.value) || 0)}
                   />
@@ -810,7 +816,9 @@ const TeacherExamGenerator: React.FC = () => {
                     onChange={(e) => setSectionPoints((prev) => ({ ...prev, essay: Number(e.target.value || 0) }))}
                   />
                 </div>
-                <p className="text-xs text-gray-500 mt-1">Defaults: MCQ 7, Essay 3 — these totals determine per-question default points.</p>
+                <p className={`text-xs mt-1 ${Math.abs(sectionPointsTotal - TOTAL_EXAM_POINTS) > 0.0001 ? 'text-red-600' : 'text-gray-500'}`}>
+                  Total: {sectionPointsTotal}. Required total: {TOTAL_EXAM_POINTS}. Defaults for mixed exams: MCQ 7, Essay 3.
+                </p>
               </div>
             </div>
 

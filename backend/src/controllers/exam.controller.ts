@@ -17,7 +17,7 @@ import {
 } from '../services/docx.service';
 import { uploadImageToCloudinary, uploadPdfToCloudinary } from '../services/cloudinary.service';
 import { mergeImagesToPdfBuffer } from '../services/pdf.service';
-import { processOmrImage, fuzzyMatchStudentCode } from '../services/omr-client.service';
+import { processOmrImage, fuzzyMatchStudentCode, deriveMssvSixDigits } from '../services/omr-client.service';
 import type { OmrProcessResult } from '../services/omr-client.service';
 import { config } from '../config';
 import jwt from 'jsonwebtoken';
@@ -32,6 +32,10 @@ type ExamRequirements = {
   total: number;
   multipleChoice: number;
   essay: number;
+  sectionPoints?: {
+    multipleChoice?: number;
+    essay?: number;
+  };
   scannablePages?: number;
   difficultyDistribution?: {
     multipleChoice: { easy: number; medium: number; hard: number };
@@ -70,6 +74,85 @@ const normalizePositiveInt = (value: unknown, fallback: number): number => {
   const normalized = Number.parseInt(String(value), 10);
   if (Number.isFinite(normalized) && normalized > 0) return normalized;
   return fallback;
+};
+
+const TOTAL_EXAM_POINTS = 10;
+const POINTS_EPSILON = 0.0001;
+
+const sumPoints = (values: number[]): number => {
+  return values.reduce((total, value) => total + Number(value || 0), 0);
+};
+
+const hasExpectedTotalPoints = (values: number[]): boolean => {
+  return Math.abs(sumPoints(values) - TOTAL_EXAM_POINTS) <= POINTS_EPSILON;
+};
+
+const resolveSectionPointTotals = (
+  sectionPoints: ExamRequirements['sectionPoints'],
+  mcqCount: number,
+  essayCount: number
+): { multipleChoice: number; essay: number } => {
+  const multipleChoice = mcqCount > 0
+    ? Number(sectionPoints?.multipleChoice ?? (essayCount > 0 ? 7 : TOTAL_EXAM_POINTS))
+    : 0;
+  const essay = essayCount > 0
+    ? Number(sectionPoints?.essay ?? (mcqCount > 0 ? 3 : TOTAL_EXAM_POINTS))
+    : 0;
+
+  return { multipleChoice, essay };
+};
+
+const validateSectionPointTotals = (
+  sectionPoints: ExamRequirements['sectionPoints'],
+  mcqCount: number,
+  essayCount: number
+): string | null => {
+  const totals = resolveSectionPointTotals(sectionPoints, mcqCount, essayCount);
+  if (!Number.isFinite(totals.multipleChoice) || totals.multipleChoice < 0) {
+    return 'Section points for multipleChoice must be a number >= 0';
+  }
+  if (!Number.isFinite(totals.essay) || totals.essay < 0) {
+    return 'Section points for essay must be a number >= 0';
+  }
+  if (!hasExpectedTotalPoints([totals.multipleChoice, totals.essay])) {
+    return `Total section points must equal ${TOTAL_EXAM_POINTS}`;
+  }
+  return null;
+};
+
+const allocateSectionPoints = (totalPoints: number, count: number): number[] => {
+  if (count <= 0) return [];
+  const totalCents = Math.round(totalPoints * 100);
+  const baseCents = Math.floor(totalCents / count);
+  const remainder = totalCents - baseCents * count;
+
+  return Array.from({ length: count }, (_, index) => {
+    return (baseCents + (index < remainder ? 1 : 0)) / 100;
+  });
+};
+
+const buildQuestionPointsByType = (
+  questions: Array<{ type: string }>,
+  sectionPoints: ExamRequirements['sectionPoints']
+): number[] => {
+  const mcqCount = questions.filter((question) => question.type === 'MULTIPLE_CHOICE').length;
+  const essayCount = questions.filter((question) => question.type === 'ESSAY').length;
+  const totals = resolveSectionPointTotals(sectionPoints, mcqCount, essayCount);
+  const mcqPoints = allocateSectionPoints(totals.multipleChoice, mcqCount);
+  const essayPoints = allocateSectionPoints(totals.essay, essayCount);
+  let mcqIndex = 0;
+  let essayIndex = 0;
+
+  return questions.map((question) => {
+    if (question.type === 'MULTIPLE_CHOICE') {
+      const points = mcqPoints[mcqIndex];
+      mcqIndex += 1;
+      return points;
+    }
+    const points = essayPoints[essayIndex];
+    essayIndex += 1;
+    return points;
+  });
 };
 
 /**
@@ -1688,6 +1771,8 @@ const validateRequirements = (requirements: ExamRequirements): string | null => 
   if (multipleChoice + essay !== total) {
     return 'Sum of question types must equal total';
   }
+  const sectionPointsError = validateSectionPointTotals(requirements.sectionPoints, multipleChoice, essay);
+  if (sectionPointsError) return sectionPointsError;
   if (requirements.difficultyDistribution) {
     const mc = requirements.difficultyDistribution.multipleChoice;
     const essayDist = requirements.difficultyDistribution.essay;
@@ -2108,27 +2193,15 @@ export const createExamDraft = async (req: AuthRequest, res: Response): Promise<
         },
       });
 
-      // Determine sectionPoints: defaults to 7 for MCQ and 3 for Essay
-      const sectionPoints = (requirements && (requirements as any).sectionPoints)
-        ? (requirements as any).sectionPoints
-        : { multipleChoice: 7, essay: 3 };
-
-      const mcqCount = selectedQuestions.filter((sq) => sq.type === 'MULTIPLE_CHOICE').length;
-      const essayCount = selectedQuestions.filter((sq) => sq.type === 'ESSAY').length;
+      const questionPoints = buildQuestionPointsByType(selectedQuestions, requirements.sectionPoints);
 
       await tx.examQuestion.createMany({
         data: selectedQuestions.map((q, idx) => {
-          const isMcq = q.type === 'MULTIPLE_CHOICE';
-          const totalObjective = mcqCount > 0 ? Number(sectionPoints.multipleChoice ?? 7) : 0;
-          const totalEssay = mcqCount > 0 ? Number(sectionPoints.essay ?? 3) : Number(sectionPoints.essay ?? 10);
-          const pts = isMcq
-            ? mcqCount > 0 ? Number((totalObjective / mcqCount).toFixed(4)) : 0
-            : essayCount > 0 ? Number((totalEssay / essayCount).toFixed(4)) : 0;
           return {
             examId: exam.id,
             questionId: q.id,
             position: idx + 1,
-            points: pts,
+            points: questionPoints[idx],
           };
         }),
       });
@@ -2298,6 +2371,14 @@ export const updateExamConfiguration = async (req: AuthRequest, res: Response): 
       return;
     }
 
+    if (requirements) {
+      const requirementsError = validateRequirements(requirements);
+      if (requirementsError) {
+        res.status(400).json({ error: requirementsError });
+        return;
+      }
+    }
+
     const existingRequirements = parseExamRequirements(exam.requirements);
     const fallbackBlueprint = buildFallbackScanBlueprintFromQuestions(exam.questions);
     const resolvedScanBlueprint = normalizeStoredScanBlueprint(
@@ -2345,35 +2426,21 @@ export const updateExamConfiguration = async (req: AuthRequest, res: Response): 
     try {
       const incomingReq = requirements as ExamRequirements | undefined;
       if (incomingReq && (incomingReq as any).sectionPoints) {
-        const sectionPoints = (incomingReq as any).sectionPoints as { multipleChoice?: number; essay?: number };
-
         const questions = updated.questions || [];
-        const mcq = questions.filter((q) => q.question.type === 'MULTIPLE_CHOICE');
-        const essayQ = questions.filter((q) => q.question.type === 'ESSAY');
-
-        const mcqCount = mcq.length;
-        const essayCount = essayQ.length;
-
-        const totalObjective = mcqCount > 0 ? Number(sectionPoints.multipleChoice ?? 7) : 0;
-        const totalEssay = mcqCount > 0 ? Number(sectionPoints.essay ?? 3) : Number(sectionPoints.essay ?? 10);
+        const questionPoints = buildQuestionPointsByType(
+          questions.map((item) => ({ type: item.question.type })),
+          incomingReq.sectionPoints
+        );
 
         await prisma.$transaction(async (tx) => {
-          if (mcqCount > 0) {
-            const per = Number((totalObjective / mcqCount).toFixed(4));
-            await Promise.all(
-              mcq.map((item) =>
-                tx.examQuestion.update({ where: { examId_questionId: { examId: updated.id, questionId: item.questionId } }, data: { points: per } })
-              )
-            );
-          }
-          if (essayCount > 0) {
-            const per = Number((totalEssay / essayCount).toFixed(4));
-            await Promise.all(
-              essayQ.map((item) =>
-                tx.examQuestion.update({ where: { examId_questionId: { examId: updated.id, questionId: item.questionId } }, data: { points: per } })
-              )
-            );
-          }
+          await Promise.all(
+            questions.map((item, index) =>
+              tx.examQuestion.update({
+                where: { examId_questionId: { examId: updated.id, questionId: item.questionId } },
+                data: { points: questionPoints[index] },
+              })
+            )
+          );
           await tx.exam.update({ where: { id: updated.id }, data: { version: { increment: 1 } } });
         });
 
@@ -2576,8 +2643,8 @@ export const updateExamQuestionPoints = async (req: AuthRequest, res: Response):
     const questionId = toInt(req.params.questionId);
     const { points } = req.body as { points?: number };
 
-    if (points === undefined || Number.isNaN(Number(points))) {
-      res.status(400).json({ error: 'points is required' });
+    if (points === undefined || !Number.isFinite(Number(points)) || Number(points) < 0) {
+      res.status(400).json({ error: 'points must be a number >= 0' });
       return;
     }
 
@@ -2641,6 +2708,13 @@ export const exportExamDocx = async (req: AuthRequest, res: Response): Promise<v
     const essayQuestions = questionList.filter((item) => item.type === 'ESSAY');
     const mcqQuestions = questionList.filter((item) => item.type === 'MULTIPLE_CHOICE');
 
+    if (!hasExpectedTotalPoints(exam.questions.map((item) => item.points))) {
+      res.status(400).json({
+        error: `Exam question points must total ${TOTAL_EXAM_POINTS} before export. Update the section points or individual question points.`,
+      });
+      return;
+    }
+
     // Build points map from ExamQuestion rows for accurate docx rendering
     const pointsMap = new Map<number, number>();
     for (const eq of exam.questions) {
@@ -2700,9 +2774,18 @@ export const createExamSession = async (req: AuthRequest, res: Response): Promis
       return;
     }
 
-    const exam = await prisma.exam.findUnique({ where: { id: examId } });
+    const exam = await prisma.exam.findUnique({
+      where: { id: examId },
+      include: { questions: { select: { points: true } } },
+    });
     if (!exam || exam.teacherId !== req.user!.id) {
       res.status(404).json({ error: 'Exam not found' });
+      return;
+    }
+    if (!hasExpectedTotalPoints(exam.questions.map((item) => item.points))) {
+      res.status(400).json({
+        error: `Exam question points must total ${TOTAL_EXAM_POINTS} before starting a session.`,
+      });
       return;
     }
 
@@ -3218,27 +3301,15 @@ export const cloneExamConfigToDraft = async (req: AuthRequest, res: Response): P
         },
       });
 
-      // Determine sectionPoints (reuse same logic as createExamDraft)
-      const sectionPoints = (parsedReq && (parsedReq as any).sectionPoints)
-        ? (parsedReq as any).sectionPoints
-        : { multipleChoice: 7, essay: 3 };
-
-      const mcqCount = selectedQuestions.filter((sq) => sq.type === 'MULTIPLE_CHOICE').length;
-      const essayCount = selectedQuestions.filter((sq) => sq.type === 'ESSAY').length;
+      const questionPoints = buildQuestionPointsByType(selectedQuestions, parsedReq.sectionPoints);
 
       await tx.examQuestion.createMany({
         data: selectedQuestions.map((q, idx) => {
-          const isMcq = q.type === 'MULTIPLE_CHOICE';
-          const totalObjective = mcqCount > 0 ? Number(sectionPoints.multipleChoice ?? 7) : 0;
-          const totalEssay = mcqCount > 0 ? Number(sectionPoints.essay ?? 3) : Number(sectionPoints.essay ?? 10);
-          const pts = isMcq
-            ? mcqCount > 0 ? Number((totalObjective / mcqCount).toFixed(4)) : 0
-            : essayCount > 0 ? Number((totalEssay / essayCount).toFixed(4)) : 0;
           return {
             examId: exam.id,
             questionId: q.id,
             position: idx + 1,
-            points: pts,
+            points: questionPoints[idx],
           };
         }),
       });
@@ -3686,13 +3757,15 @@ export const gradeSubmissionWithAI = async (req: AuthRequest, res: Response): Pr
     let identityCheck: { nameMatch: boolean; codeMatch: boolean } | null = null;
     if (extractedIdentity) {
       const expectedName = (submission.student?.fullName || '').trim().toLowerCase();
-      const expectedCode = normalizeStudentCode(submission.student?.username);
+      // The OMR sheet encodes only 6 digits (first 2 + last 4 of the MSSV), so
+      // reduce the enrolled username the same way before comparing.
+      const expectedCode = deriveMssvSixDigits(submission.student?.username);
       const foundName = (extractedIdentity.fullName || '').trim().toLowerCase();
       const foundCode = normalizeStudentCode(extractedIdentity.studentCode);
 
       identityCheck = {
         nameMatch: !!foundName && expectedName.includes(foundName),
-        codeMatch: !!foundCode && expectedCode === foundCode,
+        codeMatch: !!foundCode && matchesStudentCodePattern(expectedCode, foundCode),
       };
 
       if (!identityCheck.nameMatch || !identityCheck.codeMatch) {
@@ -4831,6 +4904,13 @@ export const exportExamAnswerKey = async (req: AuthRequest, res: Response): Prom
     const questionList = exam.questions.map((item) => item.question);
     const essayQuestions = questionList.filter((item) => item.type === 'ESSAY');
     const mcqQuestions = questionList.filter((item) => item.type === 'MULTIPLE_CHOICE');
+
+    if (!hasExpectedTotalPoints(exam.questions.map((item) => item.points))) {
+      res.status(400).json({
+        error: `Exam question points must total ${TOTAL_EXAM_POINTS} before exporting the answer key. Update the section points or individual question points.`,
+      });
+      return;
+    }
 
     const pointsMap = new Map<number, number>();
     for (const eq of exam.questions) {
