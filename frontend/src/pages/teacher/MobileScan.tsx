@@ -2,7 +2,23 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import toast from 'react-hot-toast';
 import { useSearchParams } from 'react-router-dom';
-import { Camera, CameraOff, CheckCircle2, RefreshCw, Upload, ScanLine, UserCheck, Save, RotateCcw } from 'lucide-react';
+import {
+  Camera,
+  CameraOff,
+  CheckCircle2,
+  RefreshCw,
+  Upload,
+  ScanLine,
+  UserCheck,
+  Save,
+  RotateCcw,
+  Trash2,
+  X,
+  Image as ImageIcon,
+  PlayCircle,
+  Pencil,
+  Zap,
+} from 'lucide-react';
 
 type StudentLite = {
   id: number;
@@ -57,7 +73,47 @@ type BufferedPage = {
   thumb: string;
 };
 
+type QueuedPaper = {
+  clientId: string;
+  student: StudentLite;
+  pages: BufferedPage[];
+  totalPasses: number;
+  capturedAt: string;
+};
+
+type StoredQueuedPaper = {
+  storageKey: string;
+  sessionId: number;
+  clientId: string;
+  student: StudentLite;
+  pages: Array<Omit<BufferedPage, 'thumb'>>;
+  totalPasses: number;
+  capturedAt: string;
+};
+
+type MobileStartGradingResponse = {
+  message: string;
+  syncedPaperCount: number;
+  syncedImageCount: number;
+  statusUrl?: string;
+  reportUrl?: string;
+  job?: {
+    jobId: string;
+    status: string;
+    progress: number;
+    message: string;
+  };
+};
+
 type ViewfinderVariant = 'omr' | 'identityEssay' | 'essayPage' | 'generic';
+
+type TorchCapabilities = MediaTrackCapabilities & {
+  torch?: boolean;
+};
+
+type TorchConstraintSet = MediaTrackConstraintSet & {
+  torch?: boolean;
+};
 
 /**
  * Anchor target centres (percentage of the A4 sheet), matching the canonical
@@ -147,13 +203,142 @@ const publicApi = axios.create({
   headers: { 'Content-Type': 'application/json' },
 });
 
+const MOBILE_SCAN_DB_NAME = 'nt208-mobile-scan';
+const MOBILE_SCAN_DB_VERSION = 1;
+const MOBILE_SCAN_STORE = 'queuedPapers';
+
+const openMobileScanDb = (): Promise<IDBDatabase> => {
+  if (!window.indexedDB) {
+    return Promise.reject(new Error('IndexedDB is not supported by this browser'));
+  }
+
+  return new Promise((resolve, reject) => {
+    const request = window.indexedDB.open(MOBILE_SCAN_DB_NAME, MOBILE_SCAN_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(MOBILE_SCAN_STORE)) {
+        const store = db.createObjectStore(MOBILE_SCAN_STORE, { keyPath: 'storageKey' });
+        store.createIndex('sessionId', 'sessionId', { unique: false });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error('Failed to open mobile scan storage'));
+  });
+};
+
+const runMobileScanStore = async <T,>(
+  mode: IDBTransactionMode,
+  action: (store: IDBObjectStore) => IDBRequest<T> | void
+): Promise<T | undefined> => {
+  const db = await openMobileScanDb();
+  return await new Promise((resolve, reject) => {
+    const tx = db.transaction(MOBILE_SCAN_STORE, mode);
+    const store = tx.objectStore(MOBILE_SCAN_STORE);
+    const request = action(store);
+    let result: T | undefined;
+
+    if (request) {
+      request.onsuccess = () => {
+        result = request.result;
+      };
+      request.onerror = () => reject(request.error || new Error('Mobile scan storage request failed'));
+    }
+
+    tx.oncomplete = () => {
+      db.close();
+      resolve(result);
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error || new Error('Mobile scan storage transaction failed'));
+    };
+    tx.onabort = () => {
+      db.close();
+      reject(tx.error || new Error('Mobile scan storage transaction aborted'));
+    };
+  });
+};
+
+const getQueuedPaperStorageKey = (sessionId: number, studentId: number) => {
+  return `${sessionId}:student:${studentId}`;
+};
+
+const toStoredQueuedPaper = (sessionId: number, paper: QueuedPaper): StoredQueuedPaper => ({
+  storageKey: getQueuedPaperStorageKey(sessionId, paper.student.id),
+  sessionId,
+  clientId: paper.clientId,
+  student: paper.student,
+  totalPasses: paper.totalPasses,
+  capturedAt: paper.capturedAt,
+  pages: paper.pages.map((page) => ({
+    passIndex: page.passIndex,
+    purpose: page.purpose,
+    blob: page.blob,
+  })),
+});
+
+const toQueuedPaper = (stored: StoredQueuedPaper): QueuedPaper => ({
+  clientId: stored.clientId,
+  student: stored.student,
+  totalPasses: stored.totalPasses,
+  capturedAt: stored.capturedAt,
+  pages: stored.pages.map((page) => ({
+    ...page,
+    thumb: URL.createObjectURL(page.blob),
+  })),
+});
+
+const saveQueuedPaperToStorage = async (sessionId: number, paper: QueuedPaper) => {
+  await runMobileScanStore('readwrite', (store) => store.put(toStoredQueuedPaper(sessionId, paper)));
+};
+
+const deleteQueuedPaperFromStorage = async (sessionId: number, studentId: number) => {
+  await runMobileScanStore('readwrite', (store) => store.delete(getQueuedPaperStorageKey(sessionId, studentId)));
+};
+
+const clearQueuedPapersFromStorage = async (sessionId: number) => {
+  const records = await listQueuedPapersFromStorageRaw(sessionId);
+  await runMobileScanStore('readwrite', (store) => {
+    records.forEach((record) => store.delete(record.storageKey));
+  });
+};
+
+const listQueuedPapersFromStorageRaw = async (sessionId: number): Promise<StoredQueuedPaper[]> => {
+  const db = await openMobileScanDb();
+  return await new Promise((resolve, reject) => {
+    const tx = db.transaction(MOBILE_SCAN_STORE, 'readonly');
+    const index = tx.objectStore(MOBILE_SCAN_STORE).index('sessionId');
+    const request = index.getAll(IDBKeyRange.only(sessionId));
+    request.onsuccess = () => resolve((request.result || []) as StoredQueuedPaper[]);
+    request.onerror = () => reject(request.error || new Error('Failed to load mobile scan queue'));
+    tx.oncomplete = () => db.close();
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error || new Error('Mobile scan queue load failed'));
+    };
+  });
+};
+
+const listQueuedPapersFromStorage = async (sessionId: number): Promise<QueuedPaper[]> => {
+  const stored = await listQueuedPapersFromStorageRaw(sessionId);
+  return stored.sort((a, b) => a.capturedAt.localeCompare(b.capturedAt)).map(toQueuedPaper);
+};
+
 // Probe loop tuning.
-const PROBE_INTERVAL_MS = 500;
-const PROBE_MAX_SIDE = 1600; // downscale preview frames before sending; big enough for OMR to read MSSV bubbles
+const PROBE_INTERVAL_MS = 350;
+const PROBE_MAX_SIDE = 1400; // downscale preview frames before sending; big enough for MSSV bubbles
 const PROBE_QUALITY = 0.7;
-const STABLE_FRAMES_REQUIRED = 2; // same recognised student across N consecutive probes before auto-capture
+const STABLE_FRAMES_REQUIRED = 1; // identity-only probe is fast; capture on first confident match
 const CAPTURE_MAX_SIDE = 2200; // final capture stays high-res for accurate grading
 const CAPTURE_QUALITY = 0.92;
+const PAPER_ASPECT_RATIO = 210 / 297;
+
+const createClientId = () => {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+  return `paper-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+};
 
 const TeacherMobileScan: React.FC = () => {
   const [searchParams] = useSearchParams();
@@ -162,10 +347,15 @@ const TeacherMobileScan: React.FC = () => {
   const [context, setContext] = useState<MobileScanContext | null>(null);
   const [loading, setLoading] = useState(true);
   const [cameraOpen, setCameraOpen] = useState(false);
+  const [torchSupported, setTorchSupported] = useState(false);
+  const [torchEnabled, setTorchEnabled] = useState(false);
+  const [torchBusy, setTorchBusy] = useState(false);
 
   // Current paper buffer (held client-side until the whole set is finalised).
   const [pages, setPages] = useState<Record<number, BufferedPage>>({});
   const [activePassIndex, setActivePassIndex] = useState(1);
+  const [queuedPapers, setQueuedPapers] = useState<QueuedPaper[]>([]);
+  const [selectedPageIndex, setSelectedPageIndex] = useState<number | null>(null);
 
   // Identity resolution for the current paper.
   const [recognizedStudent, setRecognizedStudent] = useState<StudentLite | null>(null);
@@ -176,11 +366,13 @@ const TeacherMobileScan: React.FC = () => {
   const [captureReady, setCaptureReady] = useState(false);
   const [captureHint, setCaptureHint] = useState('Camera đang tắt');
   const [busy, setBusy] = useState(false);
-  const [finalizing, setFinalizing] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncStatus, setSyncStatus] = useState('');
 
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const probeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const replaceFileInputRef = useRef<HTMLInputElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const loopTimerRef = useRef<number | null>(null);
   const probeInFlightRef = useRef(false);
@@ -247,6 +439,22 @@ const TeacherMobileScan: React.FC = () => {
     return totalPasses > 0;
   }, [pages, totalPasses]);
 
+  const currentPageCount = Object.keys(pages).length;
+
+  const getOrderedCurrentPages = (): BufferedPage[] => {
+    const ordered: BufferedPage[] = [];
+    for (let p = 1; p <= totalPasses; p += 1) {
+      if (pages[p]) ordered.push(pages[p]);
+    }
+    return ordered;
+  };
+
+  const revokeThumbIfNeeded = (thumb: string) => {
+    if (thumb.startsWith('blob:')) {
+      URL.revokeObjectURL(thumb);
+    }
+  };
+
   const getCameraSupportIssue = (): string | null => {
     if (!window.isSecureContext) {
       return 'Camera trực tiếp cần HTTPS (hoặc localhost). Trên link HTTP, hãy dùng nút Tải ảnh bên dưới.';
@@ -255,6 +463,68 @@ const TeacherMobileScan: React.FC = () => {
       return 'Trình duyệt này không hỗ trợ camera trực tiếp. Hãy dùng nút Tải ảnh bên dưới.';
     }
     return null;
+  };
+
+  const getPrimaryVideoTrack = (): MediaStreamTrack | null => {
+    return streamRef.current?.getVideoTracks()[0] || null;
+  };
+
+  const canUseTorch = (track: MediaStreamTrack | null): boolean => {
+    if (!track || typeof track.getCapabilities !== 'function') return false;
+    try {
+      const capabilities = track.getCapabilities() as TorchCapabilities;
+      return capabilities.torch === true;
+    } catch {
+      return false;
+    }
+  };
+
+  const applyTorch = async (enabled: boolean): Promise<boolean> => {
+    const track = getPrimaryVideoTrack();
+    if (!canUseTorch(track)) {
+      setTorchSupported(false);
+      setTorchEnabled(false);
+      if (enabled) {
+        toast.error('Thiết bị hoặc trình duyệt không hỗ trợ bật flash từ web.');
+      }
+      return false;
+    }
+
+    try {
+      await track!.applyConstraints({
+        advanced: [{ torch: enabled } as TorchConstraintSet],
+      });
+      setTorchSupported(true);
+      setTorchEnabled(enabled);
+      return true;
+    } catch (error: any) {
+      if (enabled) {
+        toast.error(error?.message || 'Không bật được flash trên camera này.');
+      } else {
+        toast.error(error?.message || 'Không tắt được flash trên camera này.');
+      }
+      return false;
+    }
+  };
+
+  const toggleTorch = async () => {
+    if (!cameraOpen || torchBusy) return;
+    setTorchBusy(true);
+    try {
+      await applyTorch(!torchEnabled);
+    } finally {
+      setTorchBusy(false);
+    }
+  };
+
+  const persistQueuedPaperInBackground = (paper: QueuedPaper) => {
+    const sessionId = context?.session.id;
+    if (!sessionId) return;
+
+    void saveQueuedPaperToStorage(sessionId, paper).catch((error) => {
+      toast.error('Không lưu được hàng đợi vào bộ nhớ trình duyệt. Nếu reload, ảnh có thể bị mất.');
+      console.error('Persist mobile scan queue error:', error);
+    });
   };
 
   const loadContext = async () => {
@@ -275,11 +545,15 @@ const TeacherMobileScan: React.FC = () => {
     }
   };
 
-  const resetPaper = () => {
+  const resetPaper = (revokeThumbs = true) => {
+    if (revokeThumbs) {
+      Object.values(pages).forEach((page) => revokeThumbIfNeeded(page.thumb));
+    }
     setPages({});
     setActivePassIndex(1);
     setRecognizedStudent(null);
     setManualStudentId(null);
+    setSelectedPageIndex(null);
     stableRef.current = { studentId: null, count: 0 };
     setProbeStatus('Đưa phiếu trắc nghiệm vào khung để tự nhận diện');
   };
@@ -289,11 +563,18 @@ const TeacherMobileScan: React.FC = () => {
       window.clearInterval(loopTimerRef.current);
       loopTimerRef.current = null;
     }
+    const track = getPrimaryVideoTrack();
+    if (torchEnabled && canUseTorch(track)) {
+      void track!.applyConstraints({ advanced: [{ torch: false } as TorchConstraintSet] }).catch(() => undefined);
+    }
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
     }
     setCameraOpen(false);
+    setTorchSupported(false);
+    setTorchEnabled(false);
+    setTorchBusy(false);
     setCaptureReady(false);
     setCaptureHint('Camera đang tắt');
   };
@@ -319,10 +600,20 @@ const TeacherMobileScan: React.FC = () => {
         stream = await navigator.mediaDevices.getUserMedia({ video: true });
       }
       streamRef.current = stream;
+      const videoTrack = stream.getVideoTracks()[0] || null;
+      setTorchSupported(canUseTorch(videoTrack));
+      setTorchEnabled(false);
+      setTorchBusy(false);
+      videoTrack?.addEventListener('ended', () => {
+        setTorchSupported(false);
+        setTorchEnabled(false);
+        setTorchBusy(false);
+      });
       if (cameraVideoRef.current) {
         cameraVideoRef.current.srcObject = stream;
         await cameraVideoRef.current.play();
       }
+      setTorchSupported(canUseTorch(videoTrack));
       setCameraOpen(true);
     } catch (error: any) {
       toast.error(error?.message || 'Không mở được camera');
@@ -335,9 +626,9 @@ const TeacherMobileScan: React.FC = () => {
     if (!video || !canvas || video.videoWidth === 0 || video.videoHeight === 0) return null;
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) return null;
-    canvas.width = 320;
-    canvas.height = 240;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    canvas.width = 240;
+    canvas.height = 340;
+    drawVideoFrameToCanvas(video, canvas);
     const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
 
     let brightnessTotal = 0;
@@ -370,20 +661,51 @@ const TeacherMobileScan: React.FC = () => {
     else setCaptureHint('Giữ yên và lấp đầy khung bằng tờ phiếu');
   };
 
+  const getPaperCoverSourceRect = (video: HTMLVideoElement) => {
+    const vw = video.videoWidth;
+    const vh = video.videoHeight;
+    const videoAspect = vw / vh;
+
+    if (videoAspect > PAPER_ASPECT_RATIO) {
+      const sw = Math.round(vh * PAPER_ASPECT_RATIO);
+      return {
+        sx: Math.round((vw - sw) / 2),
+        sy: 0,
+        sw,
+        sh: vh,
+      };
+    }
+
+    const sh = Math.round(vw / PAPER_ASPECT_RATIO);
+    return {
+      sx: 0,
+      sy: Math.round((vh - sh) / 2),
+      sw: vw,
+      sh,
+    };
+  };
+
+  const drawVideoFrameToCanvas = (
+    video: HTMLVideoElement,
+    canvas: HTMLCanvasElement,
+    source = getPaperCoverSourceRect(video)
+  ) => {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return false;
+    ctx.drawImage(video, source.sx, source.sy, source.sw, source.sh, 0, 0, canvas.width, canvas.height);
+    return true;
+  };
+
   const grabScaledBlob = async (maxSide: number, quality: number): Promise<Blob | null> => {
     const video = cameraVideoRef.current;
     const canvas = captureCanvasRef.current;
     if (!video || !canvas || video.videoWidth === 0 || video.videoHeight === 0) return null;
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-    const scale = Math.min(1, maxSide / Math.max(vw, vh));
-    const w = Math.max(1, Math.round(vw * scale));
-    const h = Math.max(1, Math.round(vh * scale));
+    const source = getPaperCoverSourceRect(video);
+    const h = Math.max(1, Math.round(Math.min(maxSide, source.sh)));
+    const w = Math.max(1, Math.round(h * PAPER_ASPECT_RATIO));
     canvas.width = w;
     canvas.height = h;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return null;
-    ctx.drawImage(video, 0, 0, w, h);
+    if (!drawVideoFrameToCanvas(video, canvas, source)) return null;
     return await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/jpeg', quality));
   };
 
@@ -392,20 +714,42 @@ const TeacherMobileScan: React.FC = () => {
     const canvas = captureCanvasRef.current;
     if (!video || !canvas || video.videoWidth === 0) return '';
     const w = 160;
-    const h = Math.round((video.videoHeight / video.videoWidth) * w) || 220;
+    const h = Math.round(w / PAPER_ASPECT_RATIO) || 226;
     canvas.width = w;
     canvas.height = h;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return '';
-    ctx.drawImage(video, 0, 0, w, h);
+    if (!drawVideoFrameToCanvas(video, canvas)) return '';
     return canvas.toDataURL('image/jpeg', 0.6);
   };
 
   const bufferPage = (passIndex: number, blob: Blob, thumb: string) => {
-    setPages((prev) => ({
-      ...prev,
-      [passIndex]: { passIndex, purpose: getPassPurpose(passIndex), blob, thumb },
-    }));
+    setPages((prev) => {
+      if (prev[passIndex]) {
+        revokeThumbIfNeeded(prev[passIndex].thumb);
+      }
+      return {
+        ...prev,
+        [passIndex]: { passIndex, purpose: getPassPurpose(passIndex), blob, thumb },
+      };
+    });
+  };
+
+  const deleteCapturedPage = (passIndex: number) => {
+    setPages((prev) => {
+      const next = { ...prev };
+      if (next[passIndex]) {
+        revokeThumbIfNeeded(next[passIndex].thumb);
+        delete next[passIndex];
+      }
+      return next;
+    });
+    if (passIndex === 1) {
+      setRecognizedStudent(null);
+      setManualStudentId(null);
+      stableRef.current = { studentId: null, count: 0 };
+      setProbeStatus('Đưa phiếu trắc nghiệm vào khung để tự nhận diện');
+    }
+    setActivePassIndex(passIndex);
+    setSelectedPageIndex(null);
   };
 
   const advanceAfterCapture = (passIndex: number) => {
@@ -436,10 +780,54 @@ const TeacherMobileScan: React.FC = () => {
     }
   };
 
+  const probePickedIdentity = async (file: Blob) => {
+    try {
+      const formData = new FormData();
+      formData.append('token', token);
+      formData.append('frame', file, 'probe.jpg');
+      const { data } = await publicApi.post<ProbeResult>('/exams/mobile-scan/probe', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      if (data.resolvedStudent) {
+        setRecognizedStudent(data.resolvedStudent);
+        setManualStudentId(null);
+        toast.success(`Đã nhận diện: ${data.resolvedStudent.fullName}`);
+      } else {
+        toast('Chưa nhận diện được MSSV — hãy chọn thí sinh thủ công.', { icon: '⚠️' });
+      }
+    } catch {
+      toast('Chưa nhận diện được MSSV — hãy chọn thí sinh thủ công.', { icon: '⚠️' });
+    }
+  };
+
+  const bufferPickedImage = async (files: FileList | null, passIndex: number, advance: boolean) => {
+    const selectedFile = files?.[0];
+    if (!selectedFile) {
+      toast.error('Chưa chọn ảnh');
+      return;
+    }
+    if (!selectedFile.type.startsWith('image/')) {
+      toast.error('Chỉ chấp nhận tệp ảnh');
+      return;
+    }
+    const thumb = URL.createObjectURL(selectedFile);
+    bufferPage(passIndex, selectedFile, thumb);
+
+    if (isIdentityPass(passIndex)) {
+      await probePickedIdentity(selectedFile);
+    } else {
+      toast.success(`Đã thêm ảnh trang ${passIndex}`);
+    }
+
+    if (advance) {
+      advanceAfterCapture(passIndex);
+    }
+  };
+
   const handleProbeResult = (result: ProbeResult) => {
     const parts: string[] = [`Neo ${result.aligned}/4`];
     parts.push(`MSSV ${result.studentCode || '…'}`);
-    if (result.mcqCount > 0) parts.push(`Đáp án ${result.answeredCount}/${result.mcqCount}`);
+    if (result.recognized) parts.push('Đã nhận diện sinh viên');
     setProbeStatus(parts.join(' · '));
 
     if (result.recognized && result.resolvedStudentId && result.resolvedStudent) {
@@ -544,41 +932,7 @@ const TeacherMobileScan: React.FC = () => {
   };
 
   const uploadFromPicker = async (files: FileList | null) => {
-    const selectedFile = files?.[0];
-    if (!selectedFile) {
-      toast.error('Chưa chọn ảnh');
-      return;
-    }
-    if (!selectedFile.type.startsWith('image/')) {
-      toast.error('Chỉ chấp nhận tệp ảnh');
-      return;
-    }
-    const passIndex = activePassIndex;
-    const thumb = URL.createObjectURL(selectedFile);
-    bufferPage(passIndex, selectedFile, thumb);
-
-    if (isIdentityPass(passIndex)) {
-      try {
-        const formData = new FormData();
-        formData.append('token', token);
-        formData.append('frame', selectedFile, 'probe.jpg');
-        const { data } = await publicApi.post<ProbeResult>('/exams/mobile-scan/probe', formData, {
-          headers: { 'Content-Type': 'multipart/form-data' },
-        });
-        if (data.resolvedStudent) {
-          setRecognizedStudent(data.resolvedStudent);
-          setManualStudentId(null);
-          toast.success(`Đã nhận diện: ${data.resolvedStudent.fullName}`);
-        } else {
-          toast('Chưa nhận diện được MSSV — hãy chọn thí sinh thủ công.', { icon: '⚠️' });
-        }
-      } catch {
-        toast('Chưa nhận diện được MSSV — hãy chọn thí sinh thủ công.', { icon: '⚠️' });
-      }
-    } else {
-      toast.success(`Đã thêm ảnh trang ${passIndex}`);
-    }
-    advanceAfterCapture(passIndex);
+    await bufferPickedImage(files, activePassIndex, true);
   };
 
   const finalizePaper = async () => {
@@ -596,35 +950,134 @@ const TeacherMobileScan: React.FC = () => {
       return;
     }
 
-    setFinalizing(true);
+    const student = effectiveStudent || context?.students.find((item) => item.studentId === effectiveStudentId)?.student || null;
+    if (!student) {
+      toast.error('Không tìm thấy thông tin thí sinh trong phiên quét.');
+      return;
+    }
+
+    const queued: QueuedPaper = {
+      clientId: createClientId(),
+      student,
+      pages: getOrderedCurrentPages().map((page) => ({ ...page })),
+      totalPasses,
+      capturedAt: new Date().toISOString(),
+    };
+
+    setQueuedPapers((prev) => {
+      prev
+        .filter((item) => item.student.id === student.id)
+        .forEach((item) => item.pages.forEach((page) => revokeThumbIfNeeded(page.thumb)));
+      const withoutSameStudent = prev.filter((item) => item.student.id !== student.id);
+      return [...withoutSameStudent, queued];
+    });
+    persistQueuedPaperInBackground(queued);
+    toast.success(`Đã lưu tạm bài cho ${student.fullName}. Có thể quét bài tiếp theo.`);
+    resetPaper(false);
+  };
+
+  const editQueuedPaper = (paper: QueuedPaper) => {
+    if (currentPageCount > 0) {
+      toast.error('Hãy lưu tạm hoặc bỏ bài đang quét trước khi sửa bài trong hàng đợi.');
+      return;
+    }
+
+    const restoredPages: Record<number, BufferedPage> = {};
+    for (const page of paper.pages) {
+      restoredPages[page.passIndex] = page;
+    }
+
+    setQueuedPapers((prev) => prev.filter((item) => item.clientId !== paper.clientId));
+    setPages(restoredPages);
+    setRecognizedStudent(paper.student);
+    setManualStudentId(paper.student.id);
+    setActivePassIndex(1);
+    setSelectedPageIndex(null);
+    toast.success(`Đang sửa bài của ${paper.student.fullName}`);
+  };
+
+  const deleteQueuedPaper = (paper: QueuedPaper) => {
+    paper.pages.forEach((page) => revokeThumbIfNeeded(page.thumb));
+    setQueuedPapers((prev) => prev.filter((item) => item.clientId !== paper.clientId));
+    if (context?.session.id) {
+      void deleteQueuedPaperFromStorage(context.session.id, paper.student.id).catch((error) => {
+        toast.error('Không xóa được bài khỏi bộ nhớ trình duyệt.');
+        console.error('Delete mobile scan queue error:', error);
+      });
+    }
+    toast.success(`Đã xóa bài tạm của ${paper.student.fullName}`);
+  };
+
+  const syncQueueAndStartGrading = async () => {
+    if (!context) {
+      toast.error('Chưa tải được phiên thi.');
+      return;
+    }
+    if (currentPageCount > 0) {
+      toast.error('Hãy lưu tạm hoặc bỏ bài đang quét trước khi bắt đầu chấm.');
+      return;
+    }
+    if (queuedPapers.length === 0) {
+      toast.error('Chưa có bài nào trong hàng đợi RAM.');
+      return;
+    }
+
+    setSyncing(true);
+    setSyncStatus('Đang đồng bộ ảnh từ điện thoại sang backend...');
     try {
       const formData = new FormData();
       formData.append('token', token);
-      formData.append('studentId', String(effectiveStudentId));
-      formData.append('fullSet', '1');
       formData.append('totalPasses', String(totalPasses));
-      for (let p = 1; p <= totalPasses; p += 1) {
-        const name = `scan_p${String(p).padStart(2, '0')}.jpg`;
-        formData.append('files', new File([pages[p].blob], name, { type: 'image/jpeg' }));
-      }
-      const { data } = await publicApi.post('/exams/mobile-scan/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
+      formData.append(
+        'papers',
+        JSON.stringify(
+          queuedPapers.map((paper) => ({
+            clientId: paper.clientId,
+            studentId: paper.student.id,
+            pageCount: paper.pages.length,
+            pages: paper.pages.map((page) => ({
+              passIndex: page.passIndex,
+              purpose: page.purpose,
+            })),
+          }))
+        )
+      );
+
+      queuedPapers.forEach((paper, paperIndex) => {
+        const orderedPages = [...paper.pages].sort((a, b) => a.passIndex - b.passIndex);
+        orderedPages.forEach((page) => {
+          const name = `paper_${String(paperIndex + 1).padStart(4, '0')}_p${String(page.passIndex).padStart(3, '0')}.jpg`;
+          formData.append('files', new File([page.blob], name, { type: page.blob.type || 'image/jpeg' }));
+        });
       });
-      const name = data?.resolvedStudent?.fullName || effectiveStudent?.fullName || 'thí sinh';
-      toast.success(`Đã lưu bài cho ${name}. Tiếp tục bài tiếp theo.`);
-      resetPaper();
+
+      const { data } = await publicApi.post<MobileStartGradingResponse>(
+        '/exams/mobile-scan/start-grading',
+        formData,
+        { headers: { 'Content-Type': 'multipart/form-data' } }
+      );
+
+      if (context?.session.id) {
+        await clearQueuedPapersFromStorage(context.session.id);
+      }
+      queuedPapers.forEach((paper) => paper.pages.forEach((page) => revokeThumbIfNeeded(page.thumb)));
+      setQueuedPapers([]);
+      setSyncStatus(
+        `Đã đồng bộ ${data.syncedPaperCount || 0} bài (${data.syncedImageCount || 0} ảnh) và bắt đầu chấm.`
+      );
+      toast.success('Đã đồng bộ ảnh và bắt đầu chấm.');
       await loadContext();
     } catch (err: any) {
       const payload = err?.response?.data as { error?: string; invalidScans?: Array<{ passIndex?: number }> };
       if (Array.isArray(payload?.invalidScans) && payload.invalidScans.length > 0) {
-        const bad = payload.invalidScans.map((s) => s.passIndex).filter((v): v is number => Number.isFinite(v));
-        toast.error(`Trang ${bad.join(', ')} chưa đạt chất lượng, hãy chụp lại.`);
-        if (bad[0]) setActivePassIndex(bad[0]);
-        return;
+        const bad = payload.invalidScans.map((scan) => scan.passIndex).filter((value): value is number => Number.isFinite(value));
+        toast.error(`Một số ảnh chưa đạt chất lượng: trang ${bad.join(', ')}`);
+      } else {
+        toast.error(payload?.error || 'Đồng bộ và bắt đầu chấm thất bại');
       }
-      toast.error(payload?.error || 'Lưu bài thất bại');
+      setSyncStatus('');
     } finally {
-      setFinalizing(false);
+      setSyncing(false);
     }
   };
 
@@ -632,6 +1085,36 @@ const TeacherMobileScan: React.FC = () => {
     loadContext();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
+
+  useEffect(() => {
+    const sessionId = context?.session.id;
+    if (!sessionId) return;
+
+    let cancelled = false;
+    void listQueuedPapersFromStorage(sessionId)
+      .then((storedPapers) => {
+        if (cancelled) {
+          storedPapers.forEach((paper) => paper.pages.forEach((page) => revokeThumbIfNeeded(page.thumb)));
+          return;
+        }
+        setQueuedPapers((prev) => {
+          prev.forEach((paper) => paper.pages.forEach((page) => revokeThumbIfNeeded(page.thumb)));
+          return storedPapers;
+        });
+        if (storedPapers.length > 0) {
+          setSyncStatus(`Đã khôi phục ${storedPapers.length} bài đã lưu trong phiên quét này.`);
+        }
+      })
+      .catch((error) => {
+        toast.error('Không khôi phục được hàng đợi ảnh đã lưu.');
+        console.error('Load mobile scan queue error:', error);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [context?.session.id]);
 
   useEffect(() => {
     setActivePassIndex((prev) => Math.min(Math.max(prev, 1), totalPasses));
@@ -679,6 +1162,7 @@ const TeacherMobileScan: React.FC = () => {
               <p className="text-gray-600">
                 Phiên #{context.session.id} • {context.session.status} • {totalPasses} trang/bài
               </p>
+              <p className="text-gray-600">Hàng đợi RAM: {queuedPapers.length} bài</p>
             </div>
           ) : (
             <p className="text-sm text-red-600 mt-3">Không tải được dữ liệu phiên thi.</p>
@@ -780,14 +1264,36 @@ const TeacherMobileScan: React.FC = () => {
               {cameraOpen ? <CameraOff size={14} className="inline mr-1" /> : <Camera size={14} className="inline mr-1" />}
               {cameraOpen ? 'Tắt camera' : 'Bật camera'}
             </button>
+            {cameraOpen ? (
+              <button
+                className={`${torchEnabled ? 'btn-primary' : 'btn-secondary'} text-xs disabled:opacity-50`}
+                onClick={toggleTorch}
+                disabled={!torchSupported || torchBusy}
+                title={
+                  torchSupported
+                    ? torchEnabled
+                      ? 'Tắt flash'
+                      : 'Bật flash'
+                    : 'Camera này không hỗ trợ flash từ trình duyệt'
+                }
+              >
+                <Zap size={14} className="inline mr-1" />
+                {torchBusy ? 'Đang đổi…' : torchEnabled ? 'Tắt flash' : 'Bật flash'}
+              </button>
+            ) : null}
             <button
-              className="btn-primary text-xs"
+              className={`btn-primary text-xs ${cameraOpen ? 'col-span-2' : ''}`}
               onClick={captureManually}
               disabled={!cameraOpen || !captureReady || busy}
             >
               {busy ? 'Đang chụp…' : onIdentityPass ? 'Chụp tay trang đầu' : 'Chụp trang này'}
             </button>
           </div>
+          {cameraOpen && !torchSupported && (
+            <p className="text-[11px] text-gray-500">
+              Flash không khả dụng trên camera hoặc trình duyệt hiện tại.
+            </p>
+          )}
 
           {/* Captured thumbnails */}
           {Object.keys(pages).length > 0 && (
@@ -796,9 +1302,12 @@ const TeacherMobileScan: React.FC = () => {
                 pages[p] ? (
                   <button
                     key={p}
-                    onClick={() => setActivePassIndex(p)}
+                    onClick={() => {
+                      setActivePassIndex(p);
+                      setSelectedPageIndex(p);
+                    }}
                     className="relative shrink-0"
-                    title={`Chụp lại trang ${p}`}
+                    title={`Xem/sửa trang ${p}`}
                   >
                     <img
                       src={pages[p].thumb}
@@ -818,20 +1327,73 @@ const TeacherMobileScan: React.FC = () => {
           <button
             className="btn-primary w-full text-sm flex items-center justify-center gap-2 disabled:opacity-50"
             onClick={finalizePaper}
-            disabled={!allCaptured || !effectiveStudentId || finalizing}
+            disabled={!allCaptured || !effectiveStudentId || syncing}
           >
             <Save size={15} />
-            {finalizing
-              ? 'Đang lưu…'
-              : allCaptured
-                ? `Lưu bài cho ${effectiveStudent?.fullName || 'thí sinh'}`
-                : `Chụp đủ ${totalPasses} trang để lưu`}
+            {allCaptured
+              ? `Lưu tạm vào RAM cho ${effectiveStudent?.fullName || 'thí sinh'}`
+              : `Chụp đủ ${totalPasses} trang để lưu tạm`}
           </button>
 
           {Object.keys(pages).length > 0 && (
-            <button className="btn-secondary w-full text-xs flex items-center justify-center gap-1" onClick={resetPaper}>
+            <button className="btn-secondary w-full text-xs flex items-center justify-center gap-1" onClick={() => resetPaper()}>
               <RotateCcw size={13} /> Bỏ bài hiện tại, bắt đầu lại
             </button>
+          )}
+
+          {queuedPapers.length > 0 && (
+            <div className="border border-blue-200 bg-blue-50 rounded-lg p-3 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <p className="text-xs font-medium text-blue-900">Hàng đợi RAM ({queuedPapers.length} bài)</p>
+                <button
+                  className="btn-primary text-xs inline-flex items-center gap-1 disabled:opacity-50"
+                  onClick={syncQueueAndStartGrading}
+                  disabled={syncing}
+                >
+                  <PlayCircle size={14} />
+                  {syncing ? 'Đang đồng bộ…' : 'Start Grading'}
+                </button>
+              </div>
+
+              <div className="space-y-2">
+                {queuedPapers.map((paper, index) => (
+                  <div key={paper.clientId} className="rounded-md border border-blue-200 bg-white p-2 space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <p className="text-xs font-medium text-gray-900 truncate">
+                          {index + 1}. {paper.student.fullName}
+                        </p>
+                        <p className="text-[11px] text-gray-500">
+                          {paper.student.username} • {paper.pages.length}/{paper.totalPasses} trang
+                        </p>
+                      </div>
+                      <div className="flex gap-1">
+                        <button className="btn-secondary text-[10px] px-2 py-1" onClick={() => editQueuedPaper(paper)}>
+                          <Pencil size={12} className="inline mr-0.5" />
+                          Sửa
+                        </button>
+                        <button className="btn-secondary text-[10px] px-2 py-1 text-red-600" onClick={() => deleteQueuedPaper(paper)}>
+                          <Trash2 size={12} className="inline mr-0.5" />
+                          Xóa
+                        </button>
+                      </div>
+                    </div>
+                    <div className="flex gap-1 overflow-x-auto">
+                      {paper.pages.map((page) => (
+                        <img
+                          key={`${paper.clientId}-${page.passIndex}`}
+                          src={page.thumb}
+                          alt={`Bài ${index + 1} trang ${page.passIndex}`}
+                          className="h-12 w-9 shrink-0 rounded border border-gray-200 object-cover"
+                        />
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {syncStatus && <p className="text-xs text-blue-800">{syncStatus}</p>}
+            </div>
           )}
 
           {/* Manual upload fallback */}
@@ -846,7 +1408,6 @@ const TeacherMobileScan: React.FC = () => {
               <input
                 type="file"
                 accept="image/*"
-                capture="environment"
                 className="hidden"
                 onChange={(e) => {
                   void uploadFromPicker(e.target.files);
@@ -863,6 +1424,55 @@ const TeacherMobileScan: React.FC = () => {
           )}
         </div>
       </div>
+
+      <input
+        ref={replaceFileInputRef}
+        type="file"
+        accept="image/*"
+        className="hidden"
+        onChange={(e) => {
+          if (selectedPageIndex !== null) {
+            void bufferPickedImage(e.target.files, selectedPageIndex, false);
+          }
+          e.currentTarget.value = '';
+        }}
+      />
+
+      {selectedPageIndex !== null && pages[selectedPageIndex] && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-3">
+          <div className="w-full max-w-md rounded-xl bg-white p-3 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-sm font-medium text-gray-900">
+                Trang {selectedPageIndex} • {passLabel(selectedPageIndex)}
+              </p>
+              <button className="btn-secondary text-xs p-2" onClick={() => setSelectedPageIndex(null)}>
+                <X size={14} />
+              </button>
+            </div>
+            <img
+              src={pages[selectedPageIndex].thumb}
+              alt={`Trang ${selectedPageIndex}`}
+              className="max-h-[70vh] w-full rounded-lg border border-gray-200 object-contain"
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                className="btn-secondary text-xs inline-flex items-center justify-center gap-1"
+                onClick={() => replaceFileInputRef.current?.click()}
+              >
+                <ImageIcon size={14} />
+                Thay ảnh
+              </button>
+              <button
+                className="btn-secondary text-xs text-red-600 inline-flex items-center justify-center gap-1"
+                onClick={() => deleteCapturedPage(selectedPageIndex)}
+              >
+                <Trash2 size={14} />
+                Xóa ảnh
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <canvas ref={probeCanvasRef} className="hidden" />
       <canvas ref={captureCanvasRef} className="hidden" />

@@ -337,7 +337,23 @@ const TeacherQuestions: React.FC = () => {
 
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-1.5">Correct Answer *</label>
-                <input className="input-field" value={form.answer} onChange={(e) => setForm({ ...form, answer: e.target.value })} required />
+                {form.type === 'ESSAY' ? (
+                  <>
+                    <textarea
+                      className="input-field resize-none"
+                      rows={8}
+                      value={form.answer}
+                      onChange={(e) => setForm({ ...form, answer: e.target.value })}
+                      required
+                    />
+                    <p className="mt-1.5 text-xs text-gray-500 leading-relaxed">
+                      <span className="font-medium text-gray-600">Cách viết đáp án tự luận:</span> chia đáp án mẫu thành nhiều ý, mỗi ý cách nhau một dòng trống. Kết thúc mỗi ý bằng tỉ lệ điểm đặt trong ngoặc, ví dụ{' '}
+                      <span className="font-mono text-gray-700">(30%)</span>, <span className="font-mono text-gray-700">(25%)</span>; tổng các % của một câu nên bằng <span className="font-medium">100%</span>. AI sẽ tách rubric theo từng ý và dùng % làm trọng số điểm cho ý đó khi chấm.
+                    </p>
+                  </>
+                ) : (
+                  <input className="input-field" value={form.answer} onChange={(e) => setForm({ ...form, answer: e.target.value })} required />
+                )}
               </div>
 
               <div className="flex gap-3 pt-2">

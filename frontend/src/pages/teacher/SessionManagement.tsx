@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { AlertTriangle, ArrowLeft, BarChart3, Camera, CameraOff, CheckCircle2, ClipboardCheck, Download, Eye, GripVertical, Loader2, RefreshCw, Upload, XCircle, Copy, Repeat, Search } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, BarChart3, Camera, CameraOff, CheckCircle2, ClipboardCheck, Download, Eye, GripVertical, Loader2, RefreshCw, Upload, XCircle, Copy, Repeat, Search, Trash2 } from 'lucide-react';
 import Layout from '../../components/Layout';
 import api from '../../api';
 import { BulkUploadResponse, BuiltExam, Class, ExamScanEntry, ExamSession, ExamSubmission, LearningOutcome, RegradeResponse, SessionIssuesReport, ExamDraftScan } from '../../types';
@@ -223,6 +223,7 @@ const TeacherSessionManagement: React.FC = () => {
   const [issuesReport, setIssuesReport] = useState<SessionIssuesReport | null>(null);
   const [issuesLoading, setIssuesLoading] = useState(false);
   const [regradingSubmissionId, setRegradingSubmissionId] = useState<number | null>(null);
+  const [deletingSubmissionScansId, setDeletingSubmissionScansId] = useState<number | null>(null);
   const [expandedSubmissionId, setExpandedSubmissionId] = useState<number | null>(null);
   const [inlineEditScore, setInlineEditScore] = useState<{
     submissionId: number;
@@ -1080,10 +1081,35 @@ const TeacherSessionManagement: React.FC = () => {
   const gradeAI = async (submissionId: number) => {
     try {
       await api.post(`/exams/submissions/${submissionId}/grade-ai`, { useScanExtraction: true });
-      toast.success('Batch AI grading completed');
+      toast.success('AI grading completed');
       if (selectedSessionId) fetchSessionDetails(selectedSessionId);
     } catch {
       toast.error('Failed to grade with AI');
+    }
+  };
+
+  const deleteSubmissionScans = async (submission: ExamSubmission) => {
+    const scanCount = resolveScanEntries(submission)?.length || 0;
+    const studentName = submission.student?.fullName || submission.student?.username || 'this student';
+    if (scanCount === 0) {
+      toast.error('No scan images to delete');
+      return;
+    }
+
+    const confirmed = window.confirm(`Delete ${scanCount} scan image(s) and current grading result for ${studentName}?`);
+    if (!confirmed) return;
+
+    setDeletingSubmissionScansId(submission.id);
+    try {
+      await api.delete(`/exams/submissions/${submission.id}/scans`);
+      toast.success(`Cleared scans for ${studentName}. You can scan again.`);
+      if (selectedSessionId) {
+        await fetchSessionDetails(selectedSessionId);
+      }
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to delete scan images');
+    } finally {
+      setDeletingSubmissionScansId(null);
     }
   };
 
@@ -2290,9 +2316,6 @@ const TeacherSessionManagement: React.FC = () => {
                         <p className="text-xs text-gray-500">AI: {item.aiScore ?? '-'} • Final: {item.finalScore ?? '-'} • Scans: {scans?.length ?? 0}</p>
                       </div>
                       <div className="flex gap-2 flex-wrap">
-                        <button className="btn-secondary text-xs" onClick={() => void openCameraForSubmission(item)}>
-                          <Camera size={14} className="inline mr-1" />Camera
-                        </button>
                         <label className="btn-secondary text-xs cursor-pointer">
                           <Upload size={14} className="inline mr-1" />Upload Full Set
                           <input
@@ -2306,16 +2329,25 @@ const TeacherSessionManagement: React.FC = () => {
                             }}
                           />
                         </label>
-                        <button className="btn-secondary text-xs" onClick={() => gradeAI(item.id)}>Batch AI Grade</button>
                         <button
                           className="btn-secondary text-xs"
-                          onClick={() => handleRegrade(item.id)}
-                          disabled={regradingSubmissionId === item.id}
+                          onClick={() => gradeAI(item.id)}
+                          disabled={scans.length === 0}
                         >
-                          <RefreshCw size={14} className="inline mr-1" />
-                          {regradingSubmissionId === item.id ? 'Regrading...' : 'AI Regrade'}
+                          <RefreshCw size={14} className="inline mr-1" />AI Grade
                         </button>
-                        <button className="btn-secondary text-xs" onClick={() => reviewScore(item.id, item.finalScore)}>Manual Review</button>
+                        <button
+                          className="btn-secondary text-xs text-red-700 border-red-200 hover:bg-red-50"
+                          onClick={() => void deleteSubmissionScans(item)}
+                          disabled={scans.length === 0 || deletingSubmissionScansId === item.id}
+                        >
+                          {deletingSubmissionScansId === item.id ? (
+                            <Loader2 size={14} className="inline mr-1 animate-spin" />
+                          ) : (
+                            <Trash2 size={14} className="inline mr-1" />
+                          )}
+                          Delete Scans
+                        </button>
                       </div>
                     </div>
 
