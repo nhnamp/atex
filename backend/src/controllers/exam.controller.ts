@@ -60,6 +60,21 @@ type ScanPassPlan = {
 
 const toInt = (value: unknown): number => parseInt(String(value), 10);
 
+/**
+ * Build a header-safe Content-Disposition value. HTTP header content must be
+ * ASCII, so a filename with non-ASCII characters (e.g. Vietnamese diacritics in
+ * the subject/exam title) is provided both as a stripped-down ASCII fallback and
+ * as a UTF-8 encoded `filename*` per RFC 5987/6266.
+ */
+const contentDispositionAttachment = (filename: string): string => {
+  const asciiFallback = filename
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '') // strip combining diacritical marks
+    .replace(/[^\x20-\x7E]/g, '_') // replace any remaining non-ASCII
+    .replace(/["\\]/g, '_'); // keep the quoted-string intact
+  return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+};
+
 const parseExamRequirements = (raw: string | null | undefined): Partial<ExamRequirements> => {
   try {
     const parsed = JSON.parse(raw || '{}') as unknown;
@@ -2761,7 +2776,7 @@ export const exportExamDocx = async (req: AuthRequest, res: Response): Promise<v
 
     const filename = `exam_${exam.subject.name.replace(/\s+/g, '_')}_${exam.id}_v${exam.version}.docx`;
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Disposition', contentDispositionAttachment(filename));
     res.send(docBuffer);
   } catch (error) {
     console.error('Export exam docx error:', error);
@@ -4473,7 +4488,7 @@ export const exportSessionReportCsv = async (req: AuthRequest, res: Response): P
     const filename = `session_${session.id}_${safeExamTitle}.csv`;
 
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Disposition', contentDispositionAttachment(filename));
     res.status(200).send(csv);
   } catch (error) {
     console.error('Export session report csv error:', error);
@@ -5111,7 +5126,7 @@ export const exportExamAnswerKey = async (req: AuthRequest, res: Response): Prom
 
     const filename = `answer_key_${exam.subject.name.replace(/\s+/g, '_')}_${exam.id}_v${exam.version}.docx`;
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Disposition', contentDispositionAttachment(filename));
     res.send(docBuffer);
   } catch (error) {
     console.error('Export exam answer key error:', error);
