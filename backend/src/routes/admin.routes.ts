@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Router as ExpressRouter } from 'express';
 import multer from 'multer';
 import {
   getAllUsers,
@@ -21,7 +21,7 @@ import {
 import { addStudents, removeStudent } from '../controllers/class.controller';
 import { authenticate, requireRole } from '../middleware/auth';
 
-const router = Router();
+const router: ExpressRouter = Router();
 const upload = multer({ storage: multer.memoryStorage() });
 
 router.use(authenticate, requireRole('ADMIN'));

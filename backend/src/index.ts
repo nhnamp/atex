@@ -3,7 +3,6 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createServer } from 'http';
 import { Server as SocketServer } from 'socket.io';
-import { PrismaClient } from '@prisma/client';
 
 import authRoutes from './routes/auth.routes';
 import adminRoutes from './routes/admin.routes';
@@ -13,9 +12,9 @@ import subjectRoutes from './routes/subject.routes';
 import questionRoutes from './routes/question.routes';
 import examRoutes from './routes/exam.routes';
 import faceRoutes from './routes/face.routes';
+import { prisma } from './lib/prisma';
 
 dotenv.config();
-const prisma = new PrismaClient();
 
 const app = express();
 const httpServer = createServer(app);

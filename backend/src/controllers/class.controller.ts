@@ -1,8 +1,6 @@
 import { Response } from 'express';
-import { PrismaClient } from '@prisma/client';
 import { AuthRequest } from '../middleware/auth';
-
-const prisma = new PrismaClient();
+import { prisma } from '../lib/prisma';
 
 export const getClasses = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
@@ -39,13 +37,17 @@ export const getAllClasses = async (_req: AuthRequest, res: Response): Promise<v
 export const createClass = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const { name, description, teacherId } = req.body;
+    if (req.user!.role !== 'ADMIN') {
+      res.status(403).json({ error: 'Only admins can create courses' });
+      return;
+    }
+
     if (!name) {
       res.status(400).json({ error: 'Class name is required' });
       return;
     }
 
-    // Admin must provide teacherId; teacher uses own id
-    const assignedTeacherId = req.user!.role === 'ADMIN' ? parseInt(teacherId) : req.user!.id;
+    const assignedTeacherId = parseInt(teacherId, 10);
 
     if (!assignedTeacherId || isNaN(assignedTeacherId)) {
       res.status(400).json({ error: 'teacherId is required' });
@@ -328,4 +330,3 @@ export const addStudentsByClass = async (req: AuthRequest, res: Response): Promi
     res.status(500).json({ error: 'Internal server error' });
   }
 };
-

@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Router as ExpressRouter } from 'express';
 import {
   getSessionsByClass,
   getClassAttendanceSummary,
@@ -13,7 +13,7 @@ import {
 } from '../controllers/attendance.controller';
 import { authenticate, requireRole, requireApproved } from '../middleware/auth';
 
-const router = Router();
+const router: ExpressRouter = Router();
 router.use(authenticate, requireApproved);
 
 // Teacher routes

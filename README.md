@@ -5,13 +5,11 @@ A full-stack MVP for student attendance management and paper-exam grading workfl
 ## Features
 
 - **Role-based access**: Admin, Teacher, Student
-- **Teacher account approval**: Admin must approve teacher accounts
 - **Class management**: Create classes, add students by student ID
-- **Live attendance sessions**: 3-code rolling system with 10s countdown per code
+- **Live attendance sessions**: Face enrolling and detecting.
 - **Subject & Question Bank**: Multiple choice + Essay with EASY/MEDIUM/HARD difficulty
 - **Paper Exam Builder**: Generate exam draft from question bank and print `.docx`
 - **Paper Scan + Auto Grading**: OMR for MCQ, AI grading for essay, report review before publish
-- **Minimalist UI**: White & blue design with TailwindCSS
 
 ---
 
@@ -21,11 +19,8 @@ A full-stack MVP for student attendance management and paper-exam grading workfl
 |-----------|-------------------------------------------|
 | Frontend  | React 18, TypeScript, Vite, TailwindCSS   |
 | Backend   | Node.js, Express, TypeScript              |
-| Database  | SQLite via Prisma ORM                     |
-| Realtime  | Socket.IO                                 |
-| AI        | Google Gemini API (`gemini-1.5-flash`)    |
-| Docs      | docx (Word file generation)               |
-| Auth      | JWT (jsonwebtoken) + bcryptjs             |
+| Database  | PostgreSQL via Prisma ORM                 |
+| AI        | Google Gemini API                         |
 
 ---
 
@@ -70,16 +65,6 @@ cd frontend
 npm run dev
 # Runs on http://localhost:5173
 ```
-
----
-
-## Default Accounts
-
-| Role    | Username      | Password     |
-|---------|---------------|--------------|
-| Admin   | `admin`       | `admin123`   |
-| Teacher | `Nguyen Van A`| `teacher123` |
-| Student | `22521000`    | `student123` |
 
 ---
 

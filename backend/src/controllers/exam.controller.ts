@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
+import type { PrismaClient } from '@prisma/client';
 import { AuthRequest } from '../middleware/auth';
+import { prisma } from '../lib/prisma';
 import {
   extractAndGradeSubmissionFromScansBatch,
   getGeminiErrorStatusCode,
@@ -25,7 +26,6 @@ import fs from 'fs';
 import path from 'path';
 import sharp from 'sharp';
 
-const prisma = new PrismaClient();
 const BACKEND_ROOT = path.resolve(__dirname, '..', '..');
 
 type ExamRequirements = {
