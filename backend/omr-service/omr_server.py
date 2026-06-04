@@ -10,6 +10,7 @@ Endpoints:
 POST form fields (multipart/form-data):
   image            (required) the scan image file
   total_questions  (optional) number of MCQ questions (default 20)
+  identity_only    (optional) "1"/"true" to skip MCQ reading for fast live probes
   answer_key       (optional) correct answers, e.g. "aabbccddaabbbbaaccdd";
                    when given, the graded result image marks correct answers
   return_image     (optional) "1"/"true" to include the annotated result image
@@ -57,17 +58,20 @@ def process():
                         "warnings": ["Empty filename"]}), 400
 
     total_questions = request.form.get("total_questions", 20, type=int)
+    identity_only = _truthy(request.form.get("identity_only", "0"))
     answer_key = request.form.get("answer_key") or None
     return_image = _truthy(request.form.get("return_image", "0"))
 
     temp_dir = tempfile.mkdtemp()
     temp_path = os.path.join(temp_dir, image_file.filename)
-    out_path = os.path.join(temp_dir, "result.png") if (return_image or answer_key) else None
+    out_path = os.path.join(temp_dir, "result.png") if (return_image or (answer_key and not identity_only)) else None
 
     try:
         image_file.save(temp_path)
         result = process_omr_image(temp_path, total_questions,
-                                   answer_key=answer_key, output_image_path=out_path)
+                                   answer_key=answer_key,
+                                   output_image_path=out_path,
+                                   identity_only=identity_only)
 
         if return_image and out_path and os.path.exists(out_path):
             img = cv2.imread(out_path)
@@ -81,7 +85,8 @@ def process():
 
         code = result.get("studentCode")
         print(f"[OMR Service] '{image_file.filename}' -> studentCode={code or 'UNREADABLE'}, "
-              f"aligned={result.get('aligned')}, answers={len(result.get('answers') or {})}, "
+              f"aligned={result.get('aligned')}, mode={'identity' if identity_only else 'full'}, "
+              f"answers={len(result.get('answers') or {})}, "
               f"warnings={len(result.get('warnings') or [])}")
         return jsonify(result)
     except Exception as e:

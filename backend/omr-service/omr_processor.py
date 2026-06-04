@@ -62,8 +62,20 @@ SEARCH_WIN = 10                # +/- px local search to absorb residual warp
 # baseline (median of the 4 options) removed so only the student's added ink
 # remains. This is robust to shadow/curvature near the page edge that would
 # otherwise make empty bubbles look filled under a global threshold.
+#
+# An option counts as the answer when it is (a) at least MCQ_MARK_MIN darker
+# than the per-question baseline AND (b) MCQ_MIN_GAP darker than the 2nd-darkest
+# option, with no other option reaching MCQ_MULTI_MIN (which would be a multi
+# mark). The low floor + isolation gap (rather than a single high threshold)
+# catches genuinely faint real-world pen/pencil marks while still rejecting
+# blank bubbles: real photos show empty bubbles at <=0.02 excess with a tiny
+# winner-vs-runnerup gap, whereas even a light mark darkens ONE option clearly
+# above the other three. A contrast/CLAHE scoring pass was tested but did not
+# beat raw grayscale consistently; the raw-score low floor + stricter gap below
+# gives the best combined result across identity_mcq, identity2 and real.
 MCQ_DARK_R = 9                 # disk radius used when measuring MCQ bubble darkness
-MCQ_MARK_MIN = 0.12            # min excess darkness for an option to count as marked
+MCQ_MARK_MIN = 0.023           # min excess darkness for an option to count as marked
+MCQ_MIN_GAP = 0.023            # winner option must beat the runner-up by this much
 MCQ_MULTI_MIN = 0.07           # a 2nd option this dark => multiple marks (invalid)
 # MSSV bubbles are smaller and the marks are frequently faint pencil, so an
 # absolute fill level is unreliable. A digit is recognised by how much DARKER
@@ -80,6 +92,21 @@ DEBUG = os.environ.get("OMR_DEBUG", "0") == "1"
 # ---------------------------------------------------------------------------
 # Page detection + perspective warp
 # ---------------------------------------------------------------------------
+
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+def _enhance_contrast(gray):
+    """CLAHE-based local contrast boost used ONLY to retry anchor detection.
+
+    Phone photos of paper often have uneven lighting / low local contrast that
+    hides the corner anchors from a plain threshold. This is applied strictly as
+    a fallback (when the normal detection finds nothing), so it never alters the
+    geometry/scoring of frames that already detect cleanly. It mirrors the CLAHE
+    step the browser uses for its client-side anchor trigger (opencvAnchors.ts).
+    """
+    return _CLAHE.apply(gray)
+
 
 def _order_quad_by_position(pts):
     """Order 4 points as TL, TR, BR, BL (robust up to ~40 deg rotation)."""
@@ -183,13 +210,8 @@ def _find_page_quad(gray):
     return _order_quad_by_position(quad)
 
 
-def _refine_anchor(warped, tx, ty, win=55):
-    """Find the precise anchor centroid near canonical corner (tx,ty)."""
-    y0, y1 = max(0, ty - win), min(warped.shape[0], ty + win)
-    x0, x1 = max(0, tx - win), min(warped.shape[1], tx + win)
-    roi = warped[y0:y1, x0:x1]
-    if roi.size == 0:
-        return None
+def _anchor_centroid_in_roi(roi, x0, y0, tx, ty):
+    """Otsu-threshold an ROI and return the anchor-like centroid nearest (tx,ty)."""
     _, th = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     th = cv2.morphologyEx(th, cv2.MORPH_CLOSE,
                           cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
@@ -207,6 +229,21 @@ def _refine_anchor(warped, tx, ty, win=55):
         d = (cx - tx) ** 2 + (cy - ty) ** 2
         if d < bd:
             bd, best = d, (cx, cy)
+    return best
+
+
+def _refine_anchor(warped, tx, ty, win=55):
+    """Find the precise anchor centroid near canonical corner (tx,ty)."""
+    y0, y1 = max(0, ty - win), min(warped.shape[0], ty + win)
+    x0, x1 = max(0, tx - win), min(warped.shape[1], tx + win)
+    roi = warped[y0:y1, x0:x1]
+    if roi.size == 0:
+        return None
+    best = _anchor_centroid_in_roi(roi, x0, y0, tx, ty)
+    if best is None:
+        # Contrast-boosted retry for a faint/low-contrast corner. Additive only:
+        # corners that resolve on the plain pass are returned unchanged.
+        best = _anchor_centroid_in_roi(_enhance_contrast(roi), x0, y0, tx, ty)
     return best
 
 
@@ -262,6 +299,11 @@ def preprocess_image(image_path):
     # Pass 1: prefer direct anchor detection (maps anchor centres exactly);
     # fall back to the page quad (maps paper corners) when anchors are unclear.
     anchors = _detect_anchors(gray)
+    if anchors is None:
+        # Contrast-boosted retry for low-contrast phone photos. Strictly additive:
+        # only runs when the plain pass found nothing, so cleanly-detected scans
+        # (the verified test sets) are unaffected.
+        anchors = _detect_anchors(_enhance_contrast(gray))
     if anchors is not None:
         M = cv2.getPerspectiveTransform(anchors, ANCHOR_PX)
         warped = cv2.warpPerspective(gray, M, (CW, CH))
@@ -422,17 +464,17 @@ def extract_mcq_answers(warped, total_questions):
             b["marked"] = bool(excess[bi] >= MCQ_MARK_MIN)
         order = sorted(range(4), key=lambda i: -excess[i])
         best, second = excess[order[0]], excess[order[1]]
-        if best < MCQ_MARK_MIN:
-            answers[str(q)] = "x"
-            status = "blank"
-            warnings.append(f"Q{q}: invalid (blank)")
-        elif second >= MCQ_MULTI_MIN:
+        if second >= MCQ_MULTI_MIN:
             answers[str(q)] = "x"
             status = "multi"
             warnings.append(f"Q{q}: invalid (multiple marks)")
-        else:
+        elif best >= MCQ_MARK_MIN and (best - second) >= MCQ_MIN_GAP:
             answers[str(q)] = MCQ_OPTIONS[order[0]]
             status = "ok"
+        else:
+            answers[str(q)] = "x"
+            status = "blank"
+            warnings.append(f"Q{q}: invalid (blank)")
         questions.append({"questionNumber": q, "bubbles": bubbles,
                           "selected": answers[str(q)], "status": status})
         if DEBUG:
@@ -511,7 +553,7 @@ def extract_student_code(warped):
 
 
 # ---------------------------------------------------------------------------
-# Result image (green = correct answer, red = student's wrong/invalid mark)
+# Result image (green = correct answer, red = detected student mark)
 # ---------------------------------------------------------------------------
 
 GREEN = (0, 170, 0)
@@ -522,9 +564,9 @@ BLUE = (200, 120, 0)
 def annotate_result(warped, mcq_layout, identity_layout, answer_key=None):
     """Render the graded result onto the aligned sheet.
 
-    For every question a GREEN ring marks the correct answer; for questions the
-    student got wrong or left blank/multi-marked, a RED ring also marks each
-    bubble the student actually filled. Detected MSSV digits are ringed in blue.
+    For every question a GREEN ring marks the correct answer; a RED ring marks
+    every bubble detected as filled by the student. A correct filled answer is
+    therefore shown with both rings. Detected MSSV digits are ringed in blue.
     `answer_key` is a string like "aabbccddaabbbbaaccdd" (one char per question,
     case-insensitive). When it is None only the student's marks are shown.
     """
@@ -541,17 +583,15 @@ def annotate_result(warped, mcq_layout, identity_layout, answer_key=None):
             correct = None
             if answer_key and qn <= len(answer_key):
                 correct = answer_key[qn - 1].upper()
-            sel = (q.get("selected") or "x").upper()
-            got_it = correct is not None and sel == correct
             for b in q["bubbles"]:
                 pos = (b["cx"], b["cy"])
                 r = b["r"]
                 if correct and b["option"] == correct:
-                    cv2.circle(vis, pos, r + 5, GREEN, 2)
-                if not got_it and b.get("marked") and b["option"] != correct:
-                    cv2.circle(vis, pos, r + 5, RED, 2)
+                    cv2.circle(vis, pos, r + 8, GREEN, 2)
+                if b.get("marked"):
+                    cv2.circle(vis, pos, r + 2, RED, 2)
 
-    cv2.putText(vis, "Green = correct answer   Red = student's (wrong/invalid) mark",
+    cv2.putText(vis, "Green = correct answer   Red = detected student mark",
                 (40, CH - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
     return vis
 
@@ -561,14 +601,16 @@ def annotate_result(warped, mcq_layout, identity_layout, answer_key=None):
 # ---------------------------------------------------------------------------
 
 def process_omr_image(image_path, total_questions=20, answer_key=None,
-                      output_image_path=None):
+                      output_image_path=None, identity_only=False):
     """Process an exam scan: extract student code and MCQ answers.
 
     Returns a dict with studentCode, answers, mcqLayout, identityLayout,
     confidence, aligned and warnings (kept backward compatible with the Node
     client). When `output_image_path` is given, a graded result image is saved
-    there (green = correct answer, red = student's wrong/invalid mark) and its
-    path is returned under `resultImage`.
+    there (green = correct answer, red = detected student mark) and its
+    path is returned under `resultImage`. When `identity_only` is true, the
+    MCQ grid is skipped so live mobile probes can resolve the student quickly;
+    full MCQ extraction still runs later during grading.
     """
     all_warnings = []
     warped, pw, aligned = preprocess_image(image_path)
@@ -580,8 +622,11 @@ def process_omr_image(image_path, total_questions=20, answer_key=None,
 
     identity = extract_student_code(warped)
     all_warnings.extend(identity.get("warnings", []))
-    mcq = extract_mcq_answers(warped, total_questions)
-    all_warnings.extend(mcq.get("warnings", []))
+    if identity_only:
+        mcq = {"answers": {}, "layout": None, "warnings": []}
+    else:
+        mcq = extract_mcq_answers(warped, total_questions)
+        all_warnings.extend(mcq.get("warnings", []))
 
     # Fold alignment quality into the reported confidence so the backend can
     # flag scans that were only partially aligned.
@@ -589,7 +634,7 @@ def process_omr_image(image_path, total_questions=20, answer_key=None,
 
     result_path = None
     if output_image_path:
-        vis = annotate_result(warped, mcq.get("layout"),
+        vis = annotate_result(warped, None if identity_only else mcq.get("layout"),
                               identity.get("identityLayout"), answer_key)
         cv2.imwrite(output_image_path, vis)
         result_path = output_image_path

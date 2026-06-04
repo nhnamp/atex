@@ -8,6 +8,14 @@ import { BulkUploadResponse, BuiltExam, Class, ExamScanEntry, ExamSession, ExamS
 
 type TabKey = 'AI_GRADING' | 'REPORT' | 'EXAM_VIEW';
 
+type InvalidScanPayload = {
+  passIndex?: number;
+  imageNumber?: number;
+  pageIndex?: number;
+  studentName?: string;
+  studentCode?: string;
+};
+
 type ViewfinderVariant = 'omr' | 'identityEssay' | 'essayPage' | 'generic';
 type ViewfinderZone = {
   id: string;
@@ -65,6 +73,58 @@ const ViewfinderOverlay: React.FC<{ variant: ViewfinderVariant }> = ({ variant }
 
 const sortUploadFiles = (files: File[]): File[] => {
   return [...files].sort((left, right) => left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' }));
+};
+
+const formatInvalidScanIssue = (scan: InvalidScanPayload, index: number): string => {
+  const imageNumber = Number.isFinite(Number(scan.imageNumber))
+    ? Number(scan.imageNumber)
+    : Number.isFinite(Number(scan.passIndex))
+      ? Number(scan.passIndex)
+      : index + 1;
+  const studentName = String(scan.studentName || '').trim();
+  const studentCode = String(scan.studentCode || '').trim();
+  const studentLabel = studentName && studentCode
+    ? `${studentName} (${studentCode})`
+    : studentName || studentCode;
+
+  return studentLabel
+    ? `Ảnh số ${imageNumber} của sinh viên ${studentLabel} đang chưa đạt chất lượng`
+    : `Ảnh số ${imageNumber} đang chưa đạt chất lượng`;
+};
+
+const formatInvalidScanToast = (invalidScans: InvalidScanPayload[]): string => {
+  const visible = invalidScans.slice(0, 3).map(formatInvalidScanIssue);
+  if (invalidScans.length > visible.length) {
+    visible.push(`... và ${invalidScans.length - visible.length} ảnh khác đang chưa đạt chất lượng`);
+  }
+  return visible.join('\n');
+};
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+const normalizeMobileScanUrl = (rawLink: string): string => {
+  let normalizedLink = rawLink;
+  try {
+    const parsed = new URL(rawLink);
+    const isLoopback = LOOPBACK_HOSTS.has(parsed.hostname);
+    const currentHostIsLoopback = LOOPBACK_HOSTS.has(window.location.hostname);
+    if (isLoopback && !currentHostIsLoopback) {
+      parsed.protocol = window.location.protocol;
+      parsed.host = window.location.host;
+      normalizedLink = parsed.toString();
+    }
+  } catch {
+    normalizedLink = rawLink;
+  }
+  return normalizedLink;
+};
+
+const isLikelyMobileScanDevice = (): boolean => {
+  const userAgent = navigator.userAgent || '';
+  const mobileUa = /Android|iPhone|iPad|iPod|Mobile|Windows Phone/i.test(userAgent);
+  const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+  const narrowViewport = window.matchMedia?.('(max-width: 768px)').matches ?? window.innerWidth <= 768;
+  return mobileUa || (coarsePointer && narrowViewport);
 };
 
 const toScanAccessUrl = (scan: ExamScanEntry): string | undefined => {
@@ -981,7 +1041,7 @@ const TeacherSessionManagement: React.FC = () => {
       const invalidScans = Array.isArray(payload?.invalidScans) ? payload.invalidScans : [];
 
       if (invalidScans.length > 0) {
-        toast.error(payload?.error || 'Ảnh bài làm bị mờ hoặc thiếu góc, vui lòng chụp lại rõ nét hơn.');
+        toast.error(formatInvalidScanToast(invalidScans));
         return null;
       }
 
@@ -1540,7 +1600,12 @@ const TeacherSessionManagement: React.FC = () => {
       if (selectedSessionId) fetchSessionDetails(selectedSessionId);
       fetchIssuesReport();
     } catch (err: any) {
-      toast.error(err?.response?.data?.error || 'Failed to upload missing pages');
+      const invalidScans = Array.isArray(err?.response?.data?.invalidScans)
+        ? err.response.data.invalidScans
+        : [];
+      toast.error(invalidScans.length > 0
+        ? formatInvalidScanToast(invalidScans)
+        : err?.response?.data?.error || 'Failed to upload missing pages');
     }
   };
 
@@ -1589,27 +1654,58 @@ const TeacherSessionManagement: React.FC = () => {
 
     try {
       const { data } = await api.post(`/exams/sessions/${selectedSessionId}/mobile-scan-link`);
-      const rawLink = String(data?.scanUrl || '').trim();
-      let normalizedLink = rawLink;
-
-      try {
-        const parsed = new URL(rawLink);
-        const isLoopback = ['localhost', '127.0.0.1', '::1'].includes(parsed.hostname);
-        const currentHostIsLoopback = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
-        if (isLoopback && !currentHostIsLoopback) {
-          parsed.protocol = window.location.protocol;
-          parsed.host = window.location.host;
-          normalizedLink = parsed.toString();
-        }
-      } catch {
-        normalizedLink = rawLink;
-      }
+      const normalizedLink = normalizeMobileScanUrl(String(data?.scanUrl || '').trim());
 
       setMobileScanLink(normalizedLink);
       toast.success('Mobile scan link created');
     } catch (err: any) {
       toast.error(err?.response?.data?.error || 'Failed to create mobile scan link');
     }
+  };
+
+  const openMobileScanOnCurrentDevice = async () => {
+    if (!selectedSessionId) return;
+
+    try {
+      const { data } = await api.post(`/exams/sessions/${selectedSessionId}/mobile-scan-link`);
+      const normalizedLink = normalizeMobileScanUrl(String(data?.scanUrl || '').trim());
+      if (!normalizedLink) {
+        toast.error('Failed to open mobile scanner');
+        return;
+      }
+
+      setMobileScanLink('');
+      toast.success('Đang mở giao diện quét bài trên điện thoại');
+      try {
+        const parsed = new URL(normalizedLink, window.location.href);
+        if (parsed.origin === window.location.origin) {
+          navigate(`${parsed.pathname}${parsed.search}`);
+          return;
+        }
+        window.location.assign(parsed.toString());
+      } catch {
+        window.location.assign(normalizedLink);
+      }
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to open mobile scanner');
+    }
+  };
+
+  const startScanForCurrentDevice = async () => {
+    if (!selectedSessionId) return;
+
+    if (isLikelyMobileScanDevice()) {
+      await openMobileScanOnCurrentDevice();
+      return;
+    }
+
+    if (submissions.length === 0) {
+      toast.error('No submissions to scan');
+      return;
+    }
+    setWorkflowSummary(null);
+    void openCameraForAutoScan();
+    toast.success('Scan mode started in auto-match mode.');
   };
 
   const copyMobileScanLink = async () => {
@@ -1846,15 +1942,7 @@ const TeacherSessionManagement: React.FC = () => {
                 </button>
                 <button
                   className="btn-secondary text-xs"
-                  onClick={() => {
-                    if (submissions.length === 0) {
-                      toast.error('No submissions to scan');
-                      return;
-                    }
-                    setWorkflowSummary(null);
-                    void openCameraForAutoScan();
-                    toast.success('Scan mode started in auto-match mode.');
-                  }}
+                  onClick={() => { void startScanForCurrentDevice(); }}
                   disabled={!selectedSessionId || submissions.length === 0}
                 >
                   Start Scan

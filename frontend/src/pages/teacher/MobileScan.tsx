@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import axios from 'axios';
 import toast from 'react-hot-toast';
 import { useSearchParams } from 'react-router-dom';
+import { detectAnchorQuad, type AnchorPoint } from '../../utils/anchorDetect';
 import {
   Camera,
   CameraOff,
@@ -73,6 +74,20 @@ type BufferedPage = {
   thumb: string;
 };
 
+type FrameMetrics = {
+  brightness: number;
+  edge: number;
+  sharpness: number;
+  preGateOk: boolean;
+};
+
+type IdentityFrameCandidate = {
+  blob: Blob;
+  thumb: string;
+  score: number;
+  capturedAt: number;
+};
+
 type QueuedPaper = {
   clientId: string;
   student: StudentLite;
@@ -103,6 +118,14 @@ type MobileStartGradingResponse = {
     progress: number;
     message: string;
   };
+};
+
+type InvalidScanPayload = {
+  passIndex?: number;
+  imageNumber?: number;
+  pageIndex?: number;
+  studentName?: string;
+  studentCode?: string;
 };
 
 type ViewfinderVariant = 'omr' | 'identityEssay' | 'essayPage' | 'generic';
@@ -202,6 +225,31 @@ const publicApi = axios.create({
   baseURL: '/api',
   headers: { 'Content-Type': 'application/json' },
 });
+
+const formatInvalidScanIssue = (scan: InvalidScanPayload, index: number): string => {
+  const imageNumber = Number.isFinite(Number(scan.imageNumber))
+    ? Number(scan.imageNumber)
+    : Number.isFinite(Number(scan.passIndex))
+      ? Number(scan.passIndex)
+      : index + 1;
+  const studentName = String(scan.studentName || '').trim();
+  const studentCode = String(scan.studentCode || '').trim();
+  const studentLabel = studentName && studentCode
+    ? `${studentName} (${studentCode})`
+    : studentName || studentCode;
+
+  return studentLabel
+    ? `Ảnh số ${imageNumber} của sinh viên ${studentLabel} đang chưa đạt chất lượng`
+    : `Ảnh số ${imageNumber} đang chưa đạt chất lượng`;
+};
+
+const formatInvalidScanToast = (invalidScans: InvalidScanPayload[]): string => {
+  const visible = invalidScans.slice(0, 3).map(formatInvalidScanIssue);
+  if (invalidScans.length > visible.length) {
+    visible.push(`... và ${invalidScans.length - visible.length} ảnh khác đang chưa đạt chất lượng`);
+  }
+  return visible.join('\n');
+};
 
 const MOBILE_SCAN_DB_NAME = 'nt208-mobile-scan';
 const MOBILE_SCAN_DB_VERSION = 1;
@@ -324,12 +372,15 @@ const listQueuedPapersFromStorage = async (sessionId: number): Promise<QueuedPap
   return stored.sort((a, b) => a.capturedAt.localeCompare(b.capturedAt)).map(toQueuedPaper);
 };
 
-// Probe loop tuning.
-const PROBE_INTERVAL_MS = 350;
-const PROBE_MAX_SIDE = 1400; // downscale preview frames before sending; big enough for MSSV bubbles
-const PROBE_QUALITY = 0.7;
-const STABLE_FRAMES_REQUIRED = 1; // identity-only probe is fast; capture on first confident match
-const CAPTURE_MAX_SIDE = 2200; // final capture stays high-res for accurate grading
+// Live loop / trigger tuning.
+const LIVE_LOOP_INTERVAL_MS = 180; // local detector, but slow enough to avoid trigger spam on phones
+const ANCHOR_DETECT_SIDE = 420; // detection canvas width (A4 portrait); big enough to resolve 5mm anchors
+const ANCHOR_STABLE_FRAMES = 8; // consecutive high-quality anchor locks before auto-capture (~1.4s)
+const ANCHOR_MOTION_TOLERANCE = 7; // max average px drift between detector frames
+const AUTO_CAPTURE_COOLDOWN_MS = 2500;
+const BEST_FRAME_SAMPLE_MS = 320;
+const BEST_FRAME_MAX_AGE_MS = 1800;
+const CAPTURE_MAX_SIDE = 2200; // final capture stays high-res for accurate grading + MSSV read
 const CAPTURE_QUALITY = 0.92;
 const PAPER_ASPECT_RATIO = 210 / 297;
 
@@ -362,21 +413,28 @@ const TeacherMobileScan: React.FC = () => {
   const [manualStudentId, setManualStudentId] = useState<number | null>(null);
 
   // Live status.
-  const [probeStatus, setProbeStatus] = useState('Đưa phiếu trắc nghiệm vào khung để tự nhận diện');
+  const [probeStatus, setProbeStatus] = useState('Đưa đủ 4 góc phiếu (4 ô vuông đen) vào khung để tự chụp');
   const [captureReady, setCaptureReady] = useState(false);
   const [captureHint, setCaptureHint] = useState('Camera đang tắt');
+  const [anchorLock, setAnchorLock] = useState(0); // consecutive frames the 4 anchors were locked
   const [busy, setBusy] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState('');
 
   const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
   const probeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const detectCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const captureCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const replaceFileInputRef = useRef<HTMLInputElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const loopTimerRef = useRef<number | null>(null);
-  const probeInFlightRef = useRef(false);
-  const stableRef = useRef<{ studentId: number | null; count: number }>({ studentId: null, count: 0 });
+  const captureInFlightRef = useRef(false);
+  const candidateInFlightRef = useRef(false);
+  const anchorStableRef = useRef(0);
+  const lastAnchorQuadRef = useRef<AnchorPoint[] | null>(null);
+  const bestIdentityFrameRef = useRef<IdentityFrameCandidate | null>(null);
+  const lastCandidateAtRef = useRef(0);
+  const lastAutoCaptureAtRef = useRef(0);
 
   const effectiveStudentId = manualStudentId ?? recognizedStudent?.id ?? null;
 
@@ -554,8 +612,12 @@ const TeacherMobileScan: React.FC = () => {
     setRecognizedStudent(null);
     setManualStudentId(null);
     setSelectedPageIndex(null);
-    stableRef.current = { studentId: null, count: 0 };
-    setProbeStatus('Đưa phiếu trắc nghiệm vào khung để tự nhận diện');
+    anchorStableRef.current = 0;
+    lastAnchorQuadRef.current = null;
+    bestIdentityFrameRef.current = null;
+    lastCandidateAtRef.current = 0;
+    setAnchorLock(0);
+    setProbeStatus('Đưa đủ 4 góc phiếu (4 ô vuông đen) vào khung để tự chụp');
   };
 
   const stopCamera = () => {
@@ -577,6 +639,7 @@ const TeacherMobileScan: React.FC = () => {
     setTorchBusy(false);
     setCaptureReady(false);
     setCaptureHint('Camera đang tắt');
+    resetAnchorLock('Camera đang tắt');
   };
 
   const startCamera = async () => {
@@ -620,7 +683,7 @@ const TeacherMobileScan: React.FC = () => {
     }
   };
 
-  const computeMetrics = (): { brightness: number; edge: number; preGateOk: boolean } | null => {
+  const computeMetrics = (): FrameMetrics | null => {
     const video = cameraVideoRef.current;
     const canvas = probeCanvasRef.current;
     if (!video || !canvas || video.videoWidth === 0 || video.videoHeight === 0) return null;
@@ -628,36 +691,58 @@ const TeacherMobileScan: React.FC = () => {
     if (!ctx) return null;
     canvas.width = 240;
     canvas.height = 340;
-    drawVideoFrameToCanvas(video, canvas);
+    if (!drawVideoFrameToCanvas(video, canvas)) return null;
     const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
 
+    const grays = new Float32Array(canvas.width * canvas.height);
     let brightnessTotal = 0;
-    let edgeTotal = 0;
-    for (let i = 0; i < data.length; i += 4) {
+    for (let i = 0, p = 0; i < data.length; i += 4, p += 1) {
       const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      grays[p] = gray;
       brightnessTotal += gray;
-      if (i >= 8) {
-        const prevGray = 0.299 * data[i - 4] + 0.587 * data[i - 3] + 0.114 * data[i - 2];
-        edgeTotal += Math.abs(gray - prevGray);
+    }
+
+    let edgeTotal = 0;
+    let sharpnessTotal = 0;
+    for (let y = 1; y < canvas.height; y += 1) {
+      const row = y * canvas.width;
+      const prevRow = row - canvas.width;
+      for (let x = 1; x < canvas.width; x += 1) {
+        const p = row + x;
+        const gray = grays[p];
+        const left = grays[p - 1];
+        const up = grays[prevRow + x];
+        edgeTotal += (Math.abs(gray - left) + Math.abs(gray - up)) / 2;
+        sharpnessTotal += Math.abs(gray * 2 - left - up);
       }
     }
     const pixels = data.length / 4;
     const brightness = brightnessTotal / Math.max(1, pixels);
     const edge = edgeTotal / Math.max(1, pixels);
-    return { brightness, edge, preGateOk: brightness > 60 && brightness < 215 && edge > 7 };
+    const sharpness = sharpnessTotal / Math.max(1, pixels);
+    return {
+      brightness,
+      edge,
+      sharpness,
+      preGateOk: brightness > 68 && brightness < 215 && edge > 6.5 && sharpness > 4.5,
+    };
   };
 
-  const applyQualityHint = (metrics: { brightness: number; edge: number } | null) => {
+  const applyQualityHint = (metrics: FrameMetrics | null, strictIdentity = false) => {
     if (!metrics) {
       setCaptureReady(false);
       setCaptureHint('Đang chờ tín hiệu camera');
       return;
     }
-    const ready = metrics.brightness > 65 && metrics.brightness < 210 && metrics.edge > 8;
+    // Essay/answer pages are not OMR'd at capture (only buffered), so the gate
+    // is purely a framing hint — kept lenient so the border turns green easily.
+    const ready = strictIdentity
+      ? metrics.preGateOk
+      : metrics.brightness > 50 && metrics.brightness < 225 && metrics.edge > 4.5 && metrics.sharpness > 3;
     setCaptureReady(ready);
     if (ready) setCaptureHint('Ảnh đủ nét — chạm Chụp');
-    else if (metrics.brightness <= 65) setCaptureHint('Thiếu sáng, tăng ánh sáng');
-    else if (metrics.brightness >= 210) setCaptureHint('Quá chói, tránh loá');
+    else if (metrics.brightness <= (strictIdentity ? 68 : 50)) setCaptureHint('Thiếu sáng, tăng ánh sáng');
+    else if (metrics.brightness >= (strictIdentity ? 215 : 225)) setCaptureHint('Quá chói, tránh loá');
     else setCaptureHint('Giữ yên và lấp đầy khung bằng tờ phiếu');
   };
 
@@ -745,8 +830,12 @@ const TeacherMobileScan: React.FC = () => {
     if (passIndex === 1) {
       setRecognizedStudent(null);
       setManualStudentId(null);
-      stableRef.current = { studentId: null, count: 0 };
-      setProbeStatus('Đưa phiếu trắc nghiệm vào khung để tự nhận diện');
+      anchorStableRef.current = 0;
+      lastAnchorQuadRef.current = null;
+      bestIdentityFrameRef.current = null;
+      lastCandidateAtRef.current = 0;
+      setAnchorLock(0);
+      setProbeStatus('Đưa đủ 4 góc phiếu (4 ô vuông đen) vào khung để tự chụp');
     }
     setActivePassIndex(passIndex);
     setSelectedPageIndex(null);
@@ -759,44 +848,124 @@ const TeacherMobileScan: React.FC = () => {
     // When it was the last pass we stay on it; the Finalize button takes over.
   };
 
-  const autoCapturePageOne = async (student: StudentLite) => {
-    if (busy) return;
-    setBusy(true);
+  const identityFrameScore = (metrics: FrameMetrics): number => {
+    const brightnessPenalty = Math.abs(metrics.brightness - 135) * 0.025;
+    return metrics.edge * 1.4 + metrics.sharpness - brightnessPenalty;
+  };
+
+  const averageAnchorDrift = (a: AnchorPoint[], b: AnchorPoint[]): number => {
+    if (a.length !== b.length || a.length === 0) return Infinity;
+    return a.reduce((sum, point, index) => {
+      const other = b[index];
+      return sum + Math.hypot(point.x - other.x, point.y - other.y);
+    }, 0) / a.length;
+  };
+
+  const resetAnchorLock = (message?: string) => {
+    anchorStableRef.current = 0;
+    lastAnchorQuadRef.current = null;
+    bestIdentityFrameRef.current = null;
+    setAnchorLock(0);
+    if (message) setProbeStatus(message);
+  };
+
+  // Detect the 4 corner anchors in the current preview frame (pure JS, no deps).
+  // Runs on a dedicated canvas, cover-cropped to A4 just like the capture, so a
+  // client lock implies the backend will align the same region.
+  const detectAnchorsClient = (): AnchorPoint[] | null => {
+    const video = cameraVideoRef.current;
+    const canvas = detectCanvasRef.current;
+    if (!video || !canvas || video.videoWidth === 0) return null;
+    const w = ANCHOR_DETECT_SIDE;
+    const h = Math.round(w / PAPER_ASPECT_RATIO);
+    canvas.width = w;
+    canvas.height = h;
+    if (!drawVideoFrameToCanvas(video, canvas)) return null;
+    return detectAnchorQuad(canvas);
+  };
+
+  const captureIdentityCandidate = async (metrics: FrameMetrics) => {
+    const now = Date.now();
+    if (candidateInFlightRef.current || now - lastCandidateAtRef.current < BEST_FRAME_SAMPLE_MS) return;
+    candidateInFlightRef.current = true;
+    lastCandidateAtRef.current = now;
     try {
       const blob = await grabScaledBlob(CAPTURE_MAX_SIDE, CAPTURE_QUALITY);
-      if (!blob) {
-        toast.error('Không lấy được khung hình');
-        return;
-      }
+      if (!blob) return;
       const thumb = makeThumb();
-      bufferPage(1, blob, thumb);
-      setRecognizedStudent(student);
-      setManualStudentId(null);
-      stableRef.current = { studentId: null, count: 0 };
-      toast.success(`Đã nhận diện: ${student.fullName} (${student.username})`);
-      advanceAfterCapture(1);
+      const candidate = {
+        blob,
+        thumb,
+        score: identityFrameScore(metrics),
+        capturedAt: Date.now(),
+      };
+      const current = bestIdentityFrameRef.current;
+      if (!current || candidate.score > current.score || Date.now() - current.capturedAt > BEST_FRAME_MAX_AGE_MS) {
+        bestIdentityFrameRef.current = candidate;
+      }
     } finally {
-      setBusy(false);
+      candidateInFlightRef.current = false;
     }
   };
 
-  const probePickedIdentity = async (file: Blob) => {
+  // Read the MSSV from a captured page-1 frame in the background (never blocks
+  // scanning the next pages). Also re-validates anchor alignment server-side.
+  const resolveIdentityInBackground = async (blob: Blob) => {
     try {
       const formData = new FormData();
       formData.append('token', token);
-      formData.append('frame', file, 'probe.jpg');
+      formData.append('frame', blob, 'identity.jpg');
       const { data } = await publicApi.post<ProbeResult>('/exams/mobile-scan/probe', formData, {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
       if (data.resolvedStudent) {
         setRecognizedStudent(data.resolvedStudent);
         setManualStudentId(null);
-        toast.success(`Đã nhận diện: ${data.resolvedStudent.fullName}`);
+        toast.success(`Đã nhận diện: ${data.resolvedStudent.fullName} (${data.resolvedStudent.username})`);
       } else {
-        toast('Chưa nhận diện được MSSV — hãy chọn thí sinh thủ công.', { icon: '⚠️' });
+        toast('Chưa đọc được MSSV — hãy chọn thí sinh thủ công.', { icon: '⚠️' });
+      }
+      if (typeof data.aligned === 'number' && data.aligned < 4) {
+        toast(`Trang định danh có thể bị lệch (neo ${data.aligned}/4) — cân nhắc chụp lại trang đầu.`, {
+          icon: '⚠️',
+        });
       }
     } catch {
-      toast('Chưa nhận diện được MSSV — hãy chọn thí sinh thủ công.', { icon: '⚠️' });
+      toast('Chưa đọc được MSSV — hãy chọn thí sinh thủ công.', { icon: '⚠️' });
+    }
+  };
+
+  // Auto-capture page 1 only after anchors and image quality stay stable long
+  // enough. We do NOT wait for MSSV here — capture, advance immediately, then
+  // resolve identity in the background while the teacher scans the next pages.
+  const autoCapturePageOneByAnchors = async () => {
+    if (captureInFlightRef.current) return;
+    if (Date.now() - lastAutoCaptureAtRef.current < AUTO_CAPTURE_COOLDOWN_MS) return;
+    captureInFlightRef.current = true;
+    setBusy(true);
+    try {
+      const candidate = bestIdentityFrameRef.current;
+      const canUseCandidate = !!candidate && Date.now() - candidate.capturedAt <= BEST_FRAME_MAX_AGE_MS;
+      const blob = canUseCandidate && candidate
+        ? candidate.blob
+        : await grabScaledBlob(CAPTURE_MAX_SIDE, CAPTURE_QUALITY);
+      if (!blob) {
+        toast.error('Không lấy được khung hình');
+        return;
+      }
+      const thumb = canUseCandidate && candidate ? candidate.thumb : makeThumb();
+      bufferPage(1, blob, thumb);
+      lastAutoCaptureAtRef.current = Date.now();
+      anchorStableRef.current = 0;
+      lastAnchorQuadRef.current = null;
+      bestIdentityFrameRef.current = null;
+      setAnchorLock(0);
+      toast.success('Đã chụp trang định danh. Đang đọc MSSV…');
+      advanceAfterCapture(1);
+      void resolveIdentityInBackground(blob);
+    } finally {
+      setBusy(false);
+      captureInFlightRef.current = false;
     }
   };
 
@@ -814,7 +983,7 @@ const TeacherMobileScan: React.FC = () => {
     bufferPage(passIndex, selectedFile, thumb);
 
     if (isIdentityPass(passIndex)) {
-      await probePickedIdentity(selectedFile);
+      await resolveIdentityInBackground(selectedFile);
     } else {
       toast.success(`Đã thêm ảnh trang ${passIndex}`);
     }
@@ -824,59 +993,51 @@ const TeacherMobileScan: React.FC = () => {
     }
   };
 
-  const handleProbeResult = (result: ProbeResult) => {
-    const parts: string[] = [`Neo ${result.aligned}/4`];
-    parts.push(`MSSV ${result.studentCode || '…'}`);
-    if (result.recognized) parts.push('Đã nhận diện sinh viên');
-    setProbeStatus(parts.join(' · '));
-
-    if (result.recognized && result.resolvedStudentId && result.resolvedStudent) {
-      const prev = stableRef.current;
-      const count = prev.studentId === result.resolvedStudentId ? prev.count + 1 : 1;
-      stableRef.current = { studentId: result.resolvedStudentId, count };
-      if (count >= STABLE_FRAMES_REQUIRED) {
-        void autoCapturePageOne(result.resolvedStudent);
-      }
-    } else {
-      stableRef.current = { studentId: null, count: 0 };
-    }
-  };
-
-  const runProbe = async () => {
-    if (probeInFlightRef.current) return;
-    probeInFlightRef.current = true;
-    try {
-      const frame = await grabScaledBlob(PROBE_MAX_SIDE, PROBE_QUALITY);
-      if (!frame) return;
-      const formData = new FormData();
-      formData.append('token', token);
-      formData.append('frame', frame, 'probe.jpg');
-      const { data } = await publicApi.post<ProbeResult>('/exams/mobile-scan/probe', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
-      handleProbeResult(data);
-    } catch {
-      /* transient probe failure — keep polling */
-    } finally {
-      probeInFlightRef.current = false;
-    }
-  };
-
-  // Single live loop: always refresh the quality hint; additionally probe for
-  // identity on pass 1 until the page is captured.
+  // Single live loop. On the identity page (pass 1, not yet captured) it runs the
+  // pure-JS anchor detector and auto-captures once 4 anchors lock for a few
+  // frames. On every page it also refreshes the framing quality hint so the
+  // manual capture button / border reflect sharpness.
   useEffect(() => {
     if (!cameraOpen) return;
     const tick = () => {
+      const onIdentity = isIdentityPass(activePassIndex) && !pages[activePassIndex] && !!context;
+      // Quality hint (also keeps the manual capture button usable on pass 1).
       const metrics = computeMetrics();
-      applyQualityHint(metrics);
-      const probing = isIdentityPass(activePassIndex) && !pages[activePassIndex] && !!context;
-      if (probing && metrics?.preGateOk) {
-        void runProbe();
-      } else if (probing && !metrics?.preGateOk) {
-        setProbeStatus(metrics ? 'Căn phiếu thẳng, đủ sáng, lấp đầy khung…' : 'Đang chờ tín hiệu camera');
+      applyQualityHint(metrics, onIdentity);
+      if (!onIdentity) return;
+
+      if (!metrics?.preGateOk) {
+        resetAnchorLock(metrics ? 'Ảnh trang đầu chưa đủ nét/sáng để tự chụp' : 'Đang chờ tín hiệu camera');
+        return;
+      }
+
+      const quad = detectAnchorsClient();
+      if (!quad) {
+        resetAnchorLock('Đưa đủ 4 góc phiếu (4 ô vuông đen) vào khung');
+        return;
+      }
+
+      const previousQuad = lastAnchorQuadRef.current;
+      const drift = previousQuad ? averageAnchorDrift(previousQuad, quad) : 0;
+      const count = previousQuad && drift <= ANCHOR_MOTION_TOLERANCE
+        ? anchorStableRef.current + 1
+        : 1;
+      lastAnchorQuadRef.current = quad;
+      anchorStableRef.current = count;
+      setAnchorLock(count);
+
+      void captureIdentityCandidate(metrics);
+
+      setProbeStatus(
+        count >= ANCHOR_STABLE_FRAMES
+          ? 'Đã khóa 4 điểm neo — đang chọn khung nét nhất…'
+          : `Giữ yên trang đầu (${Math.min(count, ANCHOR_STABLE_FRAMES)}/${ANCHOR_STABLE_FRAMES})`
+      );
+      if (count >= ANCHOR_STABLE_FRAMES && bestIdentityFrameRef.current) {
+        void autoCapturePageOneByAnchors();
       }
     };
-    loopTimerRef.current = window.setInterval(tick, PROBE_INTERVAL_MS);
+    loopTimerRef.current = window.setInterval(tick, LIVE_LOOP_INTERVAL_MS);
     return () => {
       if (loopTimerRef.current) {
         window.clearInterval(loopTimerRef.current);
@@ -904,24 +1065,13 @@ const TeacherMobileScan: React.FC = () => {
       bufferPage(passIndex, blob, thumb);
 
       if (isIdentityPass(passIndex)) {
-        // Manual fallback for page 1 — try to resolve identity from this frame.
-        try {
-          const formData = new FormData();
-          formData.append('token', token);
-          formData.append('frame', blob, 'probe.jpg');
-          const { data } = await publicApi.post<ProbeResult>('/exams/mobile-scan/probe', formData, {
-            headers: { 'Content-Type': 'multipart/form-data' },
-          });
-          if (data.resolvedStudent) {
-            setRecognizedStudent(data.resolvedStudent);
-            setManualStudentId(null);
-            toast.success(`Đã nhận diện: ${data.resolvedStudent.fullName}`);
-          } else {
-            toast('Chưa nhận diện được MSSV — hãy chọn thí sinh ở danh sách bên trên.', { icon: '⚠️' });
-          }
-        } catch {
-          toast('Chưa nhận diện được MSSV — hãy chọn thí sinh thủ công.', { icon: '⚠️' });
-        }
+        anchorStableRef.current = 0;
+        lastAnchorQuadRef.current = null;
+        bestIdentityFrameRef.current = null;
+        lastCandidateAtRef.current = 0;
+        setAnchorLock(0);
+        // Manual fallback for page 1 — resolve identity in the background.
+        void resolveIdentityInBackground(blob);
       } else {
         toast.success(`Đã chụp trang ${passIndex}`);
       }
@@ -1068,10 +1218,9 @@ const TeacherMobileScan: React.FC = () => {
       toast.success('Đã đồng bộ ảnh và bắt đầu chấm.');
       await loadContext();
     } catch (err: any) {
-      const payload = err?.response?.data as { error?: string; invalidScans?: Array<{ passIndex?: number }> };
+      const payload = err?.response?.data as { error?: string; invalidScans?: InvalidScanPayload[] };
       if (Array.isArray(payload?.invalidScans) && payload.invalidScans.length > 0) {
-        const bad = payload.invalidScans.map((scan) => scan.passIndex).filter((value): value is number => Number.isFinite(value));
-        toast.error(`Một số ảnh chưa đạt chất lượng: trang ${bad.join(', ')}`);
+        toast.error(formatInvalidScanToast(payload.invalidScans));
       } else {
         toast.error(payload?.error || 'Đồng bộ và bắt đầu chấm thất bại');
       }
@@ -1139,7 +1288,7 @@ const TeacherMobileScan: React.FC = () => {
 
   const onIdentityPass = isIdentityPass(activePassIndex) && !pages[activePassIndex];
   const borderClass = onIdentityPass
-    ? stableRef.current.count > 0
+    ? anchorLock > 0
       ? 'border-green-500'
       : 'border-amber-400'
     : captureReady
@@ -1220,7 +1369,7 @@ const TeacherMobileScan: React.FC = () => {
               <ViewfinderOverlay variant={viewfinderVariant} />
               {onIdentityPass && (
                 <div className="absolute top-2 left-1/2 -translate-x-1/2 rounded-full bg-black/60 px-3 py-1 text-[11px] text-white">
-                  Tự động chụp khi nhận diện đủ
+                  Tự động chụp khi đủ nét và neo ổn định
                 </div>
               )}
             </div>
@@ -1475,6 +1624,7 @@ const TeacherMobileScan: React.FC = () => {
       )}
 
       <canvas ref={probeCanvasRef} className="hidden" />
+      <canvas ref={detectCanvasRef} className="hidden" />
       <canvas ref={captureCanvasRef} className="hidden" />
     </div>
   );

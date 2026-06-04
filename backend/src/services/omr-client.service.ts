@@ -19,7 +19,9 @@ export interface OmrProcessResult {
     table?: { left: number; top: number; right: number; bottom: number };
     questions: Array<{
       questionNumber: number;
-      bubbles: Array<{ option: string; cx: number; cy: number; r: number }>;
+      selected?: string;
+      status?: string;
+      bubbles: Array<{ option: string; cx: number; cy: number; r: number; marked?: boolean; score?: number }>;
     }>;
   } | null;
   identityLayout?: {
@@ -31,8 +33,16 @@ export interface OmrProcessResult {
   confidence: number;
   /** How many of the 4 corner anchors locked onto their canonical position (0-4). */
   aligned?: number;
+  /** Base64 data URI returned by the Python service when returnImage is enabled. */
+  resultImage?: string | null;
   warnings: string[];
 }
+
+type OmrProcessOptions = {
+  identityOnly?: boolean;
+  answerKey?: string | null;
+  returnImage?: boolean;
+};
 
 /**
  * Derive the 6-digit sheet code (first 2 + last 4 digits of the MSSV) used by
@@ -52,7 +62,8 @@ export const deriveMssvSixDigits = (value: unknown): string => {
  */
 export const processOmrImage = async (
   imagePath: string,
-  totalQuestions: number = 52
+  totalQuestions: number = 52,
+  options?: OmrProcessOptions
 ): Promise<OmrProcessResult> => {
   const baseUrl = config.omrServiceUrl;
 
@@ -68,6 +79,15 @@ export const processOmrImage = async (
   const blob = new Blob([fileBuffer], { type: 'image/png' });
   formData.append('image', blob, filename);
   formData.append('total_questions', String(totalQuestions));
+  if (options?.identityOnly) {
+    formData.append('identity_only', '1');
+  }
+  if (options?.answerKey) {
+    formData.append('answer_key', options.answerKey);
+  }
+  if (options?.returnImage) {
+    formData.append('return_image', '1');
+  }
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 30_000); // 30s timeout
@@ -91,6 +111,7 @@ export const processOmrImage = async (
       identityLayout?: OmrProcessResult['identityLayout'];
       confidence?: number;
       warnings?: string[];
+      resultImage?: string | null;
       error?: string;
     };
 
@@ -107,6 +128,7 @@ export const processOmrImage = async (
       aligned: typeof (result as { aligned?: number }).aligned === 'number'
         ? (result as { aligned?: number }).aligned
         : undefined,
+      resultImage: typeof result.resultImage === 'string' ? result.resultImage : null,
       warnings: Array.isArray(result.warnings) ? result.warnings : [],
     };
   } catch (error) {
