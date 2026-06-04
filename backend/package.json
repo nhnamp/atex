@@ -14,13 +14,9 @@
     "prisma:studio": "prisma studio",
     "setup": "npm install && npx prisma generate && npx prisma migrate dev --name init && ts-node prisma/seed.ts"
   },
-  "opencv4nodejs": {
-    "disableAutoBuild": "1"
-  },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
     "@prisma/client": "^5.22.0",
-    "@u4/opencv4nodejs": "^7.1.2",
     "bcryptjs": "^2.4.3",
     "cloudinary": "^2.9.0",
     "cors": "^2.8.5",
