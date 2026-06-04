@@ -1,12 +1,20 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import toast from 'react-hot-toast';
-import { AlertTriangle, ArrowLeft, BarChart3, Camera, CameraOff, CheckCircle2, ClipboardCheck, Download, Eye, GripVertical, Loader2, RefreshCw, Upload, XCircle, Copy, Repeat, Search } from 'lucide-react';
+import { AlertTriangle, ArrowLeft, BarChart3, Camera, CameraOff, CheckCircle2, ClipboardCheck, Download, Eye, GripVertical, Loader2, RefreshCw, Upload, XCircle, Copy, Repeat, Search, Trash2 } from 'lucide-react';
 import Layout from '../../components/Layout';
 import api from '../../api';
 import { BulkUploadResponse, BuiltExam, Class, ExamScanEntry, ExamSession, ExamSubmission, LearningOutcome, RegradeResponse, SessionIssuesReport, ExamDraftScan } from '../../types';
 
 type TabKey = 'AI_GRADING' | 'REPORT' | 'EXAM_VIEW';
+
+type InvalidScanPayload = {
+  passIndex?: number;
+  imageNumber?: number;
+  pageIndex?: number;
+  studentName?: string;
+  studentCode?: string;
+};
 
 type ViewfinderVariant = 'omr' | 'identityEssay' | 'essayPage' | 'generic';
 type ViewfinderZone = {
@@ -65,6 +73,58 @@ const ViewfinderOverlay: React.FC<{ variant: ViewfinderVariant }> = ({ variant }
 
 const sortUploadFiles = (files: File[]): File[] => {
   return [...files].sort((left, right) => left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' }));
+};
+
+const formatInvalidScanIssue = (scan: InvalidScanPayload, index: number): string => {
+  const imageNumber = Number.isFinite(Number(scan.imageNumber))
+    ? Number(scan.imageNumber)
+    : Number.isFinite(Number(scan.passIndex))
+      ? Number(scan.passIndex)
+      : index + 1;
+  const studentName = String(scan.studentName || '').trim();
+  const studentCode = String(scan.studentCode || '').trim();
+  const studentLabel = studentName && studentCode
+    ? `${studentName} (${studentCode})`
+    : studentName || studentCode;
+
+  return studentLabel
+    ? `Ảnh số ${imageNumber} của sinh viên ${studentLabel} đang chưa đạt chất lượng`
+    : `Ảnh số ${imageNumber} đang chưa đạt chất lượng`;
+};
+
+const formatInvalidScanToast = (invalidScans: InvalidScanPayload[]): string => {
+  const visible = invalidScans.slice(0, 3).map(formatInvalidScanIssue);
+  if (invalidScans.length > visible.length) {
+    visible.push(`... và ${invalidScans.length - visible.length} ảnh khác đang chưa đạt chất lượng`);
+  }
+  return visible.join('\n');
+};
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '::1']);
+
+const normalizeMobileScanUrl = (rawLink: string): string => {
+  let normalizedLink = rawLink;
+  try {
+    const parsed = new URL(rawLink);
+    const isLoopback = LOOPBACK_HOSTS.has(parsed.hostname);
+    const currentHostIsLoopback = LOOPBACK_HOSTS.has(window.location.hostname);
+    if (isLoopback && !currentHostIsLoopback) {
+      parsed.protocol = window.location.protocol;
+      parsed.host = window.location.host;
+      normalizedLink = parsed.toString();
+    }
+  } catch {
+    normalizedLink = rawLink;
+  }
+  return normalizedLink;
+};
+
+const isLikelyMobileScanDevice = (): boolean => {
+  const userAgent = navigator.userAgent || '';
+  const mobileUa = /Android|iPhone|iPad|iPod|Mobile|Windows Phone/i.test(userAgent);
+  const coarsePointer = window.matchMedia?.('(pointer: coarse)').matches ?? false;
+  const narrowViewport = window.matchMedia?.('(max-width: 768px)').matches ?? window.innerWidth <= 768;
+  return mobileUa || (coarsePointer && narrowViewport);
 };
 
 const toScanAccessUrl = (scan: ExamScanEntry): string | undefined => {
@@ -223,6 +283,7 @@ const TeacherSessionManagement: React.FC = () => {
   const [issuesReport, setIssuesReport] = useState<SessionIssuesReport | null>(null);
   const [issuesLoading, setIssuesLoading] = useState(false);
   const [regradingSubmissionId, setRegradingSubmissionId] = useState<number | null>(null);
+  const [deletingSubmissionScansId, setDeletingSubmissionScansId] = useState<number | null>(null);
   const [expandedSubmissionId, setExpandedSubmissionId] = useState<number | null>(null);
   const [inlineEditScore, setInlineEditScore] = useState<{
     submissionId: number;
@@ -980,7 +1041,7 @@ const TeacherSessionManagement: React.FC = () => {
       const invalidScans = Array.isArray(payload?.invalidScans) ? payload.invalidScans : [];
 
       if (invalidScans.length > 0) {
-        toast.error(payload?.error || 'Ảnh bài làm bị mờ hoặc thiếu góc, vui lòng chụp lại rõ nét hơn.');
+        toast.error(formatInvalidScanToast(invalidScans));
         return null;
       }
 
@@ -1080,10 +1141,35 @@ const TeacherSessionManagement: React.FC = () => {
   const gradeAI = async (submissionId: number) => {
     try {
       await api.post(`/exams/submissions/${submissionId}/grade-ai`, { useScanExtraction: true });
-      toast.success('Batch AI grading completed');
+      toast.success('AI grading completed');
       if (selectedSessionId) fetchSessionDetails(selectedSessionId);
     } catch {
       toast.error('Failed to grade with AI');
+    }
+  };
+
+  const deleteSubmissionScans = async (submission: ExamSubmission) => {
+    const scanCount = resolveScanEntries(submission)?.length || 0;
+    const studentName = submission.student?.fullName || submission.student?.username || 'this student';
+    if (scanCount === 0) {
+      toast.error('No scan images to delete');
+      return;
+    }
+
+    const confirmed = window.confirm(`Delete ${scanCount} scan image(s) and current grading result for ${studentName}?`);
+    if (!confirmed) return;
+
+    setDeletingSubmissionScansId(submission.id);
+    try {
+      await api.delete(`/exams/submissions/${submission.id}/scans`);
+      toast.success(`Cleared scans for ${studentName}. You can scan again.`);
+      if (selectedSessionId) {
+        await fetchSessionDetails(selectedSessionId);
+      }
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to delete scan images');
+    } finally {
+      setDeletingSubmissionScansId(null);
     }
   };
 
@@ -1514,7 +1600,12 @@ const TeacherSessionManagement: React.FC = () => {
       if (selectedSessionId) fetchSessionDetails(selectedSessionId);
       fetchIssuesReport();
     } catch (err: any) {
-      toast.error(err?.response?.data?.error || 'Failed to upload missing pages');
+      const invalidScans = Array.isArray(err?.response?.data?.invalidScans)
+        ? err.response.data.invalidScans
+        : [];
+      toast.error(invalidScans.length > 0
+        ? formatInvalidScanToast(invalidScans)
+        : err?.response?.data?.error || 'Failed to upload missing pages');
     }
   };
 
@@ -1563,27 +1654,58 @@ const TeacherSessionManagement: React.FC = () => {
 
     try {
       const { data } = await api.post(`/exams/sessions/${selectedSessionId}/mobile-scan-link`);
-      const rawLink = String(data?.scanUrl || '').trim();
-      let normalizedLink = rawLink;
-
-      try {
-        const parsed = new URL(rawLink);
-        const isLoopback = ['localhost', '127.0.0.1', '::1'].includes(parsed.hostname);
-        const currentHostIsLoopback = ['localhost', '127.0.0.1', '::1'].includes(window.location.hostname);
-        if (isLoopback && !currentHostIsLoopback) {
-          parsed.protocol = window.location.protocol;
-          parsed.host = window.location.host;
-          normalizedLink = parsed.toString();
-        }
-      } catch {
-        normalizedLink = rawLink;
-      }
+      const normalizedLink = normalizeMobileScanUrl(String(data?.scanUrl || '').trim());
 
       setMobileScanLink(normalizedLink);
       toast.success('Mobile scan link created');
     } catch (err: any) {
       toast.error(err?.response?.data?.error || 'Failed to create mobile scan link');
     }
+  };
+
+  const openMobileScanOnCurrentDevice = async () => {
+    if (!selectedSessionId) return;
+
+    try {
+      const { data } = await api.post(`/exams/sessions/${selectedSessionId}/mobile-scan-link`);
+      const normalizedLink = normalizeMobileScanUrl(String(data?.scanUrl || '').trim());
+      if (!normalizedLink) {
+        toast.error('Failed to open mobile scanner');
+        return;
+      }
+
+      setMobileScanLink('');
+      toast.success('Đang mở giao diện quét bài trên điện thoại');
+      try {
+        const parsed = new URL(normalizedLink, window.location.href);
+        if (parsed.origin === window.location.origin) {
+          navigate(`${parsed.pathname}${parsed.search}`);
+          return;
+        }
+        window.location.assign(parsed.toString());
+      } catch {
+        window.location.assign(normalizedLink);
+      }
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Failed to open mobile scanner');
+    }
+  };
+
+  const startScanForCurrentDevice = async () => {
+    if (!selectedSessionId) return;
+
+    if (isLikelyMobileScanDevice()) {
+      await openMobileScanOnCurrentDevice();
+      return;
+    }
+
+    if (submissions.length === 0) {
+      toast.error('No submissions to scan');
+      return;
+    }
+    setWorkflowSummary(null);
+    void openCameraForAutoScan();
+    toast.success('Scan mode started in auto-match mode.');
   };
 
   const copyMobileScanLink = async () => {
@@ -1820,15 +1942,7 @@ const TeacherSessionManagement: React.FC = () => {
                 </button>
                 <button
                   className="btn-secondary text-xs"
-                  onClick={() => {
-                    if (submissions.length === 0) {
-                      toast.error('No submissions to scan');
-                      return;
-                    }
-                    setWorkflowSummary(null);
-                    void openCameraForAutoScan();
-                    toast.success('Scan mode started in auto-match mode.');
-                  }}
+                  onClick={() => { void startScanForCurrentDevice(); }}
                   disabled={!selectedSessionId || submissions.length === 0}
                 >
                   Start Scan
@@ -2290,9 +2404,6 @@ const TeacherSessionManagement: React.FC = () => {
                         <p className="text-xs text-gray-500">AI: {item.aiScore ?? '-'} • Final: {item.finalScore ?? '-'} • Scans: {scans?.length ?? 0}</p>
                       </div>
                       <div className="flex gap-2 flex-wrap">
-                        <button className="btn-secondary text-xs" onClick={() => void openCameraForSubmission(item)}>
-                          <Camera size={14} className="inline mr-1" />Camera
-                        </button>
                         <label className="btn-secondary text-xs cursor-pointer">
                           <Upload size={14} className="inline mr-1" />Upload Full Set
                           <input
@@ -2306,16 +2417,25 @@ const TeacherSessionManagement: React.FC = () => {
                             }}
                           />
                         </label>
-                        <button className="btn-secondary text-xs" onClick={() => gradeAI(item.id)}>Batch AI Grade</button>
                         <button
                           className="btn-secondary text-xs"
-                          onClick={() => handleRegrade(item.id)}
-                          disabled={regradingSubmissionId === item.id}
+                          onClick={() => gradeAI(item.id)}
+                          disabled={scans.length === 0}
                         >
-                          <RefreshCw size={14} className="inline mr-1" />
-                          {regradingSubmissionId === item.id ? 'Regrading...' : 'AI Regrade'}
+                          <RefreshCw size={14} className="inline mr-1" />AI Grade
                         </button>
-                        <button className="btn-secondary text-xs" onClick={() => reviewScore(item.id, item.finalScore)}>Manual Review</button>
+                        <button
+                          className="btn-secondary text-xs text-red-700 border-red-200 hover:bg-red-50"
+                          onClick={() => void deleteSubmissionScans(item)}
+                          disabled={scans.length === 0 || deletingSubmissionScansId === item.id}
+                        >
+                          {deletingSubmissionScansId === item.id ? (
+                            <Loader2 size={14} className="inline mr-1 animate-spin" />
+                          ) : (
+                            <Trash2 size={14} className="inline mr-1" />
+                          )}
+                          Delete Scans
+                        </button>
                       </div>
                     </div>
 

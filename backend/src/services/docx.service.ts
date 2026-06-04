@@ -571,24 +571,56 @@ const buildLearningOutcomePage = (mcqs: Question[], essays: Question[]): Array<P
   ];
 };
 
-const buildOutcomeMappingTableText = (mcqs: Question[], essays: Question[]): string => {
+const escapeXml = (value: unknown): string => {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+};
+
+const buildOutcomeMappingTableXml = (mcqs: Question[], essays: Question[]): string => {
   const rows = buildLearningOutcomesMappingRows(mcqs, essays).map((row) => ({
     outcome: sanitizeMultiline(row.outcome || 'UNMAPPED'),
     labels: sanitizeMultiline(row.labels || '-'),
   }));
 
-  const outcomeHeader = 'Outcome';
-  const questionsHeader = 'Questions (MCQ & Essay)';
-  const outcomeWidth = Math.min(
-    60,
-    Math.max(outcomeHeader.length, ...rows.map((row) => row.outcome.length))
-  );
+  const buildCell = (text: string, width: number, bold = false) => {
+    const runProperties = bold ? '<w:rPr><w:b/></w:rPr>' : '';
+    return [
+      '<w:tc>',
+      `<w:tcPr><w:tcW w:w="${width}" w:type="dxa"/><w:vAlign w:val="center"/></w:tcPr>`,
+      `<w:p><w:r>${runProperties}<w:t xml:space="preserve">${escapeXml(text)}</w:t></w:r></w:p>`,
+      '</w:tc>',
+    ].join('');
+  };
 
-  const header = `${outcomeHeader.padEnd(outcomeWidth, ' ')} | ${questionsHeader}`;
-  const divider = `${'-'.repeat(outcomeWidth)}-|-${'-'.repeat(Math.max(questionsHeader.length, 12))}`;
-  const body = rows.map((row) => `${row.outcome.padEnd(outcomeWidth, ' ')} | ${row.labels}`);
+  const buildRow = (outcome: string, labels: string, isHeader = false) => {
+    return `<w:tr>${buildCell(outcome, 6500, isHeader)}${buildCell(labels, 3500, isHeader)}</w:tr>`;
+  };
 
-  return [header, divider, ...body].join('\n');
+  const borders = [
+    '<w:top w:val="single" w:sz="8" w:space="0" w:color="808080"/>',
+    '<w:left w:val="single" w:sz="8" w:space="0" w:color="808080"/>',
+    '<w:bottom w:val="single" w:sz="8" w:space="0" w:color="808080"/>',
+    '<w:right w:val="single" w:sz="8" w:space="0" w:color="808080"/>',
+    '<w:insideH w:val="single" w:sz="6" w:space="0" w:color="BFBFBF"/>',
+    '<w:insideV w:val="single" w:sz="6" w:space="0" w:color="BFBFBF"/>',
+  ].join('');
+
+  return [
+    '<w:tbl>',
+    '<w:tblPr>',
+    '<w:tblW w:w="10000" w:type="dxa"/>',
+    '<w:tblLayout w:type="fixed"/>',
+    `<w:tblBorders>${borders}</w:tblBorders>`,
+    '</w:tblPr>',
+    '<w:tblGrid><w:gridCol w:w="6500"/><w:gridCol w:w="3500"/></w:tblGrid>',
+    buildRow('Outcomes', 'Questions', true),
+    ...rows.map((row) => buildRow(row.outcome, row.labels)),
+    '</w:tbl>',
+  ].join('');
 };
 
 const mapEssaysForTemplate = (essays: Question[], pointsMap?: Map<number, number>): RenderEssay[] => {
@@ -598,6 +630,37 @@ const mapEssaysForTemplate = (essays: Question[], pointsMap?: Map<number, number
     question: sanitizeMultiline(question.content),
     content: sanitizeMultiline(question.content),
   }));
+};
+
+const buildPrintablePointsMap = (questions: Question[], pointsMap?: Map<number, number>): Map<number, number> => {
+  const printablePoints = new Map<number, number>();
+  if (questions.length === 0) return printablePoints;
+
+  const rawPoints = questions.map((question) => {
+    const points = pointsMap?.get(question.id);
+    return Number.isFinite(points) && points! >= 0 ? points! : 1;
+  });
+  const targetCents = Math.round(rawPoints.reduce((total, points) => total + points, 0) * 100);
+  const roundedCents = rawPoints.map((points) => Math.round(points * 100));
+  const roundedTotalCents = roundedCents.reduce((total, points) => total + points, 0);
+  let delta = targetCents - roundedTotalCents;
+  let index = roundedCents.length - 1;
+  while (delta !== 0) {
+    if (delta > 0) {
+      roundedCents[index] += 1;
+      delta -= 1;
+    } else if (roundedCents[index] > 0) {
+      roundedCents[index] -= 1;
+      delta += 1;
+    }
+    index = index === 0 ? roundedCents.length - 1 : index - 1;
+  }
+
+  questions.forEach((question, index) => {
+    printablePoints.set(question.id, roundedCents[index] / 100);
+  });
+
+  return printablePoints;
 };
 
 const mapMcqsForTemplate = (mcqs: Question[], pointsMap?: Map<number, number>): RenderMcq[] => {
@@ -644,11 +707,13 @@ const generateTemplateExamDocx = async (
 ): Promise<Buffer> => {
   const hasMcq = mcqs.length > 0;
   const examCode = `EX-${Date.now().toString().slice(-8)}`;
-  const mappedMcqs = mapMcqsForTemplate(mcqs, pointsMap);
-  const mappedEssays = mapEssaysForTemplate(essays, pointsMap);
+  const printableMcqPoints = buildPrintablePointsMap(mcqs, pointsMap);
+  const printableEssayPoints = buildPrintablePointsMap(essays, pointsMap);
+  const mappedMcqs = mapMcqsForTemplate(mcqs, printableMcqPoints);
+  const mappedEssays = mapEssaysForTemplate(essays, printableEssayPoints);
   const firstEssayQuestions = mappedEssays.slice(0, 1);
   const remainingEssayQuestions = mappedEssays.slice(1);
-  const outcomesText = buildOutcomeMappingTableText(mcqs, essays);
+  const outcomesTableXml = buildOutcomeMappingTableXml(mcqs, essays);
 
   // Compute section totals for template placeholders
   const mcqFullScore = mappedMcqs.reduce((acc, q) => acc + Number(q.score), 0);
@@ -670,7 +735,7 @@ const generateTemplateExamDocx = async (
       essay_questions: mappedEssays,
       first_essay_questions: firstEssayQuestions,
       remaining_essay_questions: remainingEssayQuestions,
-      outcomes_text: outcomesText,
+      outcomes_table_xml: outcomesTableXml,
     }, { blurOmr: true, blurStudentId: true, blueprint, padding: 8 });
   }
 
@@ -688,7 +753,7 @@ const generateTemplateExamDocx = async (
     essay_questions: mappedEssays,
     first_essay_questions: firstEssayQuestions,
     remaining_essay_questions: remainingEssayQuestions,
-    outcomes_text: outcomesText,
+    outcomes_table_xml: outcomesTableXml,
   });
 };
 
@@ -904,16 +969,19 @@ export const generateAnswerKeyDocx = async (
   const examCode = 'ANSWER-KEY';
   const templateFile = 'template-answer-key.docx';
 
+  const printableMcqPoints = buildPrintablePointsMap(mcqs, pointsMap);
+  const printableEssayPoints = buildPrintablePointsMap(essays, pointsMap);
+
   const mappedMcqs = mcqs.map((question, index) => ({
     index: index + 1,
     correct_answer: (question.answer || '').trim().toUpperCase(),
-    score: Number(pointsMap?.get(question.id) ?? 1).toFixed(2),
+    score: Number(printableMcqPoints.get(question.id) ?? 1).toFixed(2),
   }));
 
   const mappedEssays = essays.map((question, index) => ({
     index: index + 1,
     answer: sanitizeMultiline(question.answer),
-    score: Number(pointsMap?.get(question.id) ?? 1).toFixed(2),
+    score: Number(printableEssayPoints.get(question.id) ?? 1).toFixed(2),
   }));
 
   const mcqFullScore = mappedMcqs.reduce((total, question) => total + Number(question.score), 0).toFixed(2);

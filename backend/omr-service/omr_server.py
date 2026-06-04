@@ -2,102 +2,106 @@
 OMR Flask Server — HTTP API for the Python OMR service.
 
 Endpoints:
-  GET  /api/omr/health       → { "status": "ok" }
-  POST /api/omr/process      → { "studentCode": ..., "answers": ..., "mcqLayout": ..., "confidence": ..., "warnings": [...] }
+  GET  /api/omr/health   -> { "status": "ok" }
+  POST /api/omr/process  -> { "studentCode", "answers", "mcqLayout",
+                              "identityLayout", "confidence", "aligned",
+                              "warnings", "resultImage"? }
+
+POST form fields (multipart/form-data):
+  image            (required) the scan image file
+  total_questions  (optional) number of MCQ questions (default 20)
+  identity_only    (optional) "1"/"true" to skip MCQ reading for fast live probes
+  answer_key       (optional) correct answers, e.g. "aabbccddaabbbbaaccdd";
+                   when given, the graded result image marks correct answers
+  return_image     (optional) "1"/"true" to include the annotated result image
+                   as a base64 PNG under "resultImage"
 """
 
+import base64
 import os
 import sys
 import tempfile
 import traceback
+
+import cv2
 from flask import Flask, request, jsonify
 
-# Add current directory to path for local imports.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from omr_processor import process_omr_image
 
 app = Flask(__name__)
 
-# Configuration
 PORT = int(os.environ.get("OMR_SERVICE_PORT", 5001))
-MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50 MB max upload
-app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB max upload
 
 
 @app.route("/api/omr/health", methods=["GET"])
 def health():
-    """Health check endpoint."""
     return jsonify({"status": "ok", "service": "omr-python"})
+
+
+def _truthy(value):
+    return str(value).lower() in ("1", "true", "yes", "on")
 
 
 @app.route("/api/omr/process", methods=["POST"])
 def process():
-    """
-    Process a single exam scan image for OMR.
-
-    Accepts multipart/form-data with:
-      - image: the scan image file
-      - total_questions (optional): number of MCQ questions (default 52)
-
-    Returns JSON:
-      {
-        "studentCode": "22521000" | null,
-        "answers": { "1": "A", "2": "C", ... },
-        "mcqLayout": { "referenceWidth": 800, "referenceHeight": 1131, "questions": [...] },
-        "identityLayout": { "referenceWidth": 800, "referenceHeight": 1131, "digits": [...] },
-        "confidence": 0.92,
-        "warnings": ["..."]
-      }
-    """
     if "image" not in request.files:
-        return jsonify({"error": "No image file provided", "studentCode": None, "answers": {}, "confidence": 0.0, "warnings": ["No image file in request"]}), 400
+        return jsonify({"error": "No image file provided", "studentCode": None,
+                        "answers": {}, "confidence": 0.0,
+                        "warnings": ["No image file in request"]}), 400
 
     image_file = request.files["image"]
     if not image_file.filename:
-        return jsonify({"error": "Empty filename", "studentCode": None, "answers": {}, "confidence": 0.0, "warnings": ["Empty filename"]}), 400
+        return jsonify({"error": "Empty filename", "studentCode": None,
+                        "answers": {}, "confidence": 0.0,
+                        "warnings": ["Empty filename"]}), 400
 
-    total_questions = request.form.get("total_questions", 52, type=int)
+    total_questions = request.form.get("total_questions", 20, type=int)
+    identity_only = _truthy(request.form.get("identity_only", "0"))
+    answer_key = request.form.get("answer_key") or None
+    return_image = _truthy(request.form.get("return_image", "0"))
 
-    # Save uploaded file to a temp location.
     temp_dir = tempfile.mkdtemp()
     temp_path = os.path.join(temp_dir, image_file.filename)
+    out_path = os.path.join(temp_dir, "result.png") if (return_image or (answer_key and not identity_only)) else None
 
     try:
         image_file.save(temp_path)
-        result = process_omr_image(temp_path, total_questions)
+        result = process_omr_image(temp_path, total_questions,
+                                   answer_key=answer_key,
+                                   output_image_path=out_path,
+                                   identity_only=identity_only)
 
-        student_code = result.get("studentCode")
-        confidence = result.get("confidence", 0.0)
-        answer_count = len(result.get("answers") or {})
-        warnings_count = len(result.get("warnings") or [])
-        source_name = image_file.filename or "uploaded_image"
-
-        if student_code:
-            print(
-                f"[OMR Service] Processed '{source_name}' -> studentCode={student_code}, "
-                f"confidence={confidence}, answers={answer_count}, warnings={warnings_count}"
-            )
+        if return_image and out_path and os.path.exists(out_path):
+            img = cv2.imread(out_path)
+            ok, buf = cv2.imencode(".png", img)
+            if ok:
+                result["resultImage"] = "data:image/png;base64," + \
+                    base64.b64encode(buf.tobytes()).decode("ascii")
         else:
-            print(
-                f"[OMR Service] Processed '{source_name}' -> studentCode=UNREADABLE, "
-                f"confidence={confidence}, answers={answer_count}, warnings={warnings_count}"
-            )
+            # Don't leak a server-local path to the client.
+            result.pop("resultImage", None)
 
+        code = result.get("studentCode")
+        print(f"[OMR Service] '{image_file.filename}' -> studentCode={code or 'UNREADABLE'}, "
+              f"aligned={result.get('aligned')}, mode={'identity' if identity_only else 'full'}, "
+              f"answers={len(result.get('answers') or {})}, "
+              f"warnings={len(result.get('warnings') or [])}")
         return jsonify(result)
     except Exception as e:
         traceback.print_exc()
-        return jsonify({
-            "error": str(e),
-            "studentCode": None,
-            "answers": {},
-            "confidence": 0.0,
-            "warnings": [f"OMR processing error: {str(e)}"],
-        }), 500
+        return jsonify({"error": str(e), "studentCode": None, "answers": {},
+                        "confidence": 0.0,
+                        "warnings": [f"OMR processing error: {str(e)}"]}), 500
     finally:
-        # Clean up temp file.
+        for path in (temp_path, out_path):
+            try:
+                if path and os.path.exists(path):
+                    os.unlink(path)
+            except OSError:
+                pass
         try:
-            if os.path.exists(temp_path):
-                os.unlink(temp_path)
             os.rmdir(temp_dir)
         except OSError:
             pass

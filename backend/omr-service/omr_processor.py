@@ -1,615 +1,651 @@
 """
-OMR Processor — Student identity + MCQ answer reading via OpenCV.
+OMR Processor — Student identity (MSSV) + MCQ answer reading via OpenCV.
 
-Uses vectorized numpy/OpenCV ops. Works at a normalized resolution
-(800 wide) for consistent results regardless of input image size.
+Designed for the anchor-based answer sheet produced by docx.service:
+  * 4 solid black square anchors at the page corners (perspective reference).
+  * Alternating timing marks down the left/right margins of the MSSV and MCQ
+    answer regions.
+  * Faded letters inside each bubble (vanish under threshold) and no grid
+    border lines, so filled bubbles stand out cleanly.
 
-Calibrated ROI positions for the standard exam template generated
-by the system's docx.service.
+Pipeline
+--------
+1. Detect the paper (largest bright quad) and warp it flat (pass 1).
+2. Re-detect the 4 corner anchors in the flat image and snap them to fixed
+   canonical positions (pass 2) so every scan lands in the same coordinate
+   frame: A4 at 5 px/mm  ->  1050 x 1485 px, anchor centres at the corners.
+3. Read the MSSV grid (6 columns x 10 digit rows) and the MCQ grid
+   (4 question columns x 10 rows x A/B/C/D) at fixed canonical positions,
+   with a small per-bubble search to absorb residual warp error.
+
+MSSV note: the identifier uses the first 2 + last 4 digits of the student
+code (the 3rd/4th digits are dropped on the sheet), so there are 6 columns.
 """
 
 import cv2
 import numpy as np
 import os
+import itertools
 
 # ---------------------------------------------------------------------------
-# Constants
+# Canonical geometry (A4 at 5 px/mm)
 # ---------------------------------------------------------------------------
 
-WORKING_WIDTH = 800
+SCALE = 5
+PAGE_W_MM, PAGE_H_MM = 210, 297
+CW, CH = PAGE_W_MM * SCALE, PAGE_H_MM * SCALE          # 1050 x 1485
+PAGE_CORNERS = np.array([(0, 0), (CW - 1, 0), (CW - 1, CH - 1), (0, CH - 1)],
+                        dtype=np.float32)
+# Anchor centres (mm, from the template) -> canonical px. Order: TL,TR,BR,BL.
+ANCHOR_MM = [(10, 10), (200, 10), (200, 287), (10, 287)]
+ANCHOR_PX = np.array([(x * SCALE, y * SCALE) for x, y in ANCHOR_MM], dtype=np.float32)
 
-STUDENT_CODE_COLUMNS = 8
-STUDENT_CODE_DIGIT_ROWS = 10
-
-# Calibrated ROI for MSSV region (relative to working-size image).
-#
-# The search ROI is intentionally wider than the actual 8x10 grid. Phone
-# captures in the test set use the resize fallback and can shift/compress the
-# right edge enough that a tight static ROI clips the last MSSV column.
-STUDENT_CODE_ROI = {"x": 0.63, "y": 0.12, "width": 0.27, "height": 0.30}
-STUDENT_CODE_SEARCH_ROI = {"x": 0.55, "y": 0.08, "width": 0.43, "height": 0.34}
-STUDENT_CODE_HEADER_FRAC = 0.20  # Top 20% is label/header, skip it
-STUDENT_CODE_GRID_HEADER_FRAC = 0.12  # Header row inside the detected MSSV table
-
-# MCQ answer table fallback ROI. The processor prefers dynamic table-line
-# detection; this static layout is only used when the table borders are not
-# confidently detected.
-MCQ_ROI = {"x": 0.09, "y": 0.467, "width": 0.85, "height": 0.452}
-
-MCQ_COLUMN_COUNT = 4
-MCQ_ROWS_PER_COLUMN = 13
+# MCQ grid: 4 question columns (1-10, 11-20, 21-30, 31-40), each with A/B/C/D.
+# Geometry calibrated from the warped sheet by detecting the printed bubble
+# circles (Hough) across the reference scans; centres land within ~2 px.
+MCQ_GROUP_X = [123, 361, 596, 832]        # x of option A in each column
+MCQ_OPTION_DX = [0, 51, 101, 152]         # A,B,C,D offsets
+MCQ_ROW_Y0, MCQ_ROW_DY = 711, 62.95       # first row y, row pitch
+MCQ_ROWS_PER_COLUMN = 10
 MCQ_OPTIONS = ["A", "B", "C", "D"]
 
-MIN_MARK_THRESHOLD = 0.20
-TIE_GAP = 0.06
+# MSSV grid: 6 digit columns x 10 rows (digits 0-9 top to bottom).
+MSSV_COL_X0, MSSV_COL_DX = 634.0, 68.1
+MSSV_ROW_Y0, MSSV_ROW_DY = 247.0, 42.1
+MSSV_COLUMNS = 6
+MSSV_DIGIT_ROWS = 10
 
-MCQ_DYNAMIC_HEADER_RATIO = 0.07
-MCQ_DYNAMIC_BUBBLE_START = 0.17
-MCQ_DYNAMIC_BUBBLE_END = 0.91
-MCQ_FALLBACK_HEADER_RATIO = MCQ_DYNAMIC_HEADER_RATIO
-MCQ_FALLBACK_BUBBLE_START = MCQ_DYNAMIC_BUBBLE_START
-MCQ_FALLBACK_BUBBLE_END = MCQ_DYNAMIC_BUBBLE_END
+BUBBLE_R = 13                  # nominal printed bubble radius (px)
+SEARCH_WIN = 10                # +/- px local search to absorb residual warp
+
+# MCQ marks are read by darkness relative to paper, with the per-question
+# baseline (median of the 4 options) removed so only the student's added ink
+# remains. This is robust to shadow/curvature near the page edge that would
+# otherwise make empty bubbles look filled under a global threshold.
+#
+# An option counts as the answer when it is (a) at least MCQ_MARK_MIN darker
+# than the per-question baseline AND (b) MCQ_MIN_GAP darker than the 2nd-darkest
+# option, with no other option reaching MCQ_MULTI_MIN (which would be a multi
+# mark). The low floor + isolation gap (rather than a single high threshold)
+# catches genuinely faint real-world pen/pencil marks while still rejecting
+# blank bubbles: real photos show empty bubbles at <=0.02 excess with a tiny
+# winner-vs-runnerup gap, whereas even a light mark darkens ONE option clearly
+# above the other three. A contrast/CLAHE scoring pass was tested but did not
+# beat raw grayscale consistently; the raw-score low floor + stricter gap below
+# gives the best combined result across identity_mcq, identity2 and real.
+MCQ_DARK_R = 9                 # disk radius used when measuring MCQ bubble darkness
+MCQ_MARK_MIN = 0.023           # min excess darkness for an option to count as marked
+MCQ_MIN_GAP = 0.023            # winner option must beat the runner-up by this much
+MCQ_MULTI_MIN = 0.07           # a 2nd option this dark => multiple marks (invalid)
+# MSSV bubbles are smaller and the marks are frequently faint pencil, so an
+# absolute fill level is unreliable. A digit is recognised by how much DARKER
+# its bubble is than the per-row baseline (the printed digit glyph, estimated as
+# the median darkness of that row across the 6 columns since most columns are
+# unmarked on any given row). This cancels the glyph ink and isolates the mark.
+MSSV_MIN_EXCESS = 0.025        # min darkness added above the printed-glyph baseline
+MSSV_MIN_GAP = 0.012           # winner digit must beat runner-up digit by this much
+MSSV_DARK_R = 7                # disk radius used when measuring MSSV bubble darkness
 
 DEBUG = os.environ.get("OMR_DEBUG", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
-# Preprocessing
+# Page detection + perspective warp
 # ---------------------------------------------------------------------------
 
-def _order_corners(pts: np.ndarray) -> np.ndarray:
-    rect = np.zeros((4, 2), dtype=np.float32)
-    s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).ravel()
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    rect[1] = pts[np.argmin(d)]
-    rect[3] = pts[np.argmax(d)]
-    return rect
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 
-def _detect_document_corners(gray: np.ndarray):
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
-    contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+def _enhance_contrast(gray):
+    """CLAHE-based local contrast boost used ONLY to retry anchor detection.
+
+    Phone photos of paper often have uneven lighting / low local contrast that
+    hides the corner anchors from a plain threshold. This is applied strictly as
+    a fallback (when the normal detection finds nothing), so it never alters the
+    geometry/scoring of frames that already detect cleanly. It mirrors the CLAHE
+    step the browser uses for its client-side anchor trigger (opencvAnchors.ts).
+    """
+    return _CLAHE.apply(gray)
+
+
+def _order_quad_by_position(pts):
+    """Order 4 points as TL, TR, BR, BL (robust up to ~40 deg rotation)."""
+    pts = sorted(np.array(pts, dtype=np.float32).tolist(), key=lambda p: p[1])
+    top = sorted(pts[:2], key=lambda p: p[0])
+    bot = sorted(pts[2:], key=lambda p: p[0])
+    return np.array([top[0], top[1], bot[1], bot[0]], dtype=np.float32)
+
+
+def _anchor_candidates(gray):
+    """Solid dark squares whose surroundings are bright (i.e. on white paper).
+
+    Adaptive thresholding makes anchors stand out against their local white
+    background even when a large dark laptop dominates the global histogram.
+    Returns [(cx, cy, area), ...] (anchors + some filled bubbles / strays).
+    """
+    H, W = gray.shape
+    img_area = H * W
+    blur = cv2.GaussianBlur(gray, (3, 3), 0)
+    th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                               cv2.THRESH_BINARY_INV, 61, 12)
+    th = cv2.morphologyEx(th, cv2.MORPH_OPEN,
+                          cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    n, _, stats, cent = cv2.connectedComponentsWithStats(th, 8)
+    bright = float(np.percentile(gray, 90))
+    cands = []
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area < img_area * 3e-5 or area > img_area * 4e-3:
+            continue
+        if not (0.5 <= w / max(1, h) <= 2.0):
+            continue
+        if area / (w * h) < 0.78:
+            continue
+        cx, cy = cent[i]
+        rad = int(max(w, h) * 1.15) + 5
+        nb = tot = 0
+        for ang in range(0, 360, 30):
+            sx = int(cx + rad * np.cos(np.radians(ang)))
+            sy = int(cy + rad * np.sin(np.radians(ang)))
+            if 0 <= sx < W and 0 <= sy < H:
+                tot += 1
+                nb += gray[sy, sx] > bright * 0.6
+        if tot and nb / tot >= 0.6:
+            cands.append((float(cx), float(cy), float(area)))
+    return cands
+
+
+def _best_anchor_quad(cands):
+    """Pick 4 candidates forming the best page-aspect (190:277) quadrilateral."""
+    if len(cands) < 4:
         return None
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
-    for c in contours:
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) == 4:
-            return approx.reshape(4, 2).astype(np.float32)
-    return None
+    pts = sorted(cands, key=lambda c: -c[2])[:18]
+    pts = [(c[0], c[1]) for c in pts]
+    best, best_score = None, -1.0
+    for combo in itertools.combinations(pts, 4):
+        quad = _order_quad_by_position(list(combo))
+        TL, TR, BR, BL = quad
+        top = np.linalg.norm(TR - TL); bot = np.linalg.norm(BR - BL)
+        left = np.linalg.norm(BL - TL); right = np.linalg.norm(BR - TR)
+        if min(top, bot, left, right) < 50:
+            continue
+        if abs(top - bot) / max(top, bot) > 0.25 or abs(left - right) / max(left, right) > 0.25:
+            continue
+        w = (top + bot) / 2; h = (left + right) / 2
+        if h < 1:
+            continue
+        aspect = w / h
+        if not (0.55 <= aspect <= 0.82):
+            continue
+        area = cv2.contourArea(quad)
+        score = area * (0.5 + 0.5 * (1 - abs(aspect - 0.686) / 0.686))
+        if score > best_score:
+            best_score, best = score, quad
+    return best
 
 
-def preprocess_image(image_path: str):
-    """Load and normalize image to WORKING_WIDTH with A4 aspect ratio."""
+def _detect_anchors(gray):
+    """Detect the 4 corner anchors -> ordered [TL,TR,BR,BL] or None."""
+    return _best_anchor_quad(_anchor_candidates(gray))
+
+
+def _find_page_quad(gray):
+    """Largest bright region = the paper. Returns ordered corner quad or None."""
+    blur = cv2.GaussianBlur(gray, (7, 7), 0)
+    _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE,
+                          cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25)))
+    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    c = max(cnts, key=cv2.contourArea)
+    if cv2.contourArea(c) < 0.15 * gray.shape[0] * gray.shape[1]:
+        return None
+    peri = cv2.arcLength(c, True)
+    approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+    if len(approx) == 4:
+        quad = approx.reshape(4, 2).astype(np.float32)
+    else:
+        quad = cv2.boxPoints(cv2.minAreaRect(c)).astype(np.float32)
+    return _order_quad_by_position(quad)
+
+
+def _anchor_centroid_in_roi(roi, x0, y0, tx, ty):
+    """Otsu-threshold an ROI and return the anchor-like centroid nearest (tx,ty)."""
+    _, th = cv2.threshold(roi, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    th = cv2.morphologyEx(th, cv2.MORPH_CLOSE,
+                          cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+    n, _, stats, cent = cv2.connectedComponentsWithStats(th, 8)
+    best, bd = None, 1e18
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area < 120 or area > 1800:
+            continue
+        if not (0.45 <= w / max(1, h) <= 2.2):
+            continue
+        if area / (w * h) < 0.55:
+            continue
+        cx, cy = x0 + cent[i][0], y0 + cent[i][1]
+        d = (cx - tx) ** 2 + (cy - ty) ** 2
+        if d < bd:
+            bd, best = d, (cx, cy)
+    return best
+
+
+def _refine_anchor(warped, tx, ty, win=55):
+    """Find the precise anchor centroid near canonical corner (tx,ty)."""
+    y0, y1 = max(0, ty - win), min(warped.shape[0], ty + win)
+    x0, x1 = max(0, tx - win), min(warped.shape[1], tx + win)
+    roi = warped[y0:y1, x0:x1]
+    if roi.size == 0:
+        return None
+    best = _anchor_centroid_in_roi(roi, x0, y0, tx, ty)
+    if best is None:
+        # Contrast-boosted retry for a faint/low-contrast corner. Additive only:
+        # corners that resolve on the plain pass are returned unchanged.
+        best = _anchor_centroid_in_roi(_enhance_contrast(roi), x0, y0, tx, ty)
+    return best
+
+
+def _find_corner_anchors(warped, win=55):
+    """Return list of (found_point, target) for anchors near canonical corners."""
+    found, tgt = [], []
+    for (tx, ty) in ANCHOR_PX.astype(int):
+        a = _refine_anchor(warped, int(tx), int(ty), win)
+        if a is not None:
+            found.append(a)
+            tgt.append((float(tx), float(ty)))
+    return found, tgt
+
+
+def _refine_warp(warped, win=55):
+    """Pass 2: snap detected anchors to their exact canonical positions."""
+    found, tgt = _find_corner_anchors(warped, win)
+    if len(found) == 4:
+        M = cv2.getPerspectiveTransform(np.array(found, np.float32),
+                                        np.array(tgt, np.float32))
+        return cv2.warpPerspective(warped, M, (CW, CH)), len(found)
+    if len(found) == 3:
+        M, _ = cv2.estimateAffine2D(np.array(found, np.float32),
+                                    np.array(tgt, np.float32))
+        if M is not None:
+            return cv2.warpAffine(warped, M, (CW, CH)), len(found)
+    return warped, len(found)
+
+
+def _alignment_score(warped):
+    """How many of the 4 anchors sit within ~6px of their canonical corner."""
+    found, tgt = _find_corner_anchors(warped, win=30)
+    ok = 0
+    for (fx, fy), (tx, ty) in zip(found, tgt):
+        if abs(fx - tx) <= 8 and abs(fy - ty) <= 8:
+            ok += 1
+    return ok
+
+
+def preprocess_image(image_path):
+    """Load and warp an exam scan into the canonical coordinate frame.
+
+    Returns (warped_gray, warnings, aligned_corners) where aligned_corners is
+    how many of the 4 anchors landed on their canonical position (0-4). A low
+    count means the scan could not be reliably flattened.
+    """
     warnings = []
     image = cv2.imread(image_path)
     if image is None:
-        return None, ["Cannot read image file"]
-
+        return None, ["Cannot read image file"], 0
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape[:2]
 
-    working_h = int(WORKING_WIDTH * 3508 / 2480)
+    # Pass 1: prefer direct anchor detection (maps anchor centres exactly);
+    # fall back to the page quad (maps paper corners) when anchors are unclear.
+    anchors = _detect_anchors(gray)
+    if anchors is None:
+        # Contrast-boosted retry for low-contrast phone photos. Strictly additive:
+        # only runs when the plain pass found nothing, so cleanly-detected scans
+        # (the verified test sets) are unaffected.
+        anchors = _detect_anchors(_enhance_contrast(gray))
+    if anchors is not None:
+        M = cv2.getPerspectiveTransform(anchors, ANCHOR_PX)
+        warped = cv2.warpPerspective(gray, M, (CW, CH))
+    else:
+        warnings.append("Corner anchors not found; aligning by paper outline")
+        quad = _find_page_quad(gray)
+        if quad is None:
+            warnings.append("Page not detected; using direct resize fallback")
+            return cv2.resize(gray, (CW, CH), interpolation=cv2.INTER_AREA), warnings, 0
+        M = cv2.getPerspectiveTransform(quad, PAGE_CORNERS)
+        warped = cv2.warpPerspective(gray, M, (CW, CH))
 
-    # Try perspective warp
-    corners = _detect_document_corners(gray)
-    if corners is not None:
-        area_ratio = cv2.contourArea(corners) / max(1, w * h)
-        if area_ratio > 0.7:
-            ordered = _order_corners(corners)
-            dst = np.array([
-                [0, 0], [WORKING_WIDTH - 1, 0],
-                [WORKING_WIDTH - 1, working_h - 1], [0, working_h - 1]
-            ], dtype=np.float32)
-            M = cv2.getPerspectiveTransform(ordered, dst)
-            warped = cv2.warpPerspective(gray, M, (WORKING_WIDTH, working_h))
-            return warped, warnings
+    # Pass 2: snap anchors to exact canonical corners (iterate; widen window
+    # once if the first pass barely moved the anchors into reach).
+    warped, _ = _refine_warp(warped, win=75)
+    warped, _ = _refine_warp(warped, win=40)
 
-    # Fallback: resize to working dimensions
-    warnings.append("Using direct resize fallback")
-    return cv2.resize(gray, (WORKING_WIDTH, working_h), interpolation=cv2.INTER_LINEAR), warnings
+    aligned = _alignment_score(warped)
+    if aligned < 4:
+        warnings.append(
+            f"Sheet alignment uncertain ({aligned}/4 corner anchors locked); "
+            "results on this scan may be unreliable")
+    return warped, warnings, aligned
 
 
 # ---------------------------------------------------------------------------
-# Bubble Scoring
+# Bubble scoring
 # ---------------------------------------------------------------------------
 
-def _score_cell(binary_roi: np.ndarray, cx: int, cy: int, r: int) -> float:
-    """Score a bubble cell in a pre-binarized image."""
-    h, w = binary_roi.shape[:2]
-    top = max(0, cy - r)
-    bottom = min(h, cy + r + 1)
-    left = max(0, cx - r)
-    right = min(w, cx + r + 1)
-    if bottom <= top or right <= left:
+def _disk_darkness(gray, cx, cy, r, paper):
+    """Mean darkness of a disk relative to paper white, in [0,1] (0=white)."""
+    h, w = gray.shape
+    if cx - r < 0 or cy - r < 0 or cx + r >= w or cy + r >= h:
         return 0.0
-    patch = binary_roi[top:bottom, left:right]
-    if patch.size < 4:
-        return 0.0
-    return float(np.sum(patch > 0)) / float(patch.size)
+    patch = gray[cy - r:cy + r + 1, cx - r:cx + r + 1].astype(np.float32)
+    yy, xx = np.ogrid[-r:r + 1, -r:r + 1]
+    disk = (xx * xx + yy * yy) <= r * r
+    return float(np.clip((paper - patch[disk]) / max(paper, 1.0), 0.0, 1.0).mean())
 
 
-def _refine_filled_bubble_center(binary_roi: np.ndarray, cx: int, cy: int, r: int):
-    """Snap an accepted filled bubble to the centroid of its dark pixels."""
-    h, w = binary_roi.shape[:2]
-    search_r = max(r + 2, int(r * 1.9))
-    top = max(0, cy - search_r)
-    bottom = min(h, cy + search_r + 1)
-    left = max(0, cx - search_r)
-    right = min(w, cx + search_r + 1)
-    patch = binary_roi[top:bottom, left:right]
-    if patch.size < 16:
-        return int(cx), int(cy)
-
-    ys, xs = np.where(patch > 0)
-    if len(xs) < max(8, r):
-        return int(cx), int(cy)
-
-    refined_x = int(round(left + float(xs.mean())))
-    refined_y = int(round(top + float(ys.mean())))
-    max_shift = max(2, int(r * 0.8))
-    if abs(refined_x - cx) > max_shift or abs(refined_y - cy) > max_shift:
-        return int(cx), int(cy)
-    return refined_x, refined_y
+def _darkest_bubble(gray, cx, cy, paper, win=SEARCH_WIN, r=MSSV_DARK_R):
+    """Best (darkest) darkness within a small search window; returns (score,cx,cy)."""
+    best, bx, by = 0.0, cx, cy
+    for dy in range(-win, win + 1, 2):
+        for dx in range(-win, win + 1, 2):
+            d = _disk_darkness(gray, cx + dx, cy + dy, r, paper)
+            if d > best:
+                best, bx, by = d, cx + dx, cy + dy
+    return best, bx, by
 
 
-def _refine_bubble_center(binary_roi: np.ndarray, cx: int, cy: int, r: int):
-    """Snap a bubble to the nearby printed/filled mark center.
+# ---------------------------------------------------------------------------
+# Timing-mark row localisation (absorbs tilt and local paper curvature)
+# ---------------------------------------------------------------------------
 
-    The first-pass grid gives reliable row/option ordering, but percentage
-    positions can drift a few pixels on phone captures. Refining every option
-    keeps both scoring and exported red/green markers on the physical bubbles.
-    """
-    h, w = binary_roi.shape[:2]
-    search_r = max(r + 5, int(r * 2.2))
-    top = max(0, cy - search_r)
-    bottom = min(h, cy + search_r + 1)
-    left = max(0, cx - search_r)
-    right = min(w, cx + search_r + 1)
-    patch = binary_roi[top:bottom, left:right]
-    if patch.size < 16:
-        return int(cx), int(cy)
-
-    ys, xs = np.where(patch > 0)
-    if len(xs) < max(6, r):
-        return int(cx), int(cy)
-
-    # Ignore marks near the edge of the search window; those usually belong to
-    # neighboring bubbles or question text rather than this option.
-    local_cx = cx - left
-    local_cy = cy - top
-    dist = np.sqrt((xs - local_cx) ** 2 + (ys - local_cy) ** 2)
-    keep = dist <= search_r * 0.78
-    if int(np.sum(keep)) < max(6, r):
-        return int(cx), int(cy)
-
-    refined_x = int(round(left + float(xs[keep].mean())))
-    refined_y = int(round(top + float(ys[keep].mean())))
-    max_shift = max(2, int(r * 0.9))
-    if abs(refined_x - cx) > max_shift or abs(refined_y - cy) > max_shift:
-        return int(cx), int(cy)
-    return refined_x, refined_y
-
-
-def _group_projection_indices(indices: np.ndarray, projection: np.ndarray, gap: int = 1):
-    """Group adjacent projection indexes and keep each group's peak strength."""
-    if len(indices) == 0:
+def _detect_mark_ys(warped, xl, xh, ylo, yhi):
+    """Y-centroids of the tall-thin solid timing marks in a margin strip."""
+    strip = warped[ylo:yhi, xl:xh]
+    if strip.size == 0:
         return []
-
-    groups = []
-    start = prev = int(indices[0])
-    for raw_index in indices[1:]:
-        index = int(raw_index)
-        if index > prev + gap:
-            groups.append((start, prev, int(projection[start:prev + 1].max())))
-            start = index
-        prev = index
-
-    groups.append((start, prev, int(projection[start:prev + 1].max())))
-    return groups
-
-
-# ---------------------------------------------------------------------------
-# MSSV Recognition
-# ---------------------------------------------------------------------------
-
-def _roi_bounds(gray: np.ndarray, roi: dict):
-    h, w = gray.shape[:2]
-    x = int(w * roi["x"])
-    y = int(h * roi["y"])
-    rw = int(w * roi["width"])
-    rh = int(h * roi["height"])
-    return x, y, rw, rh
-
-
-def _crop_roi(gray: np.ndarray, roi: dict) -> np.ndarray:
-    x, y, rw, rh = _roi_bounds(gray, roi)
-    return gray[y:y + rh, x:x + rw]
-
-
-def _find_student_grid(gray: np.ndarray):
-    """Find the MSSV 8x10 table inside the wider identity search area."""
-    search_x, search_y, _, _ = _roi_bounds(gray, STUDENT_CODE_SEARCH_ROI)
-    search = _crop_roi(gray, STUDENT_CODE_SEARCH_ROI)
-    rh, rw = search.shape[:2]
-    if rw < 40 or rh < 80:
-        return None
-
-    _, binary = cv2.threshold(search, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    dilated = cv2.dilate(
-        binary,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-        iterations=1,
-    )
-
-    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(dilated, 8)
-    candidates = []
-    for label in range(1, num_labels):
-        x, y, w, h, area = stats[label]
-        if w < rw * 0.45 or h < rh * 0.55:
+    _, th = cv2.threshold(strip, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    n, _, stats, cent = cv2.connectedComponentsWithStats(th, 8)
+    ys = []
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if not (9 <= h <= 42 and 3 <= w <= 20):
             continue
-        aspect = w / max(1, h)
-        if 0.55 <= aspect <= 1.10:
-            candidates.append((int(area), int(x), int(y), int(w), int(h)))
+        if area < 25 or area / (w * h) < 0.5 or h <= w:
+            continue
+        ys.append(ylo + cent[i][1])
+    return sorted(ys)
 
-    if not candidates:
+
+def _fit_n_rows(ys, n, y0, dy):
+    """Fit n evenly spaced row centres from detected mark y's (handles gaps)."""
+    if len(ys) < 3:
         return None
+    by_idx = {}
+    for y in ys:
+        idx = int(round((y - y0) / dy))
+        if 0 <= idx < n:
+            by_idx.setdefault(idx, []).append(y)
+    if len(by_idx) < 3:
+        return None
+    idxs = sorted(by_idx)
+    meds = [float(np.median(by_idx[i])) for i in idxs]
+    A = np.vstack([idxs, np.ones(len(idxs))]).T
+    (b, a), *_ = np.linalg.lstsq(A, np.array(meds), rcond=None)
+    if not (0.6 * dy <= b <= 1.6 * dy):     # sane spacing only
+        return None
+    return [a + b * i for i in range(n)]
 
-    _, x, y, w, h = max(candidates, key=lambda item: item[0])
-    pad = 1
-    x0 = max(0, x - pad)
-    y0 = max(0, y - pad)
-    x1 = min(rw, x + w + pad)
-    y1 = min(rh, y + h + pad)
-    return {
-        "image": search[y0:y1, x0:x1],
-        "x": int(search_x + x0),
-        "y": int(search_y + y0),
-    }
+
+def _region_rows(warped, x_left, x_right, ylo, yhi, n, y0, dy):
+    """Per-side row centres from left/right timing marks; canonical fallback."""
+    pad = 16
+    lrows = _fit_n_rows(_detect_mark_ys(warped, x_left - pad, x_left + pad, ylo, yhi), n, y0, dy)
+    rrows = _fit_n_rows(_detect_mark_ys(warped, x_right - pad, x_right + pad, ylo, yhi), n, y0, dy)
+    canonical = [y0 + dy * i for i in range(n)]
+    if lrows is None and rrows is None:
+        return canonical, canonical
+    if lrows is None:
+        lrows = rrows
+    if rrows is None:
+        rrows = lrows
+    return lrows, rrows
 
 
-def extract_student_code(warped_gray: np.ndarray) -> dict:
-    """Extract 8-digit student code from MSSV bubble grid."""
-    warnings = []
-    grid_result = _find_student_grid(warped_gray)
-    adaptive = grid_result is not None
-
-    if grid_result is None:
-        warnings.append("Using static MSSV ROI fallback")
-        roi_x, roi_y, _, _ = _roi_bounds(warped_gray, STUDENT_CODE_ROI)
-        roi = _crop_roi(warped_gray, STUDENT_CODE_ROI)
-        rh, rw = roi.shape[:2]
-
-        if rw < 10 or rh < 10:
-            return {"studentCode": None, "confidence": 0.0, "warnings": ["MSSV ROI too small"]}
-
-        grid_start_y = int(rh * STUDENT_CODE_HEADER_FRAC)
-        grid = roi[grid_start_y:rh, 0:rw]
-        grid_x = roi_x
-        grid_y = roi_y + grid_start_y
-    else:
-        raw_grid = grid_result["image"]
-        grid_start_y = int(raw_grid.shape[0] * STUDENT_CODE_GRID_HEADER_FRAC)
-        grid = raw_grid[grid_start_y:raw_grid.shape[0], 0:raw_grid.shape[1]]
-        grid_x = int(grid_result["x"])
-        grid_y = int(grid_result["y"] + grid_start_y)
-
-    rh, rw = grid.shape[:2]
-    if rw < 10 or rh < 10:
-        return {"studentCode": None, "confidence": 0.0, "warnings": ["MSSV grid too small"]}
-
-    _, binary = cv2.threshold(grid, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    cell_w = rw / STUDENT_CODE_COLUMNS
-    cell_h = rh / STUDENT_CODE_DIGIT_ROWS
-    r = max(3, int(min(cell_w, cell_h) * (0.20 if adaptive else 0.25)))
-
-    digits = []
-    digit_bubbles = []
-    total_confidence = 0.0
-    detected = 0
-
-    for col in range(STUDENT_CODE_COLUMNS):
-        cx = int((col + 0.5) * cell_w)
-        fills = []
-
-        for row in range(STUDENT_CODE_DIGIT_ROWS):
-            cy = int((row + 0.5) * cell_h)
-            fill = _score_cell(binary, cx, cy, r)
-            fills.append(fill)
-
-        fills_arr = np.array(fills)
-        sorted_idx = np.argsort(fills_arr)[::-1]
-        best_digit = int(sorted_idx[0])
-        best_fill = float(fills_arr[best_digit])
-        second_fill = float(fills_arr[sorted_idx[1]]) if len(sorted_idx) > 1 else 0.0
-        gap = best_fill - second_fill
-
-        if DEBUG:
-            top3 = [(int(sorted_idx[i]), round(float(fills_arr[sorted_idx[i]]), 3)) for i in range(min(3, len(sorted_idx)))]
-            print(f"[OMR] MSSV col {col + 1}: best=digit{best_digit}({best_fill:.3f}) gap={gap:.3f} top3={top3}")
-
-        if best_fill < MIN_MARK_THRESHOLD or gap < TIE_GAP:
-            warnings.append(f"MSSV column {col + 1} not confident")
-            digits.append("?")
-        else:
-            digits.append(str(best_digit))
-            detected += 1
-            total_confidence += min(1.0, best_fill)
-            raw_cx = int((col + 0.5) * cell_w)
-            raw_cy = int((best_digit + 0.5) * cell_h)
-            refined_cx, refined_cy = _refine_filled_bubble_center(binary, raw_cx, raw_cy, r)
-            digit_bubbles.append({
-                "column": int(col + 1),
-                "digit": int(best_digit),
-                "cx": int(grid_x + refined_cx),
-                "cy": int(grid_y + refined_cy),
-                "r": int(r),
-            })
-
-    code = "".join(digits) if not all(d == "?" for d in digits) else None
-    if code and "?" in code:
-        warnings.append(f"Partial MSSV: {code}")
-
-    confidence = total_confidence / max(1, detected) if detected > 0 else 0.0
-    return {
-        "studentCode": code,
-        "identityLayout": {
-            "referenceWidth": int(warped_gray.shape[1]),
-            "referenceHeight": int(warped_gray.shape[0]),
-            "source": "detected_table" if adaptive else "static_roi",
-            "digits": digit_bubbles,
-        },
-        "confidence": round(confidence, 3),
-        "warnings": warnings,
-    }
+def _row_y(lrows, rrows, x_left, x_right, r, x):
+    """Interpolate the row-r centre y at horizontal position x."""
+    t = (x - x_left) / float(x_right - x_left)
+    t = min(1.0, max(0.0, t))
+    return int(round(lrows[r] + (rrows[r] - lrows[r]) * t))
 
 
 # ---------------------------------------------------------------------------
-# MCQ Recognition
+# MCQ recognition
 # ---------------------------------------------------------------------------
 
-def _find_mcq_table_bounds(warped_gray: np.ndarray):
-    """Locate the printed MCQ answer table using long table lines."""
-    h, w = warped_gray.shape[:2]
-    _, binary = cv2.threshold(warped_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    vertical_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (1, max(35, int(h * 0.035))),
-    )
-    vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel)
-    vertical_projection = (vertical_lines[h // 3:, :] > 0).sum(axis=0)
-    vertical_groups = _group_projection_indices(
-        np.where(vertical_projection > max(45, h * 0.035))[0],
-        vertical_projection,
-    )
-
-    strongest_vertical = sorted(vertical_groups, key=lambda item: item[2], reverse=True)[:5]
-    if len(strongest_vertical) < 5:
-        return None
-
-    vertical_centers = sorted((start + end) // 2 for start, end, _ in strongest_vertical)
-    vertical_spacings = np.diff(vertical_centers)
-    if (
-        len(vertical_spacings) != MCQ_COLUMN_COUNT
-        or min(vertical_spacings) < w * 0.12
-        or max(vertical_spacings) - min(vertical_spacings) > w * 0.08
-    ):
-        return None
-
-    left = int(vertical_centers[0])
-    right = int(vertical_centers[-1])
-    if right <= left:
-        return None
-
-    horizontal_kernel = cv2.getStructuringElement(
-        cv2.MORPH_RECT,
-        (max(40, int(w * 0.25)), 1),
-    )
-    horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel)
-    horizontal_projection = (horizontal_lines[:, max(0, left):min(w, right)] > 0).sum(axis=1)
-    horizontal_groups = _group_projection_indices(
-        np.where(horizontal_projection > (right - left) * 0.65)[0],
-        horizontal_projection,
-    )
-
-    strong_horizontal = [
-        group for group in horizontal_groups
-        if ((group[0] + group[1]) // 2) > h * 0.35
-    ]
-    strongest_horizontal = sorted(strong_horizontal, key=lambda item: item[2], reverse=True)[:2]
-    if len(strongest_horizontal) < 2:
-        return None
-
-    horizontal_centers = sorted((start + end) // 2 for start, end, _ in strongest_horizontal)
-    top = int(horizontal_centers[0])
-    bottom = int(horizontal_centers[-1])
-    if bottom <= top or bottom - top < h * 0.20:
-        return None
-
-    return {
-        "left": left,
-        "top": top,
-        "right": right,
-        "bottom": bottom,
-        "source": "detected_table",
-    }
+MCQ_MARK_XL, MCQ_MARK_XR = 58, 1006
+MSSV_MARK_XL, MSSV_MARK_XR = 594, 1008
 
 
-def _build_mcq_layout(warped_gray: np.ndarray, total_questions: int = 52):
-    h, w = warped_gray.shape[:2]
-    bounds = _find_mcq_table_bounds(warped_gray)
+def extract_mcq_answers(warped, total_questions):
+    """Read MCQ answers. 'x' marks a blank or multi-marked (invalid) question.
 
-    if bounds is None:
-        left = int(w * MCQ_ROI["x"])
-        top = int(h * MCQ_ROI["y"])
-        right = int(w * (MCQ_ROI["x"] + MCQ_ROI["width"]))
-        bottom = int(h * (MCQ_ROI["y"] + MCQ_ROI["height"]))
-        header_ratio = MCQ_FALLBACK_HEADER_RATIO
-        bubble_start = MCQ_FALLBACK_BUBBLE_START
-        bubble_end = MCQ_FALLBACK_BUBBLE_END
-        source = "static_roi"
-    else:
-        left = bounds["left"]
-        top = bounds["top"]
-        right = bounds["right"]
-        bottom = bounds["bottom"]
-        header_ratio = MCQ_DYNAMIC_HEADER_RATIO
-        bubble_start = MCQ_DYNAMIC_BUBBLE_START
-        bubble_end = MCQ_DYNAMIC_BUBBLE_END
-        source = bounds["source"]
-
-    table_width = right - left
-    table_height = bottom - top
-    if table_width < 20 or table_height < 20:
-        return None
-
-    col_width = table_width / MCQ_COLUMN_COUNT
-    row_start_y = top + int(table_height * header_ratio)
-    row_area_height = bottom - row_start_y
-    row_height = row_area_height / MCQ_ROWS_PER_COLUMN
-    bubble_span = bubble_end - bubble_start
-    radius = max(4, int(min(col_width * 0.07, row_height * 0.24)))
-
-    questions = []
-    qnum = 0
-    for col_idx in range(MCQ_COLUMN_COUNT):
-        col_x = left + col_idx * col_width
-        for row_idx in range(MCQ_ROWS_PER_COLUMN):
-            qnum += 1
-            if qnum > total_questions:
-                break
-
-            cy = row_start_y + int((row_idx + 0.5) * row_height)
-            bubbles = []
-            for opt_idx, label in enumerate(MCQ_OPTIONS):
-                frac = (opt_idx + 0.5) / len(MCQ_OPTIONS)
-                cx = col_x + int((bubble_start + frac * bubble_span) * col_width)
-                bubbles.append({
-                    "option": label,
-                    "cx": int(cx),
-                    "cy": int(cy),
-                    "r": int(radius),
-                })
-
-            questions.append({
-                "questionNumber": qnum,
-                "bubbles": bubbles,
-            })
-
-    _, binary = cv2.threshold(warped_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    for question in questions:
-        for bubble in question["bubbles"]:
-            refined_cx, refined_cy = _refine_bubble_center(
-                binary,
-                int(bubble["cx"]),
-                int(bubble["cy"]),
-                int(bubble["r"]),
-            )
-            bubble["cx"] = int(refined_cx)
-            bubble["cy"] = int(refined_cy)
-
-    return {
-        "referenceWidth": int(w),
-        "referenceHeight": int(h),
-        "source": source,
-        "table": {
-            "left": int(left),
-            "top": int(top),
-            "right": int(right),
-            "bottom": int(bottom),
-        },
-        "questions": questions,
-    }
-
-
-def extract_mcq_answers(warped_gray: np.ndarray, total_questions: int = 52) -> dict:
-    """Extract MCQ answers from the answer grid."""
-    warnings = []
-    layout = _build_mcq_layout(warped_gray, total_questions)
-
-    if layout is None:
-        return {"answers": {}, "layout": None, "warnings": ["MCQ ROI too small"]}
-
-    _, binary = cv2.threshold(warped_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    if layout["source"] == "static_roi":
-        warnings.append("Using static MCQ ROI fallback")
-
+    Each option's darkness (relative to paper) is measured, then the per-question
+    baseline (median of the 4 options) is removed so only the student's added ink
+    remains. An option is the answer when its excess clearly exceeds the mark
+    threshold and no second option is also marked; otherwise the question is 'x'.
+    """
+    paper = float(np.percentile(warped, 85))
     answers = {}
-    for question in layout["questions"]:
-        qnum = question["questionNumber"]
-        scores = []
+    questions = []
+    warnings = []
 
-        for bubble in question["bubbles"]:
-            fill = _score_cell(binary, bubble["cx"], bubble["cy"], bubble["r"])
-            scores.append((bubble["option"], fill))
+    lrows, rrows = _region_rows(warped, MCQ_MARK_XL, MCQ_MARK_XR,
+                                660, 1320, MCQ_ROWS_PER_COLUMN, MCQ_ROW_Y0, MCQ_ROW_DY)
 
-        scores.sort(key=lambda s: s[1], reverse=True)
-        best_label, best_fill = scores[0]
-        _, second_fill = scores[1] if len(scores) > 1 else ("", 0.0)
-        gap = best_fill - second_fill
+    for q in range(1, total_questions + 1):
+        col = (q - 1) // MCQ_ROWS_PER_COLUMN
+        row = (q - 1) % MCQ_ROWS_PER_COLUMN
+        if col >= len(MCQ_GROUP_X):
+            break
+        bubbles = []
+        darks = []
+        for oi, opt in enumerate(MCQ_OPTIONS):
+            cx0 = int(round(MCQ_GROUP_X[col] + MCQ_OPTION_DX[oi]))
+            cy0 = _row_y(lrows, rrows, MCQ_MARK_XL, MCQ_MARK_XR, row, cx0)
+            s, bx, by = _darkest_bubble(warped, cx0, cy0, paper, r=MCQ_DARK_R)
+            darks.append(s)
+            bubbles.append({"option": opt, "cx": int(bx), "cy": int(by),
+                            "r": int(BUBBLE_R)})
+        base = float(np.median(darks))
+        excess = [d - base for d in darks]
+        for bi, b in enumerate(bubbles):
+            b["score"] = round(excess[bi], 3)
+            b["marked"] = bool(excess[bi] >= MCQ_MARK_MIN)
+        order = sorted(range(4), key=lambda i: -excess[i])
+        best, second = excess[order[0]], excess[order[1]]
+        if second >= MCQ_MULTI_MIN:
+            answers[str(q)] = "x"
+            status = "multi"
+            warnings.append(f"Q{q}: invalid (multiple marks)")
+        elif best >= MCQ_MARK_MIN and (best - second) >= MCQ_MIN_GAP:
+            answers[str(q)] = MCQ_OPTIONS[order[0]]
+            status = "ok"
+        else:
+            answers[str(q)] = "x"
+            status = "blank"
+            warnings.append(f"Q{q}: invalid (blank)")
+        questions.append({"questionNumber": q, "bubbles": bubbles,
+                          "selected": answers[str(q)], "status": status})
+        if DEBUG:
+            print(f"[OMR] Q{q}: excess={[round(e,2) for e in excess]} -> {answers[str(q)]}")
 
-        if best_fill >= MIN_MARK_THRESHOLD and gap >= TIE_GAP:
-            answers[str(qnum)] = best_label
-            for bubble in question["bubbles"]:
-                if bubble["option"] == best_label:
-                    refined_cx, refined_cy = _refine_filled_bubble_center(
-                        binary,
-                        int(bubble["cx"]),
-                        int(bubble["cy"]),
-                        int(bubble["r"]),
-                    )
-                    bubble["cx"] = refined_cx
-                    bubble["cy"] = refined_cy
-                    break
-        elif best_fill >= MIN_MARK_THRESHOLD:
-            warnings.append(f"Q{qnum}: ambiguous")
-
+    layout = {"referenceWidth": CW, "referenceHeight": CH,
+              "source": "anchor_canonical", "questions": questions}
     return {"answers": answers, "layout": layout, "warnings": warnings}
 
 
 # ---------------------------------------------------------------------------
-# Main Entry Point
+# MSSV recognition
 # ---------------------------------------------------------------------------
 
-def process_omr_image(image_path: str, total_questions: int = 52) -> dict:
-    """
-    Process exam scan: extract student code and MCQ answers.
+def extract_student_code(warped):
+    """Read the 6-digit MSSV (first 2 + last 4 digits of the student code).
 
-    Returns:
-        {
-            "studentCode": "22521000" | null,
-            "answers": { "1": "A", "2": "C", ... },
-            "mcqLayout": { "referenceWidth": 800, "referenceHeight": 1131, "questions": [...] },
-            "confidence": 0.92,
-            "warnings": ["..."]
-        }
+    Marks here are often faint pencil and the printed digit glyphs survive
+    binarisation unevenly (a printed "8" carries more ink than a faint "1"
+    mark). So instead of an absolute fill we measure each bubble's darkness
+    relative to paper, then subtract the per-row baseline (median darkness of
+    that digit row across the 6 columns ~= the printed glyph), leaving only the
+    ink the student added. The marked digit is the row with the most excess.
+    """
+    paper = float(np.percentile(warped, 85))
+    digit_bubbles = []
+    warnings = []
+
+    lrows, rrows = _region_rows(warped, MSSV_MARK_XL, MSSV_MARK_XR,
+                                185, 660, MSSV_DIGIT_ROWS, MSSV_ROW_Y0, MSSV_ROW_DY)
+
+    # Pass 1: darkness of every bubble + the (cx,cy) where it was darkest.
+    dark = np.zeros((MSSV_COLUMNS, MSSV_DIGIT_ROWS), dtype=np.float32)
+    pos = [[None] * MSSV_DIGIT_ROWS for _ in range(MSSV_COLUMNS)]
+    for c in range(MSSV_COLUMNS):
+        cx0 = int(round(MSSV_COL_X0 + MSSV_COL_DX * c))
+        for d in range(MSSV_DIGIT_ROWS):
+            cy0 = _row_y(lrows, rrows, MSSV_MARK_XL, MSSV_MARK_XR, d, cx0)
+            s, bx, by = _darkest_bubble(warped, cx0, cy0, paper)
+            dark[c, d] = s
+            pos[c][d] = (bx, by)
+
+    # Per-row glyph baseline; excess isolates the student's mark.
+    baseline = np.median(dark, axis=0)
+    excess = dark - baseline[None, :]
+
+    digits = []
+    total_conf = 0.0
+    detected = 0
+    for c in range(MSSV_COLUMNS):
+        ex = excess[c]
+        order = sorted(range(MSSV_DIGIT_ROWS), key=lambda i: -ex[i])
+        best, second = ex[order[0]], ex[order[1]]
+        if best < MSSV_MIN_EXCESS or (best - second) < MSSV_MIN_GAP:
+            digits.append("?")
+            warnings.append(f"MSSV column {c + 1} not confident")
+        else:
+            d = order[0]
+            digits.append(str(d))
+            detected += 1
+            total_conf += float(min(1.0, best / 0.25))
+            bx, by = pos[c][d]
+            digit_bubbles.append({"column": c + 1, "digit": d,
+                                  "cx": int(bx), "cy": int(by), "r": int(BUBBLE_R)})
+        if DEBUG:
+            print(f"[OMR] MSSV col {c+1}: d{order[0]} excess={best:.3f} gap={best-second:.3f}")
+
+    code = "".join(digits) if not all(x == "?" for x in digits) else None
+    if code and "?" in code:
+        warnings.append(f"Partial MSSV: {code}")
+    confidence = total_conf / detected if detected else 0.0
+    layout = {"referenceWidth": CW, "referenceHeight": CH,
+              "source": "anchor_canonical", "digits": digit_bubbles}
+    return {"studentCode": code, "identityLayout": layout,
+            "confidence": round(confidence, 3), "warnings": warnings}
+
+
+# ---------------------------------------------------------------------------
+# Result image (green = correct answer, red = detected student mark)
+# ---------------------------------------------------------------------------
+
+GREEN = (0, 170, 0)
+RED = (0, 0, 255)
+BLUE = (200, 120, 0)
+
+
+def annotate_result(warped, mcq_layout, identity_layout, answer_key=None):
+    """Render the graded result onto the aligned sheet.
+
+    For every question a GREEN ring marks the correct answer; a RED ring marks
+    every bubble detected as filled by the student. A correct filled answer is
+    therefore shown with both rings. Detected MSSV digits are ringed in blue.
+    `answer_key` is a string like "aabbccddaabbbbaaccdd" (one char per question,
+    case-insensitive). When it is None only the student's marks are shown.
+    """
+    vis = cv2.cvtColor(cv2.convertScaleAbs(warped, alpha=1.15, beta=0),
+                       cv2.COLOR_GRAY2BGR)
+
+    if identity_layout:
+        for d in identity_layout.get("digits", []):
+            cv2.circle(vis, (d["cx"], d["cy"]), d["r"] + 4, BLUE, 2)
+
+    if mcq_layout:
+        for q in mcq_layout.get("questions", []):
+            qn = q["questionNumber"]
+            correct = None
+            if answer_key and qn <= len(answer_key):
+                correct = answer_key[qn - 1].upper()
+            for b in q["bubbles"]:
+                pos = (b["cx"], b["cy"])
+                r = b["r"]
+                if correct and b["option"] == correct:
+                    cv2.circle(vis, pos, r + 8, GREEN, 2)
+                if b.get("marked"):
+                    cv2.circle(vis, pos, r + 2, RED, 2)
+
+    cv2.putText(vis, "Green = correct answer   Red = detected student mark",
+                (40, CH - 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+    return vis
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+def process_omr_image(image_path, total_questions=20, answer_key=None,
+                      output_image_path=None, identity_only=False):
+    """Process an exam scan: extract student code and MCQ answers.
+
+    Returns a dict with studentCode, answers, mcqLayout, identityLayout,
+    confidence, aligned and warnings (kept backward compatible with the Node
+    client). When `output_image_path` is given, a graded result image is saved
+    there (green = correct answer, red = detected student mark) and its
+    path is returned under `resultImage`. When `identity_only` is true, the
+    MCQ grid is skipped so live mobile probes can resolve the student quickly;
+    full MCQ extraction still runs later during grading.
     """
     all_warnings = []
-
-    warped_gray, pw = preprocess_image(image_path)
+    warped, pw, aligned = preprocess_image(image_path)
     all_warnings.extend(pw)
+    if warped is None:
+        return {"studentCode": None, "answers": {}, "mcqLayout": None,
+                "identityLayout": None, "confidence": 0.0,
+                "aligned": 0, "resultImage": None, "warnings": all_warnings}
 
-    if warped_gray is None:
-        return {"studentCode": None, "answers": {}, "confidence": 0.0, "warnings": all_warnings}
-
-    identity = extract_student_code(warped_gray)
+    identity = extract_student_code(warped)
     all_warnings.extend(identity.get("warnings", []))
+    if identity_only:
+        mcq = {"answers": {}, "layout": None, "warnings": []}
+    else:
+        mcq = extract_mcq_answers(warped, total_questions)
+        all_warnings.extend(mcq.get("warnings", []))
 
-    mcq = extract_mcq_answers(warped_gray, total_questions)
-    all_warnings.extend(mcq.get("warnings", []))
+    # Fold alignment quality into the reported confidence so the backend can
+    # flag scans that were only partially aligned.
+    confidence = identity["confidence"] * (aligned / 4.0)
+
+    result_path = None
+    if output_image_path:
+        vis = annotate_result(warped, None if identity_only else mcq.get("layout"),
+                              identity.get("identityLayout"), answer_key)
+        cv2.imwrite(output_image_path, vis)
+        result_path = output_image_path
 
     return {
         "studentCode": identity["studentCode"],
         "answers": mcq["answers"],
         "mcqLayout": mcq.get("layout"),
         "identityLayout": identity.get("identityLayout"),
-        "confidence": identity["confidence"],
-        "warnings": list(set(all_warnings)),
+        "confidence": round(confidence, 3),
+        "aligned": aligned,
+        "resultImage": result_path,
+        "warnings": sorted(set(all_warnings)),
     }

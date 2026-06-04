@@ -7,10 +7,32 @@ import path from 'path';
 const genAI = new GoogleGenerativeAI(config.geminiApiKey);
 
 const GEMINI_MIN_CALL_INTERVAL_MS = 15_000;
-const GEMINI_BACKOFF_RETRY_MS = [30_000, 60_000] as const;
+
+// Models to try in priority order. When a model is rate-limited (429) or
+// overloaded (503), it is put on cooldown and the next model is used instead.
+const GEMINI_MODEL_CHAIN = config.geminiModels;
+const GEMINI_MODEL_COOLDOWN_MS = config.geminiModelCooldownMs;
 
 let geminiQueue: Promise<void> = Promise.resolve();
 let lastGeminiCallStartedAt = 0;
+
+// modelId -> epoch ms until which the model is skipped after a 429/503.
+const modelCooldownUntil = new Map<string, number>();
+const modelInstanceCache = new Map<string, any>();
+
+const getGeminiModel = (modelId: string): any => {
+  let model = modelInstanceCache.get(modelId);
+  if (!model) {
+    model = genAI.getGenerativeModel({ model: modelId });
+    modelInstanceCache.set(modelId, model);
+  }
+  return model;
+};
+
+const isModelCoolingDown = (modelId: string): boolean => {
+  const until = modelCooldownUntil.get(modelId);
+  return typeof until === 'number' && until > Date.now();
+};
 
 const sleep = async (ms: number): Promise<void> => {
   if (ms <= 0) return;
@@ -50,23 +72,6 @@ const isRetryableGeminiError = (error: unknown): boolean => {
   return statusCode === 429 || statusCode === 503;
 };
 
-const runWithGeminiBackoff = async <T>(operation: () => Promise<T>): Promise<T> => {
-  for (let attempt = 0; attempt <= GEMINI_BACKOFF_RETRY_MS.length; attempt += 1) {
-    try {
-      return await operation();
-    } catch (error) {
-      if (!isRetryableGeminiError(error) || attempt >= GEMINI_BACKOFF_RETRY_MS.length) {
-        throw error;
-      }
-
-      const delayMs = GEMINI_BACKOFF_RETRY_MS[attempt];
-      await sleep(delayMs);
-    }
-  }
-
-  throw new Error('Gemini request retry attempts exceeded');
-};
-
 const enqueueGeminiRequest = async <T>(operation: () => Promise<T>): Promise<T> => {
   const execute = async (): Promise<T> => {
     const elapsed = Date.now() - lastGeminiCallStartedAt;
@@ -74,7 +79,7 @@ const enqueueGeminiRequest = async <T>(operation: () => Promise<T>): Promise<T> 
     await sleep(waitMs);
 
     lastGeminiCallStartedAt = Date.now();
-    return runWithGeminiBackoff(operation);
+    return operation();
   };
 
   const task = geminiQueue.then(execute, execute);
@@ -86,9 +91,41 @@ const enqueueGeminiRequest = async <T>(operation: () => Promise<T>): Promise<T> 
   return task;
 };
 
-const generateGeminiText = async (model: any, payload: unknown): Promise<string> => {
-  const result = await enqueueGeminiRequest<any>(() => model.generateContent(payload as any));
-  return String(result.response.text() || '').trim();
+/**
+ * Generates text by walking the configured model chain in priority order.
+ * On a 429 (out of quota / rate limit) or 503 (overloaded), the current model
+ * is put on cooldown and the next model is tried. A model that returns a
+ * non-retryable error fails the whole request immediately. On success a model's
+ * cooldown is cleared so it is preferred again straight away.
+ */
+const generateGeminiText = async (payload: unknown): Promise<string> => {
+  return enqueueGeminiRequest<string>(async () => {
+    const available = GEMINI_MODEL_CHAIN.filter((modelId) => !isModelCoolingDown(modelId));
+    // If every model is cooling down, fall back to trying the whole chain anyway.
+    const order = available.length > 0 ? available : GEMINI_MODEL_CHAIN;
+
+    let lastError: unknown;
+    for (const modelId of order) {
+      try {
+        const model = getGeminiModel(modelId);
+        const result: any = await model.generateContent(payload as any);
+        modelCooldownUntil.delete(modelId);
+        return String(result.response.text() || '').trim();
+      } catch (error) {
+        lastError = error;
+        if (isRetryableGeminiError(error)) {
+          modelCooldownUntil.set(modelId, Date.now() + GEMINI_MODEL_COOLDOWN_MS);
+          console.warn(
+            `[gemini] model "${modelId}" unavailable (status ${parseStatusCode(error) ?? '?'}); cooling down ${GEMINI_MODEL_COOLDOWN_MS}ms and falling back to next model`
+          );
+          continue;
+        }
+        throw error;
+      }
+    }
+
+    throw lastError ?? new Error('All Gemini models in the fallback chain are unavailable');
+  });
 };
 
 export interface EssayGradingResult {
@@ -157,92 +194,18 @@ export interface SubmissionBatchExtractionResult {
   warnings: string[];
 }
 
+// Hướng dẫn để Gemini TỰ tách đáp án mẫu (sourceAnswerFromDatabase) thành rubric.
+// Đáp án mẫu trong DB được chia thành các ý ngăn cách bằng dòng trống, mỗi ý kết
+// thúc bằng đánh dấu phần trăm dạng "(30%)" là trọng số điểm của ý đó.
 const DEFAULT_ESSAY_RUBRIC = [
-  'Use the generated rubric criteria for every essay question. Award points only for rubric criteria supported by the candidate answer.',
-  'Accept equivalent phrasing when the same technical meaning is clearly present.',
-  'Do not award points for generic, off-topic, contradictory, or merely stylistic text.',
-  'If the candidate answer does not address a criterion, that criterion score must be 0.',
+  'Tự xây dựng rubric cho từng câu từ sourceAnswerFromDatabase: tách đáp án mẫu thành các tiêu chí (criteria), mỗi ý chính là một tiêu chí.',
+  'Các ý trong đáp án mẫu thường được ngăn cách bằng dòng trống; mỗi ý có thể kết thúc bằng đánh dấu phần trăm dạng "(30%)" hoặc "(25%)".',
+  'Đánh dấu "(X%)" là TRỌNG SỐ điểm của ý đó: maxScore của tiêu chí = maxScore của câu * X / 100, làm tròn 2 chữ số. Tổng maxScore các tiêu chí phải bằng maxScore của câu.',
+  'Nếu một ý không có đánh dấu phần trăm, chia đều phần điểm còn lại cho các ý chưa có trọng số.',
+  'KHÔNG coi chuỗi "(X%)" là nội dung đáp án; đó chỉ là metadata trọng số, không đưa vào phần mô tả tiêu chí.',
+  'Chỉ cho điểm một tiêu chí khi câu trả lời của thí sinh có cùng ý nghĩa kỹ thuật; chấp nhận diễn đạt khác nhưng không chấp nhận câu chung chung, lạc đề.',
+  'Nếu câu trả lời không đề cập một tiêu chí, điểm tiêu chí đó phải bằng 0.',
 ].join('\n');
-
-const RUBRIC_STOPWORDS = new Set([
-  'about', 'after', 'also', 'and', 'because', 'been', 'being', 'between', 'can', 'complete',
-  'could', 'does', 'each', 'explain', 'from', 'have', 'help', 'helps', 'into', 'mention',
-  'must', 'need', 'needs', 'note', 'other', 'should', 'that', 'their', 'these', 'this',
-  'through', 'uses', 'when', 'where', 'which', 'while', 'with', 'would',
-  'cac', 'can', 'cau', 'cho', 'cua', 'duoc', 'giai', 'hay', 'khac', 'khi', 'khong',
-  'mot', 'neu', 'nhung', 'phai', 'rieng', 'thi', 'trong', 'va', 'voi',
-]);
-
-const normalizeRubricText = (value: string): string => (
-  value
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-);
-
-const extractRubricKeywords = (text: string): string[] => {
-  const seen = new Set<string>();
-  return normalizeRubricText(text)
-    .split(/[^a-z0-9]+/i)
-    .map((item) => item.trim())
-    .filter((item) => item.length >= 4 && !RUBRIC_STOPWORDS.has(item))
-    .filter((item) => {
-      if (seen.has(item)) return false;
-      seen.add(item);
-      return true;
-    })
-    .slice(0, 8);
-};
-
-const splitExpectedAnswerIntoRubricPoints = (expectedAnswer: string): string[] => {
-  const cleaned = String(expectedAnswer || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (!cleaned) {
-    return ['Candidate answer must directly and correctly answer the question.'];
-  }
-
-  const bulletParts = cleaned
-    .split(/(?:^|\s)(?:[-*•]|\d+[.)])\s+/)
-    .map((part) => part.trim())
-    .filter((part) => part.length >= 12);
-
-  const rawParts = bulletParts.length > 1
-    ? bulletParts
-    : cleaned.split(/(?<=[.!?;。！？])\s+|\s+-\s+|\s*,\s*(?=(?:and|và|va)\s+)/i);
-
-  const points = rawParts
-    .map((part) => part.trim().replace(/^[,;:.]+|[,;:.]+$/g, ''))
-    .filter((part) => part.length >= 12)
-    .slice(0, 8);
-
-  return points.length > 0 ? points : [cleaned];
-};
-
-const buildRubricFromExpectedAnswer = (question: SubmissionBatchEssayQuestion) => {
-  const points = splitExpectedAnswerIntoRubricPoints(question.expectedAnswer);
-  const maxScore = Math.max(0, Number(question.maxScore) || 0);
-  const baseScore = points.length > 0 ? Math.floor((maxScore / points.length) * 100) / 100 : maxScore;
-  let assigned = 0;
-
-  return points.map((point, index) => {
-    const criterionMaxScore = index === points.length - 1
-      ? Math.max(0, Number((maxScore - assigned).toFixed(2)))
-      : baseScore;
-    assigned = Number((assigned + criterionMaxScore).toFixed(2));
-
-    return {
-      criterionId: `Q${question.questionId}-C${index + 1}`,
-      mandatoryKeyPoint: point,
-      maxScore: criterionMaxScore,
-      criticalKeywords: extractRubricKeywords(point),
-      flexibleScoring: 'Award credit for equivalent wording only when the candidate expresses the same technical meaning. Give partial credit within this component for incomplete but relevant coverage.',
-    };
-  });
-};
 
 const buildEssayQuestionPromptPayload = (essayQuestions: SubmissionBatchEssayQuestion[]) => {
   return essayQuestions.map((question) => ({
@@ -250,7 +213,6 @@ const buildEssayQuestionPromptPayload = (essayQuestions: SubmissionBatchEssayQue
     questionContent: question.questionContent,
     maxScore: question.maxScore,
     sourceAnswerFromDatabase: question.expectedAnswer,
-    gradingRubric: buildRubricFromExpectedAnswer(question),
     rubricInstructions: DEFAULT_ESSAY_RUBRIC,
   }));
 };
@@ -419,7 +381,6 @@ export const extractAndGradeSubmissionFromScansBatch = async (
     }
   }
 
-  const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
   const imageParts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
 
   try {
@@ -440,8 +401,9 @@ export const extractAndGradeSubmissionFromScansBatch = async (
 
 Mục tiêu:
 1. Chỉ trích xuất câu trả lời tự luận từ các trang tự luận.
-2. Chấm điểm tự luận bằng cách so sánh câu trả lời với từng tiêu chí trong gradingRubric của từng câu.
-3. Không nhận diện họ tên, MSSV, khuôn mặt, hoặc danh tính thí sinh.
+2. Với mỗi câu, TỰ tách đáp án mẫu (sourceAnswerFromDatabase) thành các tiêu chí rubric theo hướng dẫn rubricInstructions/defaultRubric, dùng đánh dấu "(X%)" ở cuối mỗi ý làm trọng số điểm.
+3. Chấm điểm bằng cách so sánh câu trả lời thí sinh với từng tiêu chí vừa tách.
+4. Không nhận diện họ tên, MSSV, khuôn mặt, hoặc danh tính thí sinh.
 
 Ngữ cảnh bài thi:
 ${JSON.stringify(
@@ -459,12 +421,14 @@ ${JSON.stringify(
 Ràng buộc bắt buộc:
 1. Trả về DUY NHẤT JSON hợp lệ, không markdown, không giải thích.
 2. Không bịa dữ liệu. Không sử dụng ảnh để xác định thí sinh.
-3. Với MỖI tiêu chí trong gradingRubric, phải ghi rõ tiêu chí đạt hay thiếu trong componentScores.
-4. Chỉ cho điểm của một tiêu chí khi câu trả lời có cùng ý nghĩa kỹ thuật; chấp nhận diễn đạt khác nhưng không chấp nhận câu chung chung.
-5. Nếu câu trả lời sai, lạc đề, né tránh, chỉ lặp lại đề, quá chung chung, hoặc không có bằng chứng trong ảnh thì totalScore/score phải là 0 hoặc tối đa 20% maxScore.
-6. totalScore/score của essayResults phải bằng tổng score trong componentScores và nằm trong [0, maxScore] từng câu.
-7. feedback/comments phải nêu ngắn gọn tiêu chí nào đạt, tiêu chí nào thiếu/sai, và lý do điểm.
-8. Nếu ảnh mờ, lệch, thiếu góc hoặc khó đọc thì ghi rõ trong warnings.
+3. TỰ tách rubric từ sourceAnswerFromDatabase: mỗi ý chính là một tiêu chí trong componentScores, criterionId dạng "Q{questionId}-C{n}".
+4. Đánh dấu "(X%)" ở cuối mỗi ý là trọng số điểm của ý đó: maxScore tiêu chí = maxScore câu * X / 100 (làm tròn 2 chữ số); tổng maxScore các tiêu chí phải bằng maxScore của câu. Nếu một ý không có "(X%)", chia đều phần điểm còn lại. KHÔNG đưa chuỗi "(X%)" vào phần mô tả tiêu chí.
+5. Với MỖI tiêu chí, phải ghi rõ đạt hay thiếu trong componentScores (achieved, matchedKeywords, missingKeywords).
+6. Chỉ cho điểm của một tiêu chí khi câu trả lời có cùng ý nghĩa kỹ thuật; chấp nhận diễn đạt khác nhưng không chấp nhận câu chung chung.
+7. Nếu câu trả lời sai, lạc đề, né tránh, chỉ lặp lại đề, quá chung chung, hoặc không có bằng chứng trong ảnh thì totalScore/score phải là 0 hoặc tối đa 20% maxScore.
+8. totalScore/score của essayResults phải bằng tổng score trong componentScores và nằm trong [0, maxScore] từng câu.
+9. feedback/comments phải nêu ngắn gọn tiêu chí nào đạt, tiêu chí nào thiếu/sai, và lý do điểm.
+10. Nếu ảnh mờ, lệch, thiếu góc hoặc khó đọc thì ghi rõ trong warnings.
 
 Output JSON format:
 {
@@ -497,7 +461,7 @@ Output JSON format:
   "warnings": ["..."]
 }`;
 
-    const rawText = await generateGeminiText(model, [...imageParts, prompt]);
+    const rawText = await generateGeminiText([...imageParts, prompt]);
     const parsed = parseModelJson<{
       fullName?: string | null;
       studentCode?: string | null;
@@ -576,7 +540,6 @@ export const extractAndGradeMultiStudentBatch = async (
     return [];
   }
 
-  const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
   const imageParts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
 
   // Build image manifest describing which images belong to which student
@@ -618,8 +581,9 @@ ${imageManifest.map((m) => `  Ảnh ${m.imageIndex + 1}: ${m.studentLabel} - Tra
 
 Mục tiêu cho MỖI sinh viên:
 1. Chỉ trích xuất câu trả lời tự luận từ các trang tự luận của sinh viên đó.
-2. Chấm điểm bằng cách so sánh câu trả lời với từng tiêu chí trong gradingRubric của từng câu.
-3. Không nhận diện họ tên, MSSV, khuôn mặt, hoặc danh tính thí sinh.
+2. Với mỗi câu, TỰ tách đáp án mẫu (sourceAnswerFromDatabase) thành các tiêu chí rubric theo hướng dẫn rubricInstructions/defaultRubric, dùng đánh dấu "(X%)" ở cuối mỗi ý làm trọng số điểm.
+3. Chấm điểm bằng cách so sánh câu trả lời thí sinh với từng tiêu chí vừa tách.
+4. Không nhận diện họ tên, MSSV, khuôn mặt, hoặc danh tính thí sinh.
 
 Thông tin bài thi:
 ${JSON.stringify(
@@ -637,12 +601,14 @@ ${JSON.stringify(
 Ràng buộc bắt buộc:
 1. Trả về DUY NHẤT JSON hợp lệ, không markdown, không giải thích.
 2. Không bịa dữ liệu. Không sử dụng ảnh để xác định thí sinh.
-3. Với MỖI tiêu chí trong gradingRubric, phải ghi rõ tiêu chí đạt hay thiếu trong componentScores.
-4. Chỉ cho điểm của một tiêu chí khi câu trả lời có cùng ý nghĩa kỹ thuật; chấp nhận diễn đạt khác nhưng không chấp nhận câu chung chung.
-5. Nếu câu trả lời sai, lạc đề, né tránh, chỉ lặp lại đề, quá chung chung, hoặc không có bằng chứng trong ảnh thì totalScore/score phải là 0 hoặc tối đa 20% maxScore.
-6. totalScore/score phải bằng tổng score trong componentScores và nằm trong [0, maxScore] cho mỗi câu.
-7. feedback/comments phải nêu ngắn gọn tiêu chí nào đạt, tiêu chí nào thiếu/sai, và lý do điểm.
-8. Nếu ảnh mờ hoặc khó đọc, ghi vào warnings.
+3. TỰ tách rubric từ sourceAnswerFromDatabase: mỗi ý chính là một tiêu chí trong componentScores, criterionId dạng "Q{questionId}-C{n}".
+4. Đánh dấu "(X%)" ở cuối mỗi ý là trọng số điểm của ý đó: maxScore tiêu chí = maxScore câu * X / 100 (làm tròn 2 chữ số); tổng maxScore các tiêu chí phải bằng maxScore của câu. Nếu một ý không có "(X%)", chia đều phần điểm còn lại. KHÔNG đưa chuỗi "(X%)" vào phần mô tả tiêu chí.
+5. Với MỖI tiêu chí, phải ghi rõ đạt hay thiếu trong componentScores (achieved, matchedKeywords, missingKeywords).
+6. Chỉ cho điểm của một tiêu chí khi câu trả lời có cùng ý nghĩa kỹ thuật; chấp nhận diễn đạt khác nhưng không chấp nhận câu chung chung.
+7. Nếu câu trả lời sai, lạc đề, né tránh, chỉ lặp lại đề, quá chung chung, hoặc không có bằng chứng trong ảnh thì totalScore/score phải là 0 hoặc tối đa 20% maxScore.
+8. totalScore/score phải bằng tổng score trong componentScores và nằm trong [0, maxScore] cho mỗi câu.
+9. feedback/comments phải nêu ngắn gọn tiêu chí nào đạt, tiêu chí nào thiếu/sai, và lý do điểm.
+10. Nếu ảnh mờ hoặc khó đọc, ghi vào warnings.
 
 Output JSON format (mảng kết quả cho từng sinh viên):
 {
@@ -680,7 +646,7 @@ Output JSON format (mảng kết quả cho từng sinh viên):
   ]
 }`;
 
-    const rawText = await generateGeminiText(model, [...imageParts, prompt]);
+    const rawText = await generateGeminiText([...imageParts, prompt]);
     const parsed = parseModelJson<{
       students?: Array<{
         studentLabel?: string;

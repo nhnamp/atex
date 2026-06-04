@@ -352,3 +352,4 @@ ALTER TABLE "GradingAuditLog" ADD CONSTRAINT "GradingAuditLog_actorId_fkey" FORE
 
 -- AddForeignKey
 ALTER TABLE "FaceDescriptor" ADD CONSTRAINT "FaceDescriptor_studentId_fkey" FOREIGN KEY ("studentId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+
