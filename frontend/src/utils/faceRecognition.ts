@@ -1,23 +1,84 @@
 import * as faceapi from '@vladmandic/face-api';
 
 const MODEL_URL = '/models';
+type DetectorKind = 'tiny' | 'ssd';
+
 let modelsLoaded = false;
+let loadedDetector: DetectorKind | null = null;
+let warmedUpDetector: DetectorKind | null = null;
+
+const isMobileDevice = (): boolean => {
+  if (typeof navigator === 'undefined') return false;
+  const userAgent = navigator.userAgent || '';
+  const touchPoints = navigator.maxTouchPoints || 0;
+  return /Android|iPhone|iPad|iPod|Mobile/i.test(userAgent) || touchPoints > 1;
+};
+
+const getPreferredDetector = (): DetectorKind => (isMobileDevice() ? 'tiny' : 'ssd');
+
+const createDetectorOptions = () => {
+  if (loadedDetector === 'tiny') {
+    return new faceapi.TinyFaceDetectorOptions({
+      inputSize: 224,
+      scoreThreshold: 0.5,
+    });
+  }
+
+  return new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 });
+};
+
+const useTinyLandmarks = (): boolean => loadedDetector === 'tiny';
 
 /**
- * Load SSD MobileNet, face landmarks, and face recognition models.
+ * Load face detection, landmark, and recognition models.
+ * Mobile browsers use the smaller TinyFaceDetector and tiny landmark model.
  * Models are cached after first load.
  */
 export async function loadModels(): Promise<void> {
   if (modelsLoaded) return;
 
-  await Promise.all([
-    faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
-    faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL),
-    faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
-  ]);
+  loadedDetector = getPreferredDetector();
+
+  if (loadedDetector === 'tiny') {
+    await faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+    await faceapi.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL);
+  } else {
+    await faceapi.nets.ssdMobilenetv1.loadFromUri(MODEL_URL);
+    await faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+  }
+
+  await faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
 
   modelsLoaded = true;
-  console.log('✅ Face-api.js models loaded');
+  console.log(`✅ Face-api.js models loaded (${loadedDetector})`);
+}
+
+/**
+ * Run a small first inference before the camera flow starts.
+ * This lets mobile browsers initialize ML backends outside the capture interaction.
+ */
+export async function warmupFaceRecognition(): Promise<void> {
+  await loadModels();
+  if (warmedUpDetector === loadedDetector) return;
+
+  const tf = (faceapi as unknown as { tf?: { ready?: () => Promise<void> } }).tf;
+  await tf?.ready?.();
+
+  const canvas = document.createElement('canvas');
+  canvas.width = 160;
+  canvas.height = 160;
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    ctx.fillStyle = '#f3f4f6';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#cbd5e1';
+    ctx.beginPath();
+    ctx.ellipse(80, 74, 34, 44, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  await faceapi.detectAllFaces(canvas, createDetectorOptions());
+  warmedUpDetector = loadedDetector;
 }
 
 /**
@@ -27,9 +88,10 @@ export async function loadModels(): Promise<void> {
 export async function extractDescriptors(
   input: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement
 ): Promise<Float32Array[]> {
+  await loadModels();
   const detections = await faceapi
-    .detectAllFaces(input, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
-    .withFaceLandmarks()
+    .detectAllFaces(input, createDetectorOptions())
+    .withFaceLandmarks(useTinyLandmarks())
     .withFaceDescriptors();
 
   return detections.map((d) => d.descriptor);
@@ -42,9 +104,10 @@ export async function extractDescriptors(
 export async function extractSingleDescriptor(
   input: HTMLImageElement | HTMLVideoElement | HTMLCanvasElement
 ): Promise<Float32Array | null> {
+  await loadModels();
   const detection = await faceapi
-    .detectSingleFace(input, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
-    .withFaceLandmarks()
+    .detectSingleFace(input, createDetectorOptions())
+    .withFaceLandmarks(useTinyLandmarks())
     .withFaceDescriptor();
 
   return detection?.descriptor ?? null;
@@ -95,9 +158,10 @@ export async function detectAndMatch(
   video: HTMLVideoElement,
   matcher: faceapi.FaceMatcher
 ): Promise<FaceMatch[]> {
+  await loadModels();
   const detections = await faceapi
-    .detectAllFaces(video, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.5 }))
-    .withFaceLandmarks()
+    .detectAllFaces(video, createDetectorOptions())
+    .withFaceLandmarks(useTinyLandmarks())
     .withFaceDescriptors();
 
   return detections.map((detection) => {

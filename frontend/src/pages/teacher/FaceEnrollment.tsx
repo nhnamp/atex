@@ -5,7 +5,7 @@ import toast from 'react-hot-toast';
 import Layout from '../../components/Layout';
 import LoadingSpinner from '../../components/LoadingSpinner';
 import api from '../../api';
-import { loadModels, extractSingleDescriptor } from '../../utils/faceRecognition';
+import { loadModels, warmupFaceRecognition, extractSingleDescriptor } from '../../utils/faceRecognition';
 
 interface StudentFaceInfo {
   student: { id: number; username: string; fullName: string };
@@ -18,6 +18,7 @@ const FaceEnrollment: React.FC = () => {
   const [students, setStudents] = useState<StudentFaceInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [modelsReady, setModelsReady] = useState(false);
+  const [preparingModels, setPreparingModels] = useState(true);
   const [selectedStudent, setSelectedStudent] = useState<StudentFaceInfo | null>(null);
   const [capturing, setCapturing] = useState(false);
   const [capturedDescriptors, setCapturedDescriptors] = useState<number[][]>([]);
@@ -38,19 +39,32 @@ const FaceEnrollment: React.FC = () => {
   }, [classId]);
 
   useEffect(() => {
+    let cancelled = false;
+
     const init = async () => {
       try {
+        setPreparingModels(true);
         await loadModels();
-        setModelsReady(true);
+        await warmupFaceRecognition();
+        if (!cancelled) {
+          setModelsReady(true);
+        }
       } catch (err) {
-        toast.error('Failed to load face recognition models');
+        if (!cancelled) {
+          toast.error('Failed to load face recognition models');
+        }
         console.error(err);
+      } finally {
+        if (!cancelled) {
+          setPreparingModels(false);
+        }
       }
       await fetchStudents();
     };
     init();
 
     return () => {
+      cancelled = true;
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((t) => t.stop());
       }
@@ -58,9 +72,19 @@ const FaceEnrollment: React.FC = () => {
   }, [fetchStudents]);
 
   const startCamera = async () => {
+    if (!modelsReady) {
+      toast.error('Face recognition is still preparing. Please wait.');
+      return;
+    }
+
     try {
+      await new Promise((resolve) => setTimeout(resolve, 400));
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+        video: {
+          facingMode: 'user',
+          width: { ideal: 480, max: 640 },
+          height: { ideal: 360, max: 480 },
+        },
       });
       streamRef.current = stream;
       if (videoRef.current) {
@@ -82,9 +106,14 @@ const FaceEnrollment: React.FC = () => {
   };
 
   const handleSelectStudent = (student: StudentFaceInfo) => {
+    if (!modelsReady) {
+      toast.error('Face recognition is still preparing. Please wait.');
+      return;
+    }
+
     setSelectedStudent(student);
     setCapturedDescriptors([]);
-    startCamera();
+    void startCamera();
   };
 
   const handleCapture = async () => {
@@ -167,9 +196,9 @@ const FaceEnrollment: React.FC = () => {
           <h1 className="text-2xl font-bold text-gray-900">Face Enrollment</h1>
           <p className="text-gray-500 mt-1">
             Capture student faces for face-recognition attendance.
-            {!modelsReady && (
+            {preparingModels && (
               <span className="ml-2 text-amber-600 font-medium">
-                ⏳ Loading face models...
+                Preparing face models...
               </span>
             )}
           </p>
@@ -304,7 +333,7 @@ const FaceEnrollment: React.FC = () => {
                     )}
                     <button
                       onClick={() => handleSelectStudent(s)}
-                      disabled={!modelsReady || (selectedStudent?.student.id === s.student.id)}
+                      disabled={!modelsReady || preparingModels || (selectedStudent?.student.id === s.student.id)}
                       className="btn-secondary text-xs py-1.5 px-3"
                     >
                       {s.enrolled ? 'Re-enroll' : 'Enroll Face'}
