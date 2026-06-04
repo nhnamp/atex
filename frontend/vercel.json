@@ -2,11 +2,11 @@
   "rewrites": [
     {
       "source": "/api/:path*",
-      "destination": "https://your-backend.onrender.com/api/:path*"
+      "destination": "https://attendance-backend-tc82.onrender.com/api/:path*"
     },
     {
       "source": "/uploads/:path*",
-      "destination": "https://your-backend.onrender.com/uploads/:path*"
+      "destination": "https://attendance-backend-tc82.onrender.com/uploads/:path*"
     }
   ]
 }
