@@ -1,26 +1,63 @@
+# Dependencies
 node_modules/
+
+# Build outputs
 dist/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Database
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
-.env
-.DS_Store
-*.log
-__pycache__/
-*.py[cod]
 prisma/dev.db
 prisma/dev.db-journal
-# Backup dữ liệu xuất từ DB (chứa hash mật khẩu) - không commit
-backup.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Logs
+*.log
+npm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Uploads (keep directory structure)
 backend/uploads/scans/*
 !backend/uploads/scans/.gitkeep
 backend/uploads/temp/*
 !backend/uploads/temp/.gitkeep
+
+# Backup data (may contain password hashes)
+backup.json
+
+# Test outputs
 test/
-OMR_context.md
 test/debugOutputs/
+
+# Documentation (auto-generated or private)
 DEPLOY.md
 CLAUDE.md
-CONTEXT.md 
+CONTEXT.md
 AGENTS.md
+OMR_context.md

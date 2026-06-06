@@ -1,7 +1,7 @@
 {
-  "name": "attendance",
+  "name": "atex",
   "version": "1.0.0",
-  "description": "Student Attendance System and AI Exam Generation",
+  "description": "ATEX - Attendance & Exam platform for teachers",
   "private": true,
   "scripts": {
     "install:all": "npm install --workspaces",

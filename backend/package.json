@@ -1,7 +1,7 @@
 {
-  "name": "backend",
+  "name": "atex-backend",
   "version": "1.0.0",
-  "description": "Student Attendance System - Backend",
+  "description": "ATEX - Backend",
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",

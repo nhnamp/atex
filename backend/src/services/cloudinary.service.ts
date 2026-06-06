@@ -39,7 +39,7 @@ const uploadBuffer = async (buffer: Buffer, options: UploadApiOptions): Promise<
 export const uploadImageToCloudinary = async (buffer: Buffer, fileName: string): Promise<string> => {
   const publicId = fileName.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]+/g, '_');
   return uploadBuffer(buffer, {
-    folder: 'nt208/scans',
+    folder: 'atex/scans',
     resource_type: 'image',
     public_id: `${Date.now()}_${publicId}`,
     overwrite: true,
@@ -49,7 +49,7 @@ export const uploadImageToCloudinary = async (buffer: Buffer, fileName: string):
 export const uploadPdfToCloudinary = async (buffer: Buffer, fileName: string): Promise<string> => {
   const publicId = fileName.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]+/g, '_');
   return uploadBuffer(buffer, {
-    folder: 'nt208/merged-pdfs',
+    folder: 'atex/merged-pdfs',
     resource_type: 'raw',
     public_id: `${Date.now()}_${publicId}`,
     format: 'pdf',

@@ -210,7 +210,7 @@ const AdminClasses: React.FC = () => {
                 <input
                   type="text"
                   className="input-field"
-                  placeholder="e.g. NT208 - Network Security"
+                  placeholder="e.g. CS101 - Intro to Computer Science"
                   value={form.name}
                   onChange={(e) => setForm({ ...form, name: e.target.value })}
                   required

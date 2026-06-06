@@ -62,7 +62,7 @@ const Register: React.FC = () => {
           <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-primary-600 mb-4">
             <GraduationCap size={32} className="text-white" />
           </div>
-          <h1 className="text-3xl font-bold text-gray-900">NT208</h1>
+          <h1 className="text-3xl font-bold text-gray-900">ATEX</h1>
           <p className="text-gray-500 mt-1">Create your account</p>
         </div>
 

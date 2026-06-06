@@ -77,8 +77,8 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
             <GraduationCap size={20} className="text-white" />
           </div>
           <div>
-            <p className="font-bold text-gray-900 text-sm">NT208</p>
-            <p className="text-xs text-gray-500">Attendance System</p>
+            <p className="font-bold text-gray-900 text-sm">ATEX</p>
+            <p className="text-xs text-gray-500">Attendance & Exam</p>
           </div>
           <button
             className="ml-auto md:hidden text-gray-500 hover:text-gray-700"
@@ -163,7 +163,7 @@ const Layout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
           </button>
           <div className="flex items-center gap-2">
             <GraduationCap size={20} className="text-primary-600" />
-            <span className="font-bold text-gray-900 text-sm">NT208</span>
+            <span className="font-bold text-gray-900 text-sm">ATEX</span>
           </div>
         </header>
 

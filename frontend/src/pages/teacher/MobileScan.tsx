@@ -251,7 +251,7 @@ const formatInvalidScanToast = (invalidScans: InvalidScanPayload[]): string => {
   return visible.join('\n');
 };
 
-const MOBILE_SCAN_DB_NAME = 'nt208-mobile-scan';
+const MOBILE_SCAN_DB_NAME = 'atex-mobile-scan';
 const MOBILE_SCAN_DB_VERSION = 1;
 const MOBILE_SCAN_STORE = 'queuedPapers';
 

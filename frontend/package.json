@@ -1,7 +1,7 @@
 {
-  "name": "nt208-frontend",
+  "name": "atex-frontend",
   "version": "1.0.0",
-  "description": "NT208 Student Attendance System - Frontend",
+  "description": "ATEX - Frontend",
   "private": true,
   "type": "module",
   "scripts": {

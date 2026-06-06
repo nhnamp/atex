@@ -27,7 +27,7 @@ const DEFAULT_GEMINI_MODELS = [
 
 export const config = {
   port: process.env.PORT || 5000,
-  jwtSecret: process.env.JWT_SECRET || 'nt208_default_secret',
+  jwtSecret: process.env.JWT_SECRET || 'atex_default_secret',
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '7d',
   geminiApiKey: process.env.GEMINI_API_KEY || '',
   geminiModels: parseStringList(process.env.GEMINI_MODELS, DEFAULT_GEMINI_MODELS),
