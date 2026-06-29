@@ -26,6 +26,24 @@ type ViewfinderZone = {
   label?: string;
 };
 
+type CaptureQualityGate = {
+  minBrightness: number;
+  maxBrightness: number;
+  minEdge: number;
+};
+
+const IDENTITY_CAPTURE_GATE: CaptureQualityGate = {
+  minBrightness: 65,
+  maxBrightness: 210,
+  minEdge: 8,
+};
+
+const ESSAY_CAPTURE_GATE: CaptureQualityGate = {
+  minBrightness: 30,
+  maxBrightness: 242,
+  minEdge: 2,
+};
+
 const VIEWFINDER_ZONES: Record<ViewfinderVariant, ViewfinderZone[]> = {
   omr: [
     { id: 'header', top: '3%', left: '8%', width: '84%', height: '8%', label: 'HEADER' },
@@ -189,6 +207,7 @@ type SubmissionFeedbackPayload = {
   omrAnnotatedImageUrl: string | null;
   aiComments: string | null;
   mergedPdfUrl: string | null;
+  attemptNumber: number | null;
   aiReport: {
     summary: string;
     strengths: string[];
@@ -254,6 +273,7 @@ const TeacherSessionManagement: React.FC = () => {
   const [capturing, setCapturing] = useState(false);
   const [publishingReport, setPublishingReport] = useState(false);
   const [mobileScanLink, setMobileScanLink] = useState('');
+  const [mobileScanOtp, setMobileScanOtp] = useState('');
   const [workflowSummary, setWorkflowSummary] = useState<any | null>(null);
   const [gradingInProgress, setGradingInProgress] = useState(false);
   const [gradingProgress, setGradingProgress] = useState<GradingJobStatus | null>(null);
@@ -284,6 +304,8 @@ const TeacherSessionManagement: React.FC = () => {
   const [issuesLoading, setIssuesLoading] = useState(false);
   const [regradingSubmissionId, setRegradingSubmissionId] = useState<number | null>(null);
   const [deletingSubmissionScansId, setDeletingSubmissionScansId] = useState<number | null>(null);
+  const [gradingSubmissionId, setGradingSubmissionId] = useState<number | null>(null);
+  const [uploadingMissingId, setUploadingMissingId] = useState<number | null>(null);
   const [expandedSubmissionId, setExpandedSubmissionId] = useState<number | null>(null);
   const [inlineEditScore, setInlineEditScore] = useState<{
     submissionId: number;
@@ -305,6 +327,9 @@ const TeacherSessionManagement: React.FC = () => {
   const qualityTimerRef = useRef<number | null>(null);
   const gradingPollTimerRef = useRef<number | null>(null);
   const identityPollTimerRef = useRef<number | null>(null);
+  const isMountedRef = useRef(true);
+  const loadedClassIdRef = useRef<number | null>(null);
+  const loadedExamIdRef = useRef<number | null>(null);
 
   const selectedSession = useMemo(
     () => sessions.find((item) => item.id === selectedSessionId) || null,
@@ -499,6 +524,7 @@ const TeacherSessionManagement: React.FC = () => {
       omrAnnotatedImageUrl: null,
       aiComments: submission.aiComments || null,
       mergedPdfUrl: submission.mergedPdfUrl || null,
+      attemptNumber: null,
       aiReport: null,
     };
 
@@ -521,6 +547,7 @@ const TeacherSessionManagement: React.FC = () => {
         omrAnnotatedImageUrl?: unknown;
         aiComments?: unknown;
         mergedPdfUrl?: unknown;
+        attemptNumber?: unknown;
         aiReport?: {
           summary?: unknown;
           strengths?: unknown;
@@ -587,6 +614,7 @@ const TeacherSessionManagement: React.FC = () => {
         omrAnnotatedImageUrl: String(parsed?.omrAnnotatedImageUrl || '').trim() || null,
         aiComments: String(submission.aiComments || parsed?.aiComments || '').trim() || null,
         mergedPdfUrl: String(submission.mergedPdfUrl || parsed?.mergedPdfUrl || '').trim() || null,
+        attemptNumber: toNumberOrNull(parsed?.attemptNumber),
         aiReport: hasAiReport
           ? {
             summary,
@@ -695,6 +723,91 @@ const TeacherSessionManagement: React.FC = () => {
     return parseScanEntriesFromRaw(submission.scanFiles);
   };
 
+  // Parse scan entries + feedback JSON once per submissions/report change instead of
+  // on every render (expanding a row or typing a score re-renders the whole list).
+  const parsedSubmissions = useMemo(
+    () => new Map(submissions.map((item) => [
+      item.id,
+      { scans: resolveScanEntries(item), feedback: parseSubmissionFeedback(item) },
+    ])),
+    [submissions]
+  );
+
+  const reportSubmissions = useMemo<ExamSubmission[]>(
+    () => (Array.isArray(report?.submissions) ? report.submissions : submissions),
+    [report, submissions]
+  );
+
+  const parsedReportSubmissions = useMemo(
+    () => new Map(reportSubmissions.map((item) => [
+      item.id,
+      { scans: resolveScanEntries(item), feedback: parseSubmissionFeedback(item) },
+    ])),
+    [reportSubmissions]
+  );
+
+  const hasPreviousSubmission = (submission: ExamSubmission | undefined): boolean => {
+    if (!submission) return false;
+    const scanCount = submission.scanCount ?? resolveScanEntries(submission).length;
+    return scanCount > 0
+      || (submission.finalScore !== null && submission.finalScore !== undefined)
+      || ['GRADED', 'REVIEWED', 'FINALIZED'].includes(submission.status);
+  };
+
+  const getProcessedDraftIds = (): Set<number> => {
+    const processedDraftIds = new Set<number>();
+    submissions.forEach((submission) => {
+      const feedbackDraftId = Number.parseInt(String((() => {
+        try {
+          return JSON.parse(submission.feedback || '{}')?.draftId;
+        } catch {
+          return null;
+        }
+      })() || ''), 10);
+      if (Number.isFinite(feedbackDraftId) && feedbackDraftId > 0) {
+        processedDraftIds.add(feedbackDraftId);
+      }
+
+      (submission.attempts || []).forEach((attempt) => {
+        const sourceDraftId = Number(attempt.sourceDraftId);
+        if (Number.isFinite(sourceDraftId) && sourceDraftId > 0) {
+          processedDraftIds.add(sourceDraftId);
+        }
+      });
+    });
+    return processedDraftIds;
+  };
+
+  const getNewValidDrafts = (): ExamDraftScan[] => {
+    const processedDraftIds = getProcessedDraftIds();
+    return draftScans.filter((draft) => (
+      draft.status === 'VALID'
+      && !!draft.studentId
+      && !processedDraftIds.has(draft.id)
+    ));
+  };
+
+  const confirmRegradingExistingDraftStudents = (): boolean => {
+    const submissionsByStudentId = new Map(submissions.map((submission) => [submission.studentId, submission]));
+    const existingStudents = getNewValidDrafts()
+      .filter((draft) => draft.studentId && hasPreviousSubmission(submissionsByStudentId.get(draft.studentId)))
+      .map((draft) => {
+        const submission = draft.studentId ? submissionsByStudentId.get(draft.studentId) : undefined;
+        return draft.student?.fullName
+          || submission?.student?.fullName
+          || draft.student?.username
+          || submission?.student?.username
+          || `Student #${draft.studentId}`;
+      });
+
+    const uniqueNames = [...new Set(existingStudents)];
+    if (uniqueNames.length === 0) return true;
+
+    return window.confirm(
+      `Các thí sinh sau đã có bài nộp/điểm từ trước:\n\n${uniqueNames.map((name, index) => `${index + 1}. ${name}`).join('\n')}\n\nNếu tiếp tục, hệ thống sẽ lưu bài mới thành lần làm tiếp theo và cập nhật kết quả hiện hành.`
+    );
+  };
+
   const fetchSessions = async () => {
     setLoading(true);
     try {
@@ -730,6 +843,7 @@ const TeacherSessionManagement: React.FC = () => {
         api.get<{ drafts: ExamDraftScan[] }>(`/exams/sessions/${sessionId}/draft-scans`),
         api.get<SessionIssuesReport>(`/exams/sessions/${sessionId}/issues`).catch(() => ({ data: null })),
       ]);
+      if (!isMountedRef.current) return;
       setSubmissions(submissionRes.data);
       setReport(reportRes.data);
       setDraftScans(draftsRes.data?.drafts || []);
@@ -738,31 +852,40 @@ const TeacherSessionManagement: React.FC = () => {
       const reportClassId = Number(reportRes.data?.session?.class?.id || 0);
       const fallbackClassId = Number(selectedSession?.classId || 0);
       const classId = reportClassId > 0 ? reportClassId : fallbackClassId;
+      // Roster + exam definition don't change during grading; only fetch when they actually change.
       if (classId > 0) {
-        try {
-          const { data: classData } = await api.get(`/classes/${classId}`);
-          const students: AssignableStudent[] = Array.isArray(classData?.students)
-            ? classData.students
-                .map((item: any) => item?.student)
-                .filter((student: any) => student && Number(student.id) > 0)
-                .map((student: any) => ({
-                  id: Number(student.id),
-                  username: String(student.username || ''),
-                  fullName: String(student.fullName || ''),
-                }))
-            : [];
-          setClassStudentsForAssign(students);
-        } catch {
-          setClassStudentsForAssign([]);
+        if (loadedClassIdRef.current !== classId) {
+          try {
+            const { data: classData } = await api.get(`/classes/${classId}`);
+            if (!isMountedRef.current) return;
+            const students: AssignableStudent[] = Array.isArray(classData?.students)
+              ? classData.students
+                  .map((item: any) => item?.student)
+                  .filter((student: any) => student && Number(student.id) > 0)
+                  .map((student: any) => ({
+                    id: Number(student.id),
+                    username: String(student.username || ''),
+                    fullName: String(student.fullName || ''),
+                  }))
+              : [];
+            setClassStudentsForAssign(students);
+            loadedClassIdRef.current = classId;
+          } catch {
+            setClassStudentsForAssign([]);
+            loadedClassIdRef.current = null;
+          }
         }
       } else {
         setClassStudentsForAssign([]);
+        loadedClassIdRef.current = null;
       }
 
       const examId = reportRes.data?.session?.exam?.id;
-      if (examId) {
+      if (examId && loadedExamIdRef.current !== examId) {
         const examRes = await api.get<BuiltExam>(`/exams/builder/${examId}`);
+        if (!isMountedRef.current) return;
         setSelectedExam(examRes.data);
+        loadedExamIdRef.current = examId;
       }
     } catch {
       toast.error('Failed to load session details');
@@ -883,17 +1006,19 @@ const TeacherSessionManagement: React.FC = () => {
     const pixels = data.length / 4;
     const avgBrightness = brightnessTotal / Math.max(1, pixels);
     const edgeScore = edgeTotal / Math.max(1, pixels);
-    const ready = avgBrightness > 65 && avgBrightness < 210 && edgeScore > 8;
+    const isIdentityPass = activePassIndex === 1;
+    const gate = isIdentityPass ? IDENTITY_CAPTURE_GATE : ESSAY_CAPTURE_GATE;
+    const ready = avgBrightness > gate.minBrightness && avgBrightness < gate.maxBrightness && edgeScore > gate.minEdge;
 
     setCaptureReady(ready);
     if (ready) {
-      setCaptureHint('Green: readable, press Capture');
-    } else if (avgBrightness <= 65) {
+      setCaptureHint(isIdentityPass ? 'Green: readable, press Capture' : 'Readable enough, press Capture');
+    } else if (avgBrightness <= gate.minBrightness) {
       setCaptureHint('Too dark, increase light');
-    } else if (avgBrightness >= 210) {
+    } else if (avgBrightness >= gate.maxBrightness) {
       setCaptureHint('Too bright, avoid glare');
     } else {
-      setCaptureHint('Hold device steady and fill frame with paper');
+      setCaptureHint(isIdentityPass ? 'Hold device steady and fill frame with paper' : 'You can capture; holding steadier will improve clarity');
     }
   };
 
@@ -1083,9 +1208,12 @@ const TeacherSessionManagement: React.FC = () => {
   };
 
   const captureForActiveSubmission = async () => {
-    if (!captureReady) {
+    if (!captureReady && activePassIndex === 1) {
       toast.error('Image quality is not ready yet. Wait for green indicator before capturing.');
       return;
+    }
+    if (!captureReady) {
+      toast('Essay page image is below the green hint, but it will be captured.');
     }
 
     const video = cameraVideoRef.current;
@@ -1139,12 +1267,15 @@ const TeacherSessionManagement: React.FC = () => {
   };
 
   const gradeAI = async (submissionId: number) => {
+    setGradingSubmissionId(submissionId);
     try {
       await api.post(`/exams/submissions/${submissionId}/grade-ai`, { useScanExtraction: true });
       toast.success('AI grading completed');
-      if (selectedSessionId) fetchSessionDetails(selectedSessionId);
+      if (selectedSessionId) await fetchSessionDetails(selectedSessionId);
     } catch {
       toast.error('Failed to grade with AI');
+    } finally {
+      setGradingSubmissionId(null);
     }
   };
 
@@ -1186,6 +1317,7 @@ const TeacherSessionManagement: React.FC = () => {
     const tick = async () => {
       try {
         const { data } = await api.get<GradingJobStatus>(`/exams/sessions/${sessionId}/grading-status`);
+        if (!isMountedRef.current) { stopGradingPolling(); return; }
         setGradingProgress(data);
 
         if (data.status === 'QUEUED' || data.status === 'RUNNING') {
@@ -1224,6 +1356,14 @@ const TeacherSessionManagement: React.FC = () => {
 
   const completeScanningAndAutoGrade = async () => {
     if (!selectedSessionId) return;
+    const validDraftCount = getNewValidDrafts().length;
+    if (validDraftCount === 0) {
+      toast.error('No valid draft scans are ready for grading.');
+      return;
+    }
+    if (!confirmRegradingExistingDraftStudents()) {
+      return;
+    }
     setGradingInProgress(true);
     setGradingProgress({
       jobId: null,
@@ -1375,6 +1515,13 @@ const TeacherSessionManagement: React.FC = () => {
       const tick = async () => {
         try {
           const { data: draftData } = await api.get<{ drafts: ExamDraftScan[] }>(`/exams/sessions/${pollSessionId}/draft-scans`);
+          if (!isMountedRef.current) {
+            if (identityPollTimerRef.current) {
+              window.clearInterval(identityPollTimerRef.current);
+              identityPollTimerRef.current = null;
+            }
+            return;
+          }
           const drafts = draftData?.drafts || [];
           setDraftScans(drafts);
           const pending = drafts.filter((draft) => draft.status === 'PENDING').length;
@@ -1590,6 +1737,7 @@ const TeacherSessionManagement: React.FC = () => {
 
   const handleUploadMissing = async (submissionId: number, files: FileList | null) => {
     if (!files || files.length === 0) return;
+    setUploadingMissingId(submissionId);
     try {
       const formData = new FormData();
       Array.from(files).forEach((file) => formData.append('files', file));
@@ -1597,7 +1745,7 @@ const TeacherSessionManagement: React.FC = () => {
         headers: { 'Content-Type': 'multipart/form-data' },
       });
       toast.success(`Uploaded ${data.pagesUploaded} page(s) for ${data.studentName}`);
-      if (selectedSessionId) fetchSessionDetails(selectedSessionId);
+      if (selectedSessionId) await fetchSessionDetails(selectedSessionId);
       fetchIssuesReport();
     } catch (err: any) {
       const invalidScans = Array.isArray(err?.response?.data?.invalidScans)
@@ -1606,6 +1754,8 @@ const TeacherSessionManagement: React.FC = () => {
       toast.error(invalidScans.length > 0
         ? formatInvalidScanToast(invalidScans)
         : err?.response?.data?.error || 'Failed to upload missing pages');
+    } finally {
+      setUploadingMissingId(null);
     }
   };
 
@@ -1654,12 +1804,14 @@ const TeacherSessionManagement: React.FC = () => {
 
     try {
       const { data } = await api.post(`/exams/sessions/${selectedSessionId}/mobile-scan-link`);
-      const normalizedLink = normalizeMobileScanUrl(String(data?.scanUrl || '').trim());
+      const fallbackDefaultUrl = `${window.location.origin}/mobile-scan`;
+      const normalizedLink = normalizeMobileScanUrl(String(data?.defaultScanUrl || fallbackDefaultUrl).trim());
 
       setMobileScanLink(normalizedLink);
-      toast.success('Mobile scan link created');
+      setMobileScanOtp(String(data?.otpCode || '').trim());
+      toast.success('Mobile scan code created');
     } catch (err: any) {
-      toast.error(err?.response?.data?.error || 'Failed to create mobile scan link');
+      toast.error(err?.response?.data?.error || 'Failed to create mobile scan code');
     }
   };
 
@@ -1675,6 +1827,7 @@ const TeacherSessionManagement: React.FC = () => {
       }
 
       setMobileScanLink('');
+      setMobileScanOtp('');
       toast.success('Đang mở giao diện quét bài trên điện thoại');
       try {
         const parsed = new URL(normalizedLink, window.location.href);
@@ -1782,6 +1935,9 @@ const TeacherSessionManagement: React.FC = () => {
 
   useEffect(() => {
     if (selectedSessionId) {
+      // Scope the roster/exam fetch cache to the current session so switching sessions reloads them.
+      loadedClassIdRef.current = null;
+      loadedExamIdRef.current = null;
       setMobileScanLink('');
       fetchSessionDetails(selectedSessionId);
       const activeGradingSessionId = Number(localStorage.getItem('activeGradingSessionId') || 0);
@@ -1822,7 +1978,9 @@ const TeacherSessionManagement: React.FC = () => {
   }, [scanMode, cameraOpen, activeSubmissionId]);
 
   useEffect(() => {
+    isMountedRef.current = true;
     return () => {
+      isMountedRef.current = false;
       stopGradingPolling();
       if (identityPollTimerRef.current) {
         window.clearInterval(identityPollTimerRef.current);
@@ -1872,6 +2030,9 @@ const TeacherSessionManagement: React.FC = () => {
       setTransferLoading(false);
     }
   };
+
+  const readyDraftCount = useMemo(() => getNewValidDrafts().length, [submissions, draftScans]);
+  const canStartDraftGrading = Boolean(selectedSessionId) && readyDraftCount > 0 && !gradingInProgress;
 
   return (
     <Layout>
@@ -1938,7 +2099,7 @@ const TeacherSessionManagement: React.FC = () => {
               <h2 className="font-semibold text-gray-900">Bulk Upload and OMR-Based Grading</h2>
               <div className="flex gap-2 flex-wrap">
                 <button className="btn-secondary text-xs" onClick={generateMobileScanLink} disabled={!selectedSessionId}>
-                  Create Mobile Link
+                  Create Mobile Code
                 </button>
                 <button
                   className="btn-secondary text-xs"
@@ -1948,10 +2109,10 @@ const TeacherSessionManagement: React.FC = () => {
                   Start Scan
                 </button>
                 <button 
-                  className={`btn-secondary text-xs ${(gradingInProgress || !issuesReport || issuesReport.readyForGrading !== issuesReport.totalStudents || draftScans.some((d) => d.status === 'PENDING')) ? 'opacity-50 cursor-not-allowed' : 'bg-primary-600 text-white hover:bg-primary-700'}`} 
+                  className={`btn-secondary text-xs ${!canStartDraftGrading ? 'opacity-50 cursor-not-allowed' : 'bg-primary-600 text-white hover:bg-primary-700'}`}
                   onClick={completeScanningAndAutoGrade} 
-                  disabled={gradingInProgress || !selectedSessionId || !issuesReport || issuesReport.readyForGrading !== issuesReport.totalStudents || draftScans.some((d) => d.status === 'PENDING')}
-                  title="Only available when all students have their exams correctly mapped and identified."
+                  disabled={!canStartDraftGrading}
+                  title="Grades the currently valid mapped draft scans. You can run grading again after adding more scans."
                 >
                   {gradingInProgress ? (
                     <span className="inline-flex items-center gap-1">
@@ -1969,7 +2130,7 @@ const TeacherSessionManagement: React.FC = () => {
               </div>
             </div>
             <p className="text-xs text-gray-600">
-              Upload Full Set requires exactly {getTotalPasses()} image(s) per student. Page 1 is validated with OMR for identity and quality first; unreadable or ambiguous pages must be re-uploaded or assigned manually before grading starts. Gemini is used only for essay scoring after all sets are valid.
+              Upload Full Set requires exactly {getTotalPasses()} image(s) per student. Start Grading will grade the {readyDraftCount} valid mapped draft set(s) currently available; you can upload more students later or scan a student again to create the next attempt.
             </p>
 
             {(gradingInProgress || gradingProgress) && (
@@ -2240,13 +2401,19 @@ const TeacherSessionManagement: React.FC = () => {
                           <span className="text-gray-500 ml-2">{issue.description}</span>
                         </div>
                         <div className="flex gap-1">
-                          <label className="btn-secondary text-[10px] cursor-pointer">
-                            <Upload size={12} className="inline mr-0.5" />Re-upload
+                          <label className={`btn-secondary text-[10px] cursor-pointer ${uploadingMissingId === issue.submissionId ? 'opacity-60 pointer-events-none' : ''}`}>
+                            {uploadingMissingId === issue.submissionId ? (
+                              <Loader2 size={12} className="inline mr-0.5 animate-spin" />
+                            ) : (
+                              <Upload size={12} className="inline mr-0.5" />
+                            )}
+                            {uploadingMissingId === issue.submissionId ? 'Uploading…' : 'Re-upload'}
                             <input
                               type="file"
                               multiple
                               accept="image/*"
                               className="hidden"
+                              disabled={uploadingMissingId === issue.submissionId}
                               onChange={(e) => {
                                 void handleUploadMissing(issue.submissionId, e.target.files);
                                 e.currentTarget.value = '';
@@ -2269,27 +2436,46 @@ const TeacherSessionManagement: React.FC = () => {
               </div>
             )}
 
-            {mobileScanLink && (
+            {(mobileScanLink || mobileScanOtp) && (
               <div className="border border-primary-200 bg-primary-50 rounded-lg p-3 space-y-2">
-                <p className="text-xs text-primary-800 font-medium">Mobile scan link</p>
-                <a href={mobileScanLink} target="_blank" rel="noreferrer" className="text-xs text-primary-700 break-all underline">
-                  {mobileScanLink}
-                </a>
+                <p className="text-xs text-primary-800 font-medium">Mobile scan code</p>
+                {mobileScanOtp && (
+                  <p className="text-2xl font-bold tracking-widest text-primary-900">{mobileScanOtp}</p>
+                )}
+                {mobileScanLink && (
+                  <a href={mobileScanLink} target="_blank" rel="noreferrer" className="text-xs text-primary-700 break-all underline">
+                    {mobileScanLink}
+                  </a>
+                )}
                 {/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])/i.test(mobileScanLink) && (
                   <p className="text-xs text-amber-700">
-                    This link is localhost-only. Open frontend by your LAN IP/HTTPS to share with phone camera.
+                    This URL is localhost-only. Open frontend by your LAN IP/HTTPS to share with phone camera.
                   </p>
                 )}
+                <p className="text-xs text-gray-600">
+                  On the phone, open the fixed scanner URL and enter this code. The code expires after a short time.
+                </p>
                 <div className="flex gap-2">
-                  <button className="btn-secondary text-xs" onClick={copyMobileScanLink}>Copy Link</button>
-                  <a href={mobileScanLink} target="_blank" rel="noreferrer" className="btn-secondary text-xs">Open Link</a>
+                  <button className="btn-secondary text-xs" onClick={copyMobileScanLink} disabled={!mobileScanLink}>Copy URL</button>
+                  {mobileScanOtp && (
+                    <button
+                      className="btn-secondary text-xs"
+                      onClick={() => {
+                        void navigator.clipboard?.writeText(mobileScanOtp);
+                        toast.success('Code copied');
+                      }}
+                    >
+                      Copy Code
+                    </button>
+                  )}
+                  {mobileScanLink && <a href={mobileScanLink} target="_blank" rel="noreferrer" className="btn-secondary text-xs">Open Scanner</a>}
                 </div>
               </div>
             )}
 
             {scanMode && (
               <div className="border border-gray-200 rounded-lg p-3 space-y-3">
-                <p className="text-xs text-primary-700">When indicator turns green, press Capture to upload this scan for the selected student.</p>
+                <p className="text-xs text-primary-700">Wait for green on page 1 for OMR; essay pages can be captured with a looser quality hint.</p>
                 <div className="grid lg:grid-cols-3 gap-3">
                   <div className="lg:col-span-2">
                     <div className={`rounded-xl border-2 overflow-hidden ${captureReady ? 'border-green-500' : 'border-red-400'}`}>
@@ -2305,7 +2491,7 @@ const TeacherSessionManagement: React.FC = () => {
                           {cameraOpen ? <CameraOff size={14} className="inline mr-1" /> : <Camera size={14} className="inline mr-1" />}
                           {cameraOpen ? 'Stop Camera' : 'Start Camera'}
                         </button>
-                        <button className="btn-primary text-xs" onClick={captureForActiveSubmission} disabled={!cameraOpen || !captureReady || capturing}>
+                        <button className="btn-primary text-xs" onClick={captureForActiveSubmission} disabled={!cameraOpen || (activePassIndex === 1 && !captureReady) || capturing}>
                           {capturing ? 'Capturing...' : 'Capture'}
                         </button>
                       </div>
@@ -2389,8 +2575,9 @@ const TeacherSessionManagement: React.FC = () => {
               <p className="text-sm text-gray-500">No submissions for this session.</p>
             ) : (
               submissions.map((item) => {
-                const scans = resolveScanEntries(item) || [];
-                const feedback = parseSubmissionFeedback(item);
+                const parsed = parsedSubmissions.get(item.id);
+                const scans = parsed?.scans || [];
+                const feedback = parsed?.feedback || parseSubmissionFeedback(item);
                 const mergedPdfUrl = feedback.mergedPdfUrl || scans.find((scan) => !!scan.mergedPdfUrl)?.mergedPdfUrl || null;
 
                 return (
@@ -2420,9 +2607,14 @@ const TeacherSessionManagement: React.FC = () => {
                         <button
                           className="btn-secondary text-xs"
                           onClick={() => gradeAI(item.id)}
-                          disabled={scans.length === 0}
+                          disabled={scans.length === 0 || gradingSubmissionId === item.id}
                         >
-                          <RefreshCw size={14} className="inline mr-1" />AI Grade
+                          {gradingSubmissionId === item.id ? (
+                            <Loader2 size={14} className="inline mr-1 animate-spin" />
+                          ) : (
+                            <RefreshCw size={14} className="inline mr-1" />
+                          )}
+                          {gradingSubmissionId === item.id ? 'Grading…' : 'AI Grade'}
                         </button>
                         <button
                           className="btn-secondary text-xs text-red-700 border-red-200 hover:bg-red-50"
@@ -2529,14 +2721,17 @@ const TeacherSessionManagement: React.FC = () => {
               {(Array.isArray(report?.submissions) ? report.submissions : submissions).length === 0 ? (
                 <p className="text-sm text-gray-500">No submissions available.</p>
               ) : (
-                (Array.isArray(report?.submissions) ? report.submissions : submissions).map((item: ExamSubmission) => {
-                  const scans = resolveScanEntries(item) || [];
-                  const feedback = parseSubmissionFeedback(item);
+                reportSubmissions.map((item: ExamSubmission) => {
+                  const parsed = parsedReportSubmissions.get(item.id);
+                  const scans = parsed?.scans || [];
+                  const feedback = parsed?.feedback || parseSubmissionFeedback(item);
                   const mergedPdfUrl = feedback.mergedPdfUrl || scans.find((scan) => !!scan.mergedPdfUrl)?.mergedPdfUrl || null;
                   const isExpanded = expandedSubmissionId === item.id;
                   const isInlineEditing = inlineEditScore?.submissionId === item.id;
                   const detectedCount = item.objectiveDetectedCount ?? feedback.objectiveDetectedCount ?? Object.keys(feedback.objectiveAnswers).filter((key) => !!feedback.objectiveAnswers[key]).length;
                   const correctCount = item.objectiveCorrectCount ?? feedback.objectiveCorrectCount;
+                  const attempts = Array.isArray(item.attempts) ? item.attempts : [];
+                  const currentAttemptNumber = feedback.attemptNumber ?? (attempts.length > 0 ? attempts[attempts.length - 1].attemptNumber : null);
                   return (
                     <div key={item.id} className="border border-gray-200 rounded-lg p-3 space-y-2">
                       <div className="flex items-center justify-between gap-2 flex-wrap">
@@ -2549,6 +2744,7 @@ const TeacherSessionManagement: React.FC = () => {
                             <span>Total: <span className="font-medium text-gray-900">{feedback.totalScore ?? item.finalScore ?? '-'}</span></span>
                             <span>OMR detected: <span className="font-medium text-blue-700">{detectedCount ?? '-'}</span></span>
                             <span>Correct MCQ: <span className="font-medium text-emerald-700">{correctCount ?? '-'}</span></span>
+                            <span>Attempt: <span className="font-medium text-gray-700">{currentAttemptNumber ?? '-'}</span></span>
                             <span>Scans: {scans?.length ?? 0}</span>
                           </div>
                         </div>
@@ -2659,6 +2855,58 @@ const TeacherSessionManagement: React.FC = () => {
                                   </a>
                                 );
                               })}
+                            </div>
+                          )}
+
+                          {attempts.length > 0 && (
+                            <div className="rounded-md border border-gray-100 bg-gray-50 p-2 space-y-2">
+                              <p className="text-xs font-medium text-gray-900">Attempt history</p>
+                              <div className="space-y-2">
+                                {attempts.map((attempt) => {
+                                  const attemptScans = Array.isArray(attempt.scanEntries)
+                                    ? attempt.scanEntries.map(normalizeScanEntry)
+                                    : parseScanEntriesFromRaw(attempt.scanFiles);
+                                  const attemptScore = attempt.totalScore ?? attempt.finalScore ?? '-';
+                                  return (
+                                    <div key={attempt.id} className="rounded border border-gray-200 bg-white p-2 space-y-1">
+                                      <div className="flex items-center justify-between gap-2 text-xs">
+                                        <span className="font-medium text-gray-900">Bài làm lần {attempt.attemptNumber}</span>
+                                        <span className="text-gray-600">
+                                          MCQ {attempt.objectiveScore ?? '-'} • Essay {attempt.essayScore ?? '-'} • Total {attemptScore}
+                                        </span>
+                                      </div>
+                                      <p className="text-[11px] text-gray-500">
+                                        {attempt.gradedAt ? new Date(attempt.gradedAt).toLocaleString() : new Date(attempt.createdAt).toLocaleString()}
+                                      </p>
+                                      {attempt.mergedPdfUrl && (
+                                        <a href={attempt.mergedPdfUrl} target="_blank" rel="noreferrer" className="text-[11px] text-primary-700 underline">
+                                          Open PDF for attempt {attempt.attemptNumber}
+                                        </a>
+                                      )}
+                                      {attemptScans.length > 0 && (
+                                        <div className="flex gap-1 overflow-x-auto">
+                                          {attemptScans.map((scan, scanIdx) => {
+                                            const href = scan.accessUrl || scan.url || (scan.filename ? `/uploads/scans/${encodeURIComponent(scan.filename)}` : '');
+                                            if (!href) return null;
+                                            return (
+                                              <a
+                                                key={`${attempt.id}-${scanIdx}`}
+                                                href={href}
+                                                target="_blank"
+                                                rel="noreferrer"
+                                                className="shrink-0"
+                                                title={`Attempt ${attempt.attemptNumber} scan ${scanIdx + 1}`}
+                                              >
+                                                <img src={href} alt={`attempt-${attempt.attemptNumber}-scan-${scanIdx + 1}`} className="h-16 w-12 rounded border border-gray-200 object-cover" loading="lazy" />
+                                              </a>
+                                            );
+                                          })}
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
                             </div>
                           )}
 

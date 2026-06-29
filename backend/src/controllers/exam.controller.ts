@@ -1,5 +1,5 @@
 import { Request, Response } from 'express';
-import type { PrismaClient } from '@prisma/client';
+import { Prisma, type PrismaClient } from '@prisma/client';
 import { AuthRequest } from '../middleware/auth';
 import { prisma } from '../lib/prisma';
 import {
@@ -281,6 +281,13 @@ type MobileScanTokenPayload = {
   exp?: number;
 };
 
+type MobileScanOtpEntry = {
+  code: string;
+  teacherId: number;
+  sessionId: number;
+  expiresAt: number;
+};
+
 type HttpError = Error & { statusCode?: number; payload?: unknown };
 
 const createHttpError = (statusCode: number, message: string, payload?: unknown): HttpError => {
@@ -295,6 +302,8 @@ const createHttpError = (statusCode: number, message: string, payload?: unknown)
 const TEACHER_BUSY_MESSAGE = 'Hệ thống đang quá tải, vui lòng đợi 1 phút và thử lại.';
 const TEACHER_IDENTITY_MESSAGE = 'Không nhận diện được tên hoặc MSSV, vui lòng kiểm tra lại ảnh trang đầu.';
 const TEACHER_QUALITY_MESSAGE = 'Ảnh bài làm bị mờ hoặc thiếu góc, vui lòng chụp lại rõ nét hơn.';
+const MOBILE_SCAN_OTP_TTL_MS = 10 * 60 * 1000;
+const mobileScanOtpEntries = new Map<string, MobileScanOtpEntry>();
 
 // Minimum OMR confidence for a live probe frame to count as a confident identity read.
 // Aligned anchors (4/4) and a unique MSSV match are the stronger signals; this guards
@@ -429,6 +438,113 @@ const parseAccessibleScanEntries = (raw: string): ScanEntryWithAccessUrl[] => {
   return parseScanEntries(raw).map(toAccessibleScanEntry);
 };
 
+const parseJsonObject = (raw: string | null | undefined): Record<string, unknown> => {
+  try {
+    const parsed = JSON.parse(raw || '{}') as unknown;
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+};
+
+const getFeedbackDraftId = (rawFeedback: string | null | undefined): number | null => {
+  const parsed = parseJsonObject(rawFeedback);
+  const draftId = Number(parsed.draftId);
+  return Number.isFinite(draftId) && draftId > 0 ? draftId : null;
+};
+
+const hasSubmissionSnapshotContent = (submission: {
+  scanFiles: string;
+  objectiveAnswers: string;
+  essayAnswers: string;
+  feedback: string | null;
+  aiScore: number | null;
+  finalScore: number | null;
+  gradedAt: Date | null;
+}): boolean => {
+  return parseScanEntries(submission.scanFiles || '[]').length > 0
+    || Object.keys(parseJsonObject(submission.objectiveAnswers)).length > 0
+    || Object.keys(parseJsonObject(submission.essayAnswers)).length > 0
+    || !!submission.feedback
+    || submission.aiScore !== null
+    || submission.finalScore !== null
+    || submission.gradedAt !== null;
+};
+
+const createSubmissionAttemptSnapshot = async (
+  tx: Prisma.TransactionClient,
+  params: {
+    submissionId: number;
+    attemptNumber: number;
+    sourceDraftId?: number | null;
+    scanFiles: string;
+    objectiveAnswers: string;
+    essayAnswers: string;
+    status: string;
+    aiScore?: number | null;
+    finalScore?: number | null;
+    feedback?: string | null;
+    gradedAt?: Date | null;
+  }
+) => {
+  return tx.examSubmissionAttempt.create({
+    data: {
+      submissionId: params.submissionId,
+      attemptNumber: params.attemptNumber,
+      sourceDraftId: params.sourceDraftId ?? null,
+      scanFiles: params.scanFiles || '[]',
+      objectiveAnswers: params.objectiveAnswers || '{}',
+      essayAnswers: params.essayAnswers || '{}',
+      status: params.status || 'GRADED',
+      aiScore: params.aiScore ?? null,
+      finalScore: params.finalScore ?? null,
+      feedback: params.feedback ?? null,
+      gradedAt: params.gradedAt ?? null,
+    },
+  });
+};
+
+const ensureCurrentSubmissionArchivedAsAttempt = async (
+  tx: Prisma.TransactionClient,
+  submission: {
+    id: number;
+    scanFiles: string;
+    objectiveAnswers: string;
+    essayAnswers: string;
+    status: string;
+    aiScore: number | null;
+    finalScore: number | null;
+    feedback: string | null;
+    gradedAt: Date | null;
+  }
+): Promise<number> => {
+  const existingAttemptCount = await tx.examSubmissionAttempt.count({
+    where: { submissionId: submission.id },
+  });
+
+  if (existingAttemptCount > 0 || !hasSubmissionSnapshotContent(submission)) {
+    return existingAttemptCount;
+  }
+
+  await createSubmissionAttemptSnapshot(tx, {
+    submissionId: submission.id,
+    attemptNumber: 1,
+    sourceDraftId: getFeedbackDraftId(submission.feedback),
+    scanFiles: submission.scanFiles,
+    objectiveAnswers: submission.objectiveAnswers,
+    essayAnswers: submission.essayAnswers,
+    status: submission.status,
+    aiScore: submission.aiScore,
+    finalScore: submission.finalScore,
+    feedback: submission.feedback,
+    gradedAt: submission.gradedAt,
+  });
+
+  return 1;
+};
+
 type ScanQualityMetrics = {
   width: number;
   height: number;
@@ -436,6 +552,8 @@ type ScanQualityMetrics = {
   contrast: number;
   edgeDensity: number;
 };
+
+type ScanQualityProfile = 'identity' | 'essay';
 
 type InvalidScanDetail = {
   fileName: string;
@@ -450,7 +568,59 @@ type InvalidScanDetail = {
   metrics: ScanQualityMetrics;
 };
 
-const analyzeScanQuality = async (filePath: string): Promise<{ valid: boolean; reasons: string[]; metrics: ScanQualityMetrics }> => {
+type ScanQualityThresholds = {
+  minWidth: number;
+  minHeight: number;
+  minBrightness: number;
+  maxBrightness: number;
+  minContrast: number;
+  minEdgeDensity: number;
+};
+
+const SCAN_QUALITY_THRESHOLDS: Record<ScanQualityProfile, ScanQualityThresholds> = {
+  identity: {
+    minWidth: 700,
+    minHeight: 1000,
+    minBrightness: 25,
+    maxBrightness: 235,
+    minContrast: 18,
+    minEdgeDensity: 6.5,
+  },
+  essay: {
+    minWidth: 480,
+    minHeight: 680,
+    minBrightness: 12,
+    maxBrightness: 248,
+    minContrast: 7,
+    minEdgeDensity: 2,
+  },
+};
+
+type CollectInvalidScanOptions = {
+  basePassIndex?: number;
+  pagesPerPaper?: number;
+};
+
+const normalizeCollectInvalidScanOptions = (
+  basePassIndexOrOptions?: number | CollectInvalidScanOptions
+): CollectInvalidScanOptions => {
+  if (typeof basePassIndexOrOptions === 'number') {
+    return { basePassIndex: basePassIndexOrOptions };
+  }
+  return basePassIndexOrOptions || {};
+};
+
+const resolveQualityPageIndex = (absolutePassIndex: number, pagesPerPaper?: number): number => {
+  if (Number.isFinite(Number(pagesPerPaper)) && Number(pagesPerPaper) > 0) {
+    return ((Math.max(1, absolutePassIndex) - 1) % Number(pagesPerPaper)) + 1;
+  }
+  return absolutePassIndex;
+};
+
+const analyzeScanQuality = async (
+  filePath: string,
+  profile: ScanQualityProfile = 'identity'
+): Promise<{ valid: boolean; reasons: string[]; metrics: ScanQualityMetrics }> => {
   const metadata = await sharp(filePath).metadata();
   const width = Number(metadata.width || 0);
   const height = Number(metadata.height || 0);
@@ -496,21 +666,21 @@ const analyzeScanQuality = async (filePath: string): Promise<{ valid: boolean; r
   const edgeDensity = count > 0 ? edgeTotal / count : 0;
 
   const reasons: string[] = [];
+  const thresholds = SCAN_QUALITY_THRESHOLDS[profile];
 
-  // Keep thresholds permissive to reduce false negatives while still blocking unreadable scans.
-  if (width > 0 && height > 0 && (width < 700 || height < 1000)) {
-    reasons.push('resolution too low (minimum 700x1000)');
+  if (width > 0 && height > 0 && (width < thresholds.minWidth || height < thresholds.minHeight)) {
+    reasons.push(`resolution too low (minimum ${thresholds.minWidth}x${thresholds.minHeight})`);
   }
-  if (brightness < 25) {
+  if (brightness < thresholds.minBrightness) {
     reasons.push('image too dark');
   }
-  if (brightness > 235) {
+  if (brightness > thresholds.maxBrightness) {
     reasons.push('image too bright / glare');
   }
-  if (contrast < 18) {
+  if (contrast < thresholds.minContrast) {
     reasons.push('low contrast, text may be faint');
   }
-  if (edgeDensity < 6.5) {
+  if (edgeDensity < thresholds.minEdgeDensity) {
     reasons.push('image appears blurred');
   }
 
@@ -527,17 +697,26 @@ const analyzeScanQuality = async (filePath: string): Promise<{ valid: boolean; r
   };
 };
 
-const collectInvalidScans = async (files: Express.Multer.File[], basePassIndex?: number): Promise<InvalidScanDetail[]> => {
+const collectInvalidScans = async (
+  files: Express.Multer.File[],
+  basePassIndexOrOptions?: number | CollectInvalidScanOptions
+): Promise<InvalidScanDetail[]> => {
+  const options = normalizeCollectInvalidScanOptions(basePassIndexOrOptions);
+  const basePassIndex = Number.isFinite(Number(options.basePassIndex)) ? Number(options.basePassIndex) : 1;
   const invalid: InvalidScanDetail[] = [];
 
   for (let idx = 0; idx < files.length; idx += 1) {
     const file = files[idx];
+    const passIndex = basePassIndex + idx;
+    const pageIndex = resolveQualityPageIndex(passIndex, options.pagesPerPaper);
+    const profile: ScanQualityProfile = pageIndex === 1 ? 'identity' : 'essay';
     try {
-      const result = await analyzeScanQuality(file.path);
+      const result = await analyzeScanQuality(file.path, profile);
       if (!result.valid) {
         invalid.push({
           fileName: file.originalname || file.filename,
-          passIndex: Number.isFinite(Number(basePassIndex)) ? Number(basePassIndex) + idx : idx + 1,
+          passIndex,
+          pageIndex,
           reasons: result.reasons,
           metrics: result.metrics,
         });
@@ -545,7 +724,8 @@ const collectInvalidScans = async (files: Express.Multer.File[], basePassIndex?:
     } catch {
       invalid.push({
         fileName: file.originalname || file.filename,
-        passIndex: Number.isFinite(Number(basePassIndex)) ? Number(basePassIndex) + idx : idx + 1,
+        passIndex,
+        pageIndex,
         reasons: ['failed to analyze image quality'],
         metrics: {
           width: 0,
@@ -621,6 +801,35 @@ const signMobileScanToken = (teacherId: number, sessionId: number): string => {
     config.jwtSecret,
     { expiresIn: '8h' }
   );
+};
+
+const purgeExpiredMobileScanOtps = (): void => {
+  const now = Date.now();
+  for (const [code, entry] of mobileScanOtpEntries.entries()) {
+    if (entry.expiresAt <= now) {
+      mobileScanOtpEntries.delete(code);
+    }
+  }
+};
+
+const createMobileScanOtp = (teacherId: number, sessionId: number): MobileScanOtpEntry => {
+  purgeExpiredMobileScanOtps();
+
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const code = String(Math.floor(100000 + Math.random() * 900000));
+    if (mobileScanOtpEntries.has(code)) continue;
+
+    const entry = {
+      code,
+      teacherId,
+      sessionId,
+      expiresAt: Date.now() + MOBILE_SCAN_OTP_TTL_MS,
+    };
+    mobileScanOtpEntries.set(code, entry);
+    return entry;
+  }
+
+  throw createHttpError(503, 'Unable to generate a mobile scan code. Please try again.');
 };
 
 const verifyMobileScanToken = (token: string): MobileScanTokenPayload => {
@@ -1268,6 +1477,7 @@ const extractSubmissionReportDetails = (submission: { feedback?: string | null; 
     objectiveCorrectCount?: unknown;
     totalDetectedQuestions?: unknown;
     totalCorrectAnswers?: unknown;
+    attemptNumber?: unknown;
     aiComments?: unknown;
     mergedPdfUrl?: unknown;
     warnings?: unknown;
@@ -1296,9 +1506,45 @@ const extractSubmissionReportDetails = (submission: { feedback?: string | null; 
     totalScore: toNumberOrNull(parsed.totalScore),
     objectiveDetectedCount: toNumberOrNull(parsed.objectiveDetectedCount ?? parsed.totalDetectedQuestions),
     objectiveCorrectCount: toNumberOrNull(parsed.objectiveCorrectCount ?? parsed.totalCorrectAnswers),
+    attemptNumber: toNumberOrNull(parsed.attemptNumber),
     aiComments: parsed.aiComments ? String(parsed.aiComments) : null,
     mergedPdfUrl: parsed.mergedPdfUrl ? String(parsed.mergedPdfUrl) : fallbackMergedPdfUrl,
     warnings,
+  };
+};
+
+const serializeSubmissionAttempt = (attempt: {
+  id: number;
+  submissionId: number;
+  attemptNumber: number;
+  sourceDraftId: number | null;
+  scanFiles: string;
+  objectiveAnswers: string;
+  essayAnswers: string;
+  status: string;
+  aiScore: number | null;
+  finalScore: number | null;
+  feedback: string | null;
+  gradedAt: Date | null;
+  createdAt: Date;
+}) => {
+  const scanEntries = parseScanEntries(attempt.scanFiles || '[]');
+  const details = extractSubmissionReportDetails({
+    feedback: attempt.feedback,
+    scanFiles: attempt.scanFiles,
+  });
+
+  return {
+    ...attempt,
+    scanEntries: scanEntries.map(toAccessibleScanEntry),
+    scanCount: scanEntries.length,
+    mergedPdfUrl: details.mergedPdfUrl,
+    objectiveScore: details.objectiveScore,
+    essayScore: details.essayScore,
+    totalScore: details.totalScore ?? attempt.finalScore,
+    objectiveDetectedCount: details.objectiveDetectedCount,
+    objectiveCorrectCount: details.objectiveCorrectCount,
+    warnings: details.warnings,
   };
 };
 
@@ -2644,24 +2890,26 @@ export const reorderExamQuestions = async (req: AuthRequest, res: Response): Pro
 
     const offset = exam.questions.length;
 
+    // Renumber in two bulk statements instead of 2N row updates. The offset phase
+    // pushes every position above the 1..N target range so the unique
+    // (examId, position) constraint can't trip mid-renumber, then a single CASE
+    // statement assigns the final positions. Short lock window + few round-trips.
     await prisma.$transaction(async (tx) => {
-      await Promise.all(
-        exam.questions.map((item) =>
-          tx.examQuestion.update({
-            where: { examId_questionId: { examId, questionId: item.questionId } },
-            data: { position: item.position + offset },
-          })
-        )
-      );
+      await tx.$executeRaw`
+        UPDATE "ExamQuestion"
+        SET "position" = "position" + ${offset}
+        WHERE "examId" = ${examId}
+      `;
 
-      await Promise.all(
-        orderedQuestionIds.map((questionId, index) =>
-          tx.examQuestion.update({
-            where: { examId_questionId: { examId, questionId } },
-            data: { position: index + 1 },
-          })
-        )
+      const positionCases = orderedQuestionIds.map(
+        (questionId, index) => Prisma.sql`WHEN ${questionId} THEN ${index + 1}::int`
       );
+      await tx.$executeRaw`
+        UPDATE "ExamQuestion"
+        SET "position" = CASE "questionId" ${Prisma.join(positionCases, ' ')} END
+        WHERE "examId" = ${examId}
+          AND "questionId" IN (${Prisma.join(orderedQuestionIds)})
+      `;
     });
 
     const updated = await prisma.exam.findUnique({
@@ -2976,14 +3224,65 @@ export const createSessionMobileScanLink = async (req: AuthRequest, res: Respons
     }
 
     const token = signMobileScanToken(req.user!.id, sessionId);
+    const otp = createMobileScanOtp(req.user!.id, sessionId);
     const encodedToken = encodeURIComponent(token);
     const origin = typeof req.headers.origin === 'string' ? req.headers.origin.trim() : '';
     const frontendBaseUrl = origin && /^https?:\/\//i.test(origin) ? origin.replace(/\/+$/, '') : config.frontendUrl;
     const scanUrl = `${frontendBaseUrl}/mobile-scan?token=${encodedToken}`;
+    const defaultScanUrl = `${frontendBaseUrl}/mobile-scan`;
 
     res.json({
       token,
+      otpCode: otp.code,
       scanUrl,
+      defaultScanUrl,
+      session: {
+        id: session.id,
+        examTitle: session.exam.title,
+        className: session.class.name,
+      },
+      expiresIn: '8h',
+      otpExpiresInSeconds: Math.floor(MOBILE_SCAN_OTP_TTL_MS / 1000),
+    });
+  } catch (error) {
+    console.error('Create mobile scan link error:', error);
+    res.status(500).json({ error: 'Failed to create mobile scan link' });
+  }
+};
+
+export const resolveMobileScanOtp = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const code = String(req.body?.code || '').replace(/\D/g, '');
+    if (!code) {
+      res.status(400).json({ error: 'code is required' });
+      return;
+    }
+
+    purgeExpiredMobileScanOtps();
+    const entry = mobileScanOtpEntries.get(code);
+    if (!entry) {
+      res.status(404).json({ error: 'Mobile scan code is invalid or expired' });
+      return;
+    }
+
+    const session = await prisma.examSession.findUnique({
+      where: { id: entry.sessionId },
+      include: {
+        exam: { select: { id: true, title: true, teacherId: true } },
+        class: { select: { id: true, name: true } },
+      },
+    });
+
+    if (!session || session.exam.teacherId !== entry.teacherId) {
+      mobileScanOtpEntries.delete(code);
+      res.status(404).json({ error: 'Session not found' });
+      return;
+    }
+
+    const token = signMobileScanToken(entry.teacherId, entry.sessionId);
+    mobileScanOtpEntries.delete(code);
+    res.json({
+      token,
       session: {
         id: session.id,
         examTitle: session.exam.title,
@@ -2992,8 +3291,8 @@ export const createSessionMobileScanLink = async (req: AuthRequest, res: Respons
       expiresIn: '8h',
     });
   } catch (error) {
-    console.error('Create mobile scan link error:', error);
-    res.status(500).json({ error: 'Failed to create mobile scan link' });
+    console.error('Resolve mobile scan OTP error:', error);
+    res.status(500).json({ error: 'Failed to resolve mobile scan code' });
   }
 };
 
@@ -3296,7 +3595,7 @@ export const uploadMobileSubmissionScans = async (req: Request, res: Response): 
 
       const resolvedStudent = enrolledStudents.find((item) => item.student.id === studentId)?.student || null;
       const invalidScans = enrichInvalidScansForStudent(
-        await collectInvalidScans(files, 1),
+        await collectInvalidScans(files, { basePassIndex: 1, pagesPerPaper: expectedPages }),
         resolvedStudent
       );
       if (invalidScans.length > 0) {
@@ -3400,7 +3699,7 @@ export const uploadMobileSubmissionScans = async (req: Request, res: Response): 
     }
 
     const invalidScans = enrichInvalidScansForStudent(
-      await collectInvalidScans(files, normalizedPassIndex),
+      await collectInvalidScans(files, { basePassIndex: normalizedPassIndex, pagesPerPaper: expectedPages }),
       resolvedStudent
     );
     if (invalidScans.length > 0) {
@@ -3879,7 +4178,10 @@ export const uploadSubmissionScans = async (req: AuthRequest, res: Response): Pr
     });
 
     const invalidScans = enrichInvalidScansForStudent(
-      await collectInvalidScans(files, isCaptureMode ? Number(passIndex) : 1),
+      await collectInvalidScans(
+        files,
+        { basePassIndex: isCaptureMode ? Number(passIndex) : 1, pagesPerPaper: expectedPages }
+      ),
       resolvedStudent
     );
     if (invalidScans.length > 0) {
@@ -4025,6 +4327,7 @@ export const getSessionSubmissions = async (req: AuthRequest, res: Response): Pr
       include: {
         student: { select: { id: true, username: true, fullName: true } },
         grades: { orderBy: { createdAt: 'desc' }, take: 1 },
+        attempts: { orderBy: { attemptNumber: 'asc' } },
       },
       orderBy: { student: { fullName: 'asc' } },
     });
@@ -4039,6 +4342,7 @@ export const getSessionSubmissions = async (req: AuthRequest, res: Response): Pr
 
         return {
           ...submission,
+          attempts: submission.attempts.map(serializeSubmissionAttempt),
           scanEntries: parsedScans.map(toAccessibleScanEntry),
           scanCount: parsedScans.length,
           mergedPdfUrl: details.mergedPdfUrl,
@@ -4560,6 +4864,7 @@ export const getSessionReport = async (req: AuthRequest, res: Response): Promise
       where: { sessionId },
       include: {
         student: { select: { id: true, username: true, fullName: true } },
+        attempts: { orderBy: { attemptNumber: 'asc' } },
       },
     });
     const reportCorrectObjectiveAnswers = buildCorrectObjectiveAnswers(session.exam.questions);
@@ -4575,6 +4880,7 @@ export const getSessionReport = async (req: AuthRequest, res: Response): Promise
         where: { id: submission.id },
         include: {
           student: { select: { id: true, username: true, fullName: true } },
+          attempts: { orderBy: { attemptNumber: 'asc' } },
         },
       });
       const resolvedSubmission = refreshedSubmission || submission;
@@ -4589,6 +4895,7 @@ export const getSessionReport = async (req: AuthRequest, res: Response): Promise
 
       return {
         ...resolvedSubmission,
+        attempts: resolvedSubmission.attempts.map(serializeSubmissionAttempt),
         scanEntries: parseAccessibleScanEntries(resolvedSubmission.scanFiles || '[]'),
         scanCount: parseScanEntries(resolvedSubmission.scanFiles || '[]').length,
         mergedPdfUrl: details.mergedPdfUrl,
@@ -6028,52 +6335,38 @@ const startDraftGradingBlocking = async (req: AuthRequest, res: Response): Promi
     const pagesPerStudent = resolveExpectedScannablePages(session.exam.scannablePages, passPlan, scanBlueprint);
     const existingSubmissions = await prisma.examSubmission.findMany({
       where: { sessionId },
-      select: { studentId: true, scanFiles: true, status: true },
+      select: { id: true, studentId: true, scanFiles: true, status: true, feedback: true },
     });
-    const studentsWithCompleteSubmissions = new Set(
-      existingSubmissions
-        .filter((submission) => {
-          const scanCount = parseScanEntries(submission.scanFiles || '[]').length;
-          return scanCount >= pagesPerStudent && ['GRADED', 'REVIEWED', 'FINALIZED'].includes(submission.status);
-        })
-        .map((submission) => submission.studentId)
+    const processedAttempts = await prisma.examSubmissionAttempt.findMany({
+      where: {
+        sourceDraftId: { not: null },
+        submission: { sessionId },
+      },
+      select: { sourceDraftId: true },
+    });
+    const processedDraftIds = new Set(
+      processedAttempts
+        .map((attempt) => Number(attempt.sourceDraftId))
+        .filter((draftId) => Number.isFinite(draftId) && draftId > 0)
     );
-    const targetDrafts = drafts.filter((draft) => {
-      if (!draft.studentId) return true;
-      return !studentsWithCompleteSubmissions.has(draft.studentId);
-    });
+    const currentSubmissionDraftIds = new Set(
+      existingSubmissions
+        .map((submission) => getFeedbackDraftId(submission.feedback))
+        .filter((draftId): draftId is number => Number.isFinite(Number(draftId)) && Number(draftId) > 0)
+    );
+    const targetDrafts = drafts.filter((draft) => (
+      draft.status === 'VALID'
+      && Number.isFinite(Number(draft.studentId))
+      && Number(draft.studentId) > 0
+      && !processedDraftIds.has(draft.id)
+      && !currentSubmissionDraftIds.has(draft.id)
+    ));
 
     if (targetDrafts.length === 0) {
       res.status(400).json({
-        error: 'No new draft scans need grading. Delete scans for a student first if you want to rescan and regrade them.',
+        error: 'No valid new draft scans need grading. Upload or validate at least one paper set before starting grading.',
         totalDrafts: drafts.length,
         skippedDrafts: drafts.length,
-      });
-      return;
-    }
-
-    const invalidDrafts = targetDrafts.filter((draft) => draft.status !== 'VALID');
-    if (invalidDrafts.length > 0) {
-      res.status(400).json({
-        error: 'All draft scans selected for grading must be VALID before grading starts',
-        invalidDrafts: invalidDrafts.map((draft) => ({
-          draftId: draft.id,
-          status: draft.status,
-          studentId: draft.studentId,
-        })),
-      });
-      return;
-    }
-
-    const duplicateStudentIds = targetDrafts
-      .map((draft) => draft.studentId)
-      .filter((studentId): studentId is number => Number.isFinite(Number(studentId)) && Number(studentId) > 0)
-      .filter((studentId, index, array) => array.indexOf(studentId) !== index);
-
-    if (duplicateStudentIds.length > 0) {
-      res.status(400).json({
-        error: 'Each staged draft selected for grading must resolve to a unique student',
-        duplicateStudentIds: [...new Set(duplicateStudentIds)],
       });
       return;
     }
@@ -6308,33 +6601,70 @@ const startDraftGradingBlocking = async (req: AuthRequest, res: Response): Promi
 
         const existingSubmission = await tx.examSubmission.findUnique({
           where: { sessionId_studentId: { sessionId, studentId: draft.studentId } },
-          select: { id: true, finalScore: true },
+          select: {
+            id: true,
+            scanFiles: true,
+            objectiveAnswers: true,
+            essayAnswers: true,
+            status: true,
+            aiScore: true,
+            finalScore: true,
+            feedback: true,
+            gradedAt: true,
+          },
         });
+        const archivedAttemptCount = existingSubmission
+          ? await ensureCurrentSubmissionArchivedAsAttempt(tx, existingSubmission)
+          : 0;
+        const attemptNumber = archivedAttemptCount + 1;
+        const feedbackWithAttempt = {
+          ...feedbackPayload,
+          attemptNumber,
+        };
+        const feedbackJson = JSON.stringify(feedbackWithAttempt);
+        const scanFilesJson = JSON.stringify(scanFiles);
+        const objectiveAnswersJson = JSON.stringify(objectiveAnswers);
+        const essayAnswersJson = JSON.stringify(essayAnswers);
+        const gradedAt = new Date();
 
         const submission = await tx.examSubmission.upsert({
           where: { sessionId_studentId: { sessionId, studentId: draft.studentId } },
           create: {
             sessionId,
             studentId: draft.studentId,
-            scanFiles: JSON.stringify(scanFiles),
-            objectiveAnswers: JSON.stringify(objectiveAnswers),
-            essayAnswers: JSON.stringify(essayAnswers),
+            scanFiles: scanFilesJson,
+            objectiveAnswers: objectiveAnswersJson,
+            essayAnswers: essayAnswersJson,
             status: 'GRADED',
             aiScore: totalScore,
             finalScore: totalScore,
-            feedback: JSON.stringify(feedbackPayload),
-            gradedAt: new Date(),
+            feedback: feedbackJson,
+            gradedAt,
           },
           update: {
-            scanFiles: JSON.stringify(scanFiles),
-            objectiveAnswers: JSON.stringify(objectiveAnswers),
-            essayAnswers: JSON.stringify(essayAnswers),
+            scanFiles: scanFilesJson,
+            objectiveAnswers: objectiveAnswersJson,
+            essayAnswers: essayAnswersJson,
             status: 'GRADED',
             aiScore: totalScore,
             finalScore: totalScore,
-            feedback: JSON.stringify(feedbackPayload),
-            gradedAt: new Date(),
+            feedback: feedbackJson,
+            gradedAt,
           },
+        });
+
+        await createSubmissionAttemptSnapshot(tx, {
+          submissionId: submission.id,
+          attemptNumber,
+          sourceDraftId: draft.id,
+          scanFiles: scanFilesJson,
+          objectiveAnswers: objectiveAnswersJson,
+          essayAnswers: essayAnswersJson,
+          status: 'GRADED',
+          aiScore: totalScore,
+          finalScore: totalScore,
+          feedback: feedbackJson,
+          gradedAt,
         });
 
         await tx.submissionGrade.create({
@@ -6347,7 +6677,7 @@ const startDraftGradingBlocking = async (req: AuthRequest, res: Response): Promi
             totalScore,
             rubricVersion: `exam-v${session.exam.version}`,
             promptLog: JSON.stringify({ mode: 'draft-finalization', draftId: draft.id, batchEssayMode: true }),
-            responseLog: JSON.stringify(feedbackPayload),
+            responseLog: feedbackJson,
           },
         });
 
@@ -6358,7 +6688,7 @@ const startDraftGradingBlocking = async (req: AuthRequest, res: Response): Promi
             action: 'DRAFT_FINALIZED',
             beforeScore: existingSubmission?.finalScore ?? null,
             afterScore: totalScore,
-            note: 'Draft scan finalized into an official submission',
+            note: `Draft scan finalized into attempt ${attemptNumber}`,
           },
         });
 
@@ -6614,7 +6944,7 @@ export const startMobileScanGrading = async (req: Request, res: Response): Promi
     }
 
     const invalidScans = enrichMobileQueuedInvalidScans(
-      await collectInvalidScans(files, 1),
+      await collectInvalidScans(files, { basePassIndex: 1, pagesPerPaper: expectedPages }),
       papers,
       expectedPages,
       studentsById
@@ -7191,7 +7521,7 @@ export const uploadMissingPages = async (req: AuthRequest, res: Response): Promi
 
     const qualityBasePass = missingPages.length > 0 ? missingPages[0] : 1;
     const invalidScans = enrichInvalidScansForStudent(
-      await collectInvalidScans(files, qualityBasePass),
+      await collectInvalidScans(files, { basePassIndex: qualityBasePass, pagesPerPaper: expectedPages }),
       submission.student
     );
     if (invalidScans.length > 0) {

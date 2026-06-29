@@ -120,6 +120,15 @@ type MobileStartGradingResponse = {
   };
 };
 
+type MobileOtpResponse = {
+  token: string;
+  session?: {
+    id: number;
+    examTitle: string;
+    className: string;
+  };
+};
+
 type InvalidScanPayload = {
   passIndex?: number;
   imageNumber?: number;
@@ -384,6 +393,34 @@ const CAPTURE_MAX_SIDE = 2200; // final capture stays high-res for accurate grad
 const CAPTURE_QUALITY = 0.92;
 const PAPER_ASPECT_RATIO = 210 / 297;
 
+type CaptureQualityGate = {
+  minBrightness: number;
+  maxBrightness: number;
+  minEdge: number;
+  minSharpness: number;
+};
+
+const IDENTITY_CAPTURE_GATE: CaptureQualityGate = {
+  minBrightness: 68,
+  maxBrightness: 215,
+  minEdge: 6.5,
+  minSharpness: 4.5,
+};
+
+const ESSAY_CAPTURE_GATE: CaptureQualityGate = {
+  minBrightness: 30,
+  maxBrightness: 242,
+  minEdge: 2,
+  minSharpness: 1.5,
+};
+
+const framePassesGate = (metrics: FrameMetrics, gate: CaptureQualityGate): boolean => (
+  metrics.brightness > gate.minBrightness
+  && metrics.brightness < gate.maxBrightness
+  && metrics.edge > gate.minEdge
+  && metrics.sharpness > gate.minSharpness
+);
+
 const createClientId = () => {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
     return crypto.randomUUID();
@@ -392,11 +429,13 @@ const createClientId = () => {
 };
 
 const TeacherMobileScan: React.FC = () => {
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const token = searchParams.get('token') || '';
 
   const [context, setContext] = useState<MobileScanContext | null>(null);
   const [loading, setLoading] = useState(true);
+  const [otpCode, setOtpCode] = useState('');
+  const [otpLoading, setOtpLoading] = useState(false);
   const [cameraOpen, setCameraOpen] = useState(false);
   const [torchSupported, setTorchSupported] = useState(false);
   const [torchEnabled, setTorchEnabled] = useState(false);
@@ -603,6 +642,33 @@ const TeacherMobileScan: React.FC = () => {
     }
   };
 
+  const resolveOtpCode = async (event: React.FormEvent) => {
+    event.preventDefault();
+    const normalizedCode = otpCode.replace(/\D/g, '');
+    if (!normalizedCode) {
+      toast.error('Hãy nhập mã quét bài.');
+      return;
+    }
+
+    setOtpLoading(true);
+    try {
+      const { data } = await publicApi.post<MobileOtpResponse>('/exams/mobile-scan/otp', {
+        code: normalizedCode,
+      });
+      if (!data.token) {
+        toast.error('Mã quét không trả về phiên hợp lệ.');
+        return;
+      }
+      setSearchParams({ token: data.token });
+      setOtpCode('');
+      toast.success('Đã kết nối tới phiên chấm bài.');
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error || 'Mã quét không hợp lệ hoặc đã hết hạn.');
+    } finally {
+      setOtpLoading(false);
+    }
+  };
+
   const resetPaper = (revokeThumbs = true) => {
     if (revokeThumbs) {
       Object.values(pages).forEach((page) => revokeThumbIfNeeded(page.thumb));
@@ -724,7 +790,7 @@ const TeacherMobileScan: React.FC = () => {
       brightness,
       edge,
       sharpness,
-      preGateOk: brightness > 68 && brightness < 215 && edge > 6.5 && sharpness > 4.5,
+      preGateOk: framePassesGate({ brightness, edge, sharpness, preGateOk: false }, IDENTITY_CAPTURE_GATE),
     };
   };
 
@@ -736,14 +802,15 @@ const TeacherMobileScan: React.FC = () => {
     }
     // Essay/answer pages are not OMR'd at capture (only buffered), so the gate
     // is purely a framing hint — kept lenient so the border turns green easily.
+    const gate = strictIdentity ? IDENTITY_CAPTURE_GATE : ESSAY_CAPTURE_GATE;
     const ready = strictIdentity
       ? metrics.preGateOk
-      : metrics.brightness > 50 && metrics.brightness < 225 && metrics.edge > 4.5 && metrics.sharpness > 3;
+      : framePassesGate(metrics, gate);
     setCaptureReady(ready);
-    if (ready) setCaptureHint('Ảnh đủ nét — chạm Chụp');
-    else if (metrics.brightness <= (strictIdentity ? 68 : 50)) setCaptureHint('Thiếu sáng, tăng ánh sáng');
-    else if (metrics.brightness >= (strictIdentity ? 215 : 225)) setCaptureHint('Quá chói, tránh loá');
-    else setCaptureHint('Giữ yên và lấp đầy khung bằng tờ phiếu');
+    if (ready) setCaptureHint(strictIdentity ? 'Ảnh đủ nét — chạm Chụp' : 'Ảnh đủ dùng — chạm Chụp');
+    else if (metrics.brightness <= gate.minBrightness) setCaptureHint('Thiếu sáng, tăng ánh sáng');
+    else if (metrics.brightness >= gate.maxBrightness) setCaptureHint('Quá chói, tránh loá');
+    else setCaptureHint(strictIdentity ? 'Giữ yên và lấp đầy khung bằng tờ phiếu' : 'Có thể chụp, nhưng giữ yên thêm sẽ rõ hơn');
   };
 
   const getPaperCoverSourceRect = (video: HTMLVideoElement) => {
@@ -1048,14 +1115,17 @@ const TeacherMobileScan: React.FC = () => {
   }, [cameraOpen, activePassIndex, pages, context]);
 
   const captureManually = async () => {
-    if (!captureReady) {
+    const passIndex = activePassIndex;
+    if (!captureReady && isIdentityPass(passIndex)) {
       toast.error('Chờ chỉ báo xanh (đủ nét) trước khi chụp');
       return;
+    }
+    if (!captureReady) {
+      toast('Ảnh tự luận hơi mờ/tối, vẫn lưu để không gián đoạn thao tác.');
     }
     if (busy) return;
     setBusy(true);
     try {
-      const passIndex = activePassIndex;
       const blob = await grabScaledBlob(CAPTURE_MAX_SIDE, CAPTURE_QUALITY);
       if (!blob) {
         toast.error('Không lấy được khung hình');
@@ -1158,6 +1228,25 @@ const TeacherMobileScan: React.FC = () => {
     toast.success(`Đã xóa bài tạm của ${paper.student.fullName}`);
   };
 
+  const confirmExistingQueuedPapers = (): boolean => {
+    if (!context) return true;
+    const studentsById = new Map(context.students.map((item) => [item.studentId, item]));
+    const existing = queuedPapers.filter((paper) => {
+      const student = studentsById.get(paper.student.id);
+      return !!student && (
+        student.scanCount > 0
+        || student.finalScore !== null
+        || ['GRADED', 'REVIEWED', 'FINALIZED'].includes(String(student.status || '').toUpperCase())
+      );
+    });
+
+    if (existing.length === 0) return true;
+
+    return window.confirm(
+      `Các thí sinh sau đã có bài nộp/điểm từ trước:\n\n${existing.map((paper, index) => `${index + 1}. ${paper.student.fullName} (${paper.student.username})`).join('\n')}\n\nNếu tiếp tục, bài mới sẽ được lưu là lần làm tiếp theo và kết quả hiện hành sẽ được cập nhật.`
+    );
+  };
+
   const syncQueueAndStartGrading = async () => {
     if (!context) {
       toast.error('Chưa tải được phiên thi.');
@@ -1169,6 +1258,9 @@ const TeacherMobileScan: React.FC = () => {
     }
     if (queuedPapers.length === 0) {
       toast.error('Chưa có bài nào trong hàng đợi RAM.');
+      return;
+    }
+    if (!confirmExistingQueuedPapers()) {
       return;
     }
 
@@ -1213,9 +1305,9 @@ const TeacherMobileScan: React.FC = () => {
       queuedPapers.forEach((paper) => paper.pages.forEach((page) => revokeThumbIfNeeded(page.thumb)));
       setQueuedPapers([]);
       setSyncStatus(
-        `Đã đồng bộ ${data.syncedPaperCount || 0} bài (${data.syncedImageCount || 0} ảnh) và bắt đầu chấm.`
+        `Đã đồng bộ ${data.syncedPaperCount || 0} bài (${data.syncedImageCount || 0} ảnh) và bắt đầu chấm. Hãy tải lại trang trên máy tính để cập nhật trạng thái các bài làm đã đồng bộ.`
       );
-      toast.success('Đã đồng bộ ảnh và bắt đầu chấm.');
+      toast.success('Đã đồng bộ ảnh và bắt đầu chấm. Hãy tải lại trang trên máy tính để cập nhật trạng thái.');
       await loadContext();
     } catch (err: any) {
       const payload = err?.response?.data as { error?: string; invalidScans?: InvalidScanPayload[] };
@@ -1279,8 +1371,27 @@ const TeacherMobileScan: React.FC = () => {
   if (!token) {
     return (
       <div className="min-h-screen bg-gray-100 p-4">
-        <div className="max-w-md mx-auto bg-white rounded-xl shadow p-4">
-          <p className="text-sm text-red-600">Link quét không hợp lệ: thiếu token.</p>
+        <div className="max-w-md mx-auto bg-white rounded-xl shadow p-4 space-y-4">
+          <div>
+            <h1 className="text-lg font-semibold text-gray-900 flex items-center gap-2">
+              <ScanLine size={18} /> Quét bài bằng điện thoại
+            </h1>
+            <p className="text-sm text-gray-600 mt-2">Nhập mã quét bài đang hiển thị trên máy tính.</p>
+          </div>
+          <form className="space-y-3" onSubmit={resolveOtpCode}>
+            <input
+              className="input-field text-center text-2xl font-bold tracking-widest"
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              value={otpCode}
+              onChange={(event) => setOtpCode(event.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="000000"
+              autoFocus
+            />
+            <button className="btn-primary w-full" type="submit" disabled={otpLoading || otpCode.replace(/\D/g, '').length === 0}>
+              {otpLoading ? 'Đang kết nối...' : 'Kết nối phiên chấm'}
+            </button>
+          </form>
         </div>
       </div>
     );
@@ -1433,7 +1544,7 @@ const TeacherMobileScan: React.FC = () => {
             <button
               className={`btn-primary text-xs ${cameraOpen ? 'col-span-2' : ''}`}
               onClick={captureManually}
-              disabled={!cameraOpen || !captureReady || busy}
+              disabled={!cameraOpen || (onIdentityPass && !captureReady) || busy}
             >
               {busy ? 'Đang chụp…' : onIdentityPass ? 'Chụp tay trang đầu' : 'Chụp trang này'}
             </button>
