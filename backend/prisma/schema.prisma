@@ -221,8 +221,30 @@ model ExamSubmission {
 
   grades         SubmissionGrade[]
   auditLogs      GradingAuditLog[]
+  attempts       ExamSubmissionAttempt[]
 
   @@unique([sessionId, studentId])
+}
+
+model ExamSubmissionAttempt {
+  id               Int      @id @default(autoincrement())
+  submissionId     Int
+  submission       ExamSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  attemptNumber    Int
+  sourceDraftId    Int?
+  scanFiles        String   @default("[]")
+  objectiveAnswers String   @default("{}")
+  essayAnswers     String   @default("{}")
+  status           String   @default("GRADED")
+  aiScore          Float?
+  finalScore       Float?
+  feedback         String?
+  gradedAt         DateTime?
+  createdAt        DateTime @default(now())
+
+  @@unique([submissionId, attemptNumber])
+  @@index([submissionId])
+  @@index([sourceDraftId])
 }
 
 model ExamDraftScan {

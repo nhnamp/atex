@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Sparkles, Download, BookOpen, AlertCircle, Eye, GripVertical, X, Search, RefreshCw } from 'lucide-react';
 import toast from 'react-hot-toast';
@@ -7,6 +7,17 @@ import api from '../../api';
 import { BuiltExam, Class, ExamRequirements, ExamSession, LearningOutcome, Question, Subject } from '../../types';
 
 const TOTAL_EXAM_POINTS = 10;
+
+// A stable signature of what ends up in the exported .docx (question order + per-question
+// points). Used to light up "Generate New Word" only when those actually changed.
+const examWordSignature = (exam: BuiltExam | null): string => {
+  if (!exam?.questions) return '';
+  return JSON.stringify(
+    [...exam.questions]
+      .sort((a, b) => a.position - b.position)
+      .map((item) => [item.question.id, Number(item.points || 0)])
+  );
+};
 
 const TeacherExamGenerator: React.FC = () => {
   const navigate = useNavigate();
@@ -39,6 +50,7 @@ const TeacherExamGenerator: React.FC = () => {
   const [loadingSubjects, setLoadingSubjects] = useState(true);
   const [draggedQuestionId, setDraggedQuestionId] = useState<number | null>(null);
   const [dragOverQuestionId, setDragOverQuestionId] = useState<number | null>(null);
+  const [pointsDrafts, setPointsDrafts] = useState<Record<number, string>>({});
   const [activeQuestion, setActiveQuestion] = useState<{ examQuestionId: number; question: Question } | null>(null);
   const [activeTab, setActiveTab] = useState<'EDIT' | 'REPLACE'>('EDIT');
   const [questionForm, setQuestionForm] = useState({
@@ -55,6 +67,54 @@ const TeacherExamGenerator: React.FC = () => {
   const [replacementResults, setReplacementResults] = useState<Question[]>([]);
   const [selectedReplacementId, setSelectedReplacementId] = useState<number | null>(null);
   const [loadingReplacement, setLoadingReplacement] = useState(false);
+  const [exportingExamId, setExportingExamId] = useState<number | null>(null);
+  const [exportingKeyId, setExportingKeyId] = useState<number | null>(null);
+  const [savingQuestion, setSavingQuestion] = useState(false);
+  const replacementSearchSeqRef = useRef(0);
+  const [generatingWord, setGeneratingWord] = useState(false);
+  // Baseline order+points captured when an exam opens / after a Word is generated.
+  const [wordBaseline, setWordBaseline] = useState<{ examId: number; signature: string } | null>(null);
+  // Serial queue for all exam-structure writes (reorder + points). Running them one at a
+  // time prevents overlapping renumber transactions from deadlocking ("fail to reorder").
+  const writeChainRef = useRef<Promise<void>>(Promise.resolve());
+  // Latest desired order per exam. While a PATCH is in flight, further drags overwrite the
+  // entry so superseded orders are skipped — a burst coalesces to one PATCH per exam.
+  const pendingReorderRef = useRef<Map<number, number[]>>(new Map());
+
+  // Raw text shown in each numeric/required config input. A present key means the box shows
+  // that string verbatim (so it can be emptied while editing); the parsed number still flows
+  // into the real state. On Create Exam Draft we read these to flag empty/invalid boxes inline.
+  const [rawInputs, setRawInputs] = useState<Record<string, string>>({});
+  const [configErrors, setConfigErrors] = useState<Record<string, string>>({});
+  // Once the user edits the title we stop auto-filling it, so clearing the box stays cleared.
+  const titleTouchedRef = useRef(false);
+  // Tracks which exam's config is loaded so input drafts only reset when the exam changes.
+  const loadedConfigExamIdRef = useRef<number | null>(null);
+
+  const rawValueOf = (key: string, num: number) => rawInputs[key] ?? String(num);
+
+  const clearConfigErrors = (...keys: string[]) =>
+    setConfigErrors((prev) => {
+      if (!keys.some((key) => key in prev)) return prev;
+      const next = { ...prev };
+      keys.forEach((key) => delete next[key]);
+      return next;
+    });
+
+  // Numeric config inputs keep the raw string (empty allowed) and push a parsed number into
+  // state — empty/NaN counts as 0 for live totals while the box itself stays visually empty.
+  const handleNumInput = (
+    key: string,
+    raw: string,
+    apply: (value: number) => void,
+    alsoClear: string[] = []
+  ) => {
+    setRawInputs((prev) => ({ ...prev, [key]: raw }));
+    const trimmed = raw.trim();
+    const parsed = trimmed === '' ? 0 : Number(trimmed);
+    apply(Number.isFinite(parsed) ? parsed : 0);
+    clearConfigErrors(key, ...alsoClear);
+  };
 
   useEffect(() => {
     const fetchData = async () => {
@@ -100,6 +160,15 @@ const TeacherExamGenerator: React.FC = () => {
 
   useEffect(() => {
     if (!selectedExam) return;
+
+    // Switching to a different exam re-seeds every config field from the saved values, so drop
+    // any in-progress input drafts/errors and let the boxes reflect the loaded numbers again.
+    if (loadedConfigExamIdRef.current !== selectedExam.id) {
+      loadedConfigExamIdRef.current = selectedExam.id;
+      setRawInputs({});
+      setConfigErrors({});
+      titleTouchedRef.current = false;
+    }
 
     const parseRequirements = (raw: string): ExamRequirements | null => {
       try {
@@ -149,6 +218,20 @@ const TeacherExamGenerator: React.FC = () => {
     }
   }, [selectedExam]);
 
+  // Capture the baseline signature when a different exam is opened. Edits to the same exam
+  // keep the existing baseline so "Generate New Word" can detect drift; switching exams resets it.
+  useEffect(() => {
+    if (!selectedExam) {
+      setWordBaseline(null);
+      return;
+    }
+    setWordBaseline((prev) =>
+      prev && prev.examId === selectedExam.id
+        ? prev
+        : { examId: selectedExam.id, signature: examWordSignature(selectedExam) }
+    );
+  }, [selectedExam]);
+
   useEffect(() => {
     const fetchOutcomes = async () => {
       if (!selectedSubjectId) {
@@ -171,7 +254,7 @@ const TeacherExamGenerator: React.FC = () => {
     const selected = subjects.find((item) => item.id === parseInt(selectedSubjectId, 10));
     if (!selected) return;
 
-    if (!examTitle.trim()) {
+    if (!examTitle.trim() && !titleTouchedRef.current) {
       const today = new Date();
       const mm = String(today.getMonth() + 1).padStart(2, '0');
       const dd = String(today.getDate()).padStart(2, '0');
@@ -195,54 +278,116 @@ const TeacherExamGenerator: React.FC = () => {
     }
   };
 
-  const validateRequirements = () => {
-    const sum = requirements.multipleChoice + requirements.essay;
-    if (sum !== requirements.total) {
-      toast.error(`Question types sum (${sum}) must equal total (${requirements.total})`);
-      return false;
-    }
-    if (!selectedSubjectId) {
-      toast.error('Please select a subject');
-      return false;
-    }
-    if (requirements.total <= 0) {
-      toast.error('Total questions must be greater than 0');
-      return false;
-    }
-    if (Math.abs(sectionPoints.multipleChoice + sectionPoints.essay - TOTAL_EXAM_POINTS) > 0.0001) {
-      toast.error(`Section points must total ${TOTAL_EXAM_POINTS}`);
-      return false;
+  // Replace an exam in local state without a network round-trip (used for optimistic updates
+  // and to reconcile from the data returned by PATCH responses).
+  const applyExamData = (data: BuiltExam) => {
+    setExams((prev) => prev.map((item) => (item.id === data.id ? data : item)));
+  };
+
+  // Append a write to the serial queue. Tasks own their error handling; the chain is kept
+  // alive on failure so one bad write can't wedge later ones.
+  const enqueueWrite = (task: () => Promise<void>): Promise<void> => {
+    const next = writeChainRef.current.then(() => task());
+    writeChainRef.current = next.catch(() => {});
+    return next;
+  };
+
+  // Resolves once every queued write has been persisted — used before exporting so the
+  // .docx always reflects the latest order + points.
+  const flushPendingWrites = (): Promise<void> => writeChainRef.current;
+
+  const downloadDocx = async (url: string, filename: string) => {
+    const response = await api.get(url, { responseType: 'blob' });
+    const blobUrl = window.URL.createObjectURL(new Blob([response.data]));
+    const link = document.createElement('a');
+    link.href = blobUrl;
+    link.download = filename;
+    link.click();
+    window.URL.revokeObjectURL(blobUrl);
+  };
+
+  // Validates every config field. Empty/invalid boxes get an inline red message keyed by the
+  // field; cross-field problems (totals, ratios) get a specific message under the right group.
+  // The first message is also surfaced as a toast.
+  const validateConfig = (): boolean => {
+    const errors: Record<string, string> = {};
+    const EMPTY = 'Giá trị không được để trống';
+    const INVALID = 'Giá trị không hợp lệ';
+
+    // Reads a box and records EMPTY/INVALID; returns the number or null when unusable.
+    const checkNum = (key: string, num: number, opts?: { positive?: boolean }): number | null => {
+      const raw = rawValueOf(key, num).trim();
+      if (raw === '') {
+        errors[key] = EMPTY;
+        return null;
+      }
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < 0 || (opts?.positive && n <= 0)) {
+        errors[key] = INVALID;
+        return null;
+      }
+      return n;
+    };
+
+    // Reads a box treating empty/invalid as 0 (used for ratio sums that don't require each box).
+    const readNum = (key: string, num: number): number => {
+      const raw = rawValueOf(key, num).trim();
+      if (raw === '') return 0;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : 0;
+    };
+
+    if (!selectedSubjectId) errors.subject = 'Vui lòng chọn môn học';
+    if (!examTitle.trim()) errors.title = EMPTY;
+
+    checkNum('duration', durationMinutes, { positive: true });
+
+    const mcqCount = checkNum('mcqCount', requirements.multipleChoice);
+    const essayCount = checkNum('essayCount', requirements.essay);
+    if (mcqCount !== null && essayCount !== null && mcqCount + essayCount <= 0) {
+      errors.total = 'Tổng số câu hỏi phải lớn hơn 0';
     }
 
-    const mcqDist = requirements.difficultyDistribution?.multipleChoice;
-    const essayDist = requirements.difficultyDistribution?.essay;
-    const mcqSum = (mcqDist?.easy || 0) + (mcqDist?.medium || 0) + (mcqDist?.hard || 0);
-    const essaySum = (essayDist?.easy || 0) + (essayDist?.medium || 0) + (essayDist?.hard || 0);
-
-    if (requirements.multipleChoice > 0 && mcqSum !== 100) {
-      toast.error('Difficulty ratio for MCQ must total 100% when MCQ > 0');
-      return false;
+    const spMcq = checkNum('spMcq', sectionPoints.multipleChoice);
+    const spEssay = checkNum('spEssay', sectionPoints.essay);
+    if (spMcq !== null && spEssay !== null && Math.abs(spMcq + spEssay - TOTAL_EXAM_POINTS) > 0.0001) {
+      errors.sectionPoints = `Tổng điểm 2 phần phải bằng ${TOTAL_EXAM_POINTS} (hiện tại ${spMcq + spEssay})`;
     }
 
-    if (requirements.essay > 0 && essaySum !== 100) {
-      toast.error('Difficulty ratio for Essay must total 100% when Essay > 0');
-      return false;
+    const dd = requirements.difficultyDistribution;
+    if ((mcqCount ?? 0) > 0) {
+      const total =
+        readNum('mcqEasy', dd?.multipleChoice.easy ?? 0) +
+        readNum('mcqMedium', dd?.multipleChoice.medium ?? 0) +
+        readNum('mcqHard', dd?.multipleChoice.hard ?? 0);
+      if (total !== 100) errors.mcqRatio = 'Tỉ lệ độ khó MCQ phải tổng 100%';
+    }
+    if ((essayCount ?? 0) > 0) {
+      const total =
+        readNum('essayEasy', dd?.essay.easy ?? 0) +
+        readNum('essayMedium', dd?.essay.medium ?? 0) +
+        readNum('essayHard', dd?.essay.hard ?? 0);
+      if (total !== 100) errors.essayRatio = 'Tỉ lệ độ khó Essay phải tổng 100%';
     }
 
     if (subjectOutcomes.length > 0) {
-      const ratioEntries = Object.entries(outcomeRatios)
-        .map(([id, ratio]) => ({ learningOutcomeId: Number(id), ratio: Number(ratio) || 0 }))
-        .filter((item) => item.ratio > 0);
-
-      if (ratioEntries.length > 0) {
-        const ratioSum = ratioEntries.reduce((acc, item) => acc + item.ratio, 0);
+      const entries = subjectOutcomes
+        .map((outcome) => readNum(`outcome:${outcome.id}`, outcomeRatios[outcome.id] ?? 0))
+        .filter((ratio) => ratio > 0);
+      if (entries.length > 0) {
+        const ratioSum = entries.reduce((acc, ratio) => acc + ratio, 0);
         if (ratioSum !== 100) {
-          toast.error('Outcome ratio must sum to 100% (or leave empty to auto split evenly)');
-          return false;
+          errors.outcomeRatio = 'Tổng tỉ lệ outcome phải bằng 100% (hoặc để trống để chia đều)';
         }
       }
     }
 
+    setConfigErrors(errors);
+    const keys = Object.keys(errors);
+    if (keys.length > 0) {
+      toast.error(errors[keys[0]]);
+      return false;
+    }
     return true;
   };
 
@@ -258,7 +403,7 @@ const TeacherExamGenerator: React.FC = () => {
   };
 
   const handleGenerate = async () => {
-    if (!validateRequirements()) return;
+    if (!validateConfig()) return;
     setGenerating(true);
 
     try {
@@ -283,6 +428,7 @@ const TeacherExamGenerator: React.FC = () => {
       });
       setExams([data]);
       setSelectedExamId(data.id);
+      setConfigErrors({});
       toast.success('Exam draft created');
     } catch (err: any) {
       toast.error(err?.response?.data?.error || 'Failed to create exam draft');
@@ -292,32 +438,49 @@ const TeacherExamGenerator: React.FC = () => {
   };
 
   const handleExport = async (examId: number) => {
+    if (exportingExamId) return;
+    setExportingExamId(examId);
     try {
-      const response = await api.get(`/exams/builder/${examId}/export`, { responseType: 'blob' });
-      const blobUrl = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = `exam_${examId}.docx`;
-      link.click();
-      window.URL.revokeObjectURL(blobUrl);
+      await flushPendingWrites();
+      await downloadDocx(`/exams/builder/${examId}/export`, `exam_${examId}.docx`);
       toast.success('Exam exported (.docx template)');
     } catch {
       toast.error('Failed to export exam');
+    } finally {
+      setExportingExamId(null);
     }
   };
 
   const handleExportAnswerKey = async (examId: number) => {
+    if (exportingKeyId) return;
+    setExportingKeyId(examId);
     try {
-      const response = await api.get(`/exams/builder/${examId}/export-answer-key`, { responseType: 'blob' });
-      const blobUrl = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = `answer_key_${examId}.docx`;
-      link.click();
-      window.URL.revokeObjectURL(blobUrl);
+      await flushPendingWrites();
+      await downloadDocx(`/exams/builder/${examId}/export-answer-key`, `answer_key_${examId}.docx`);
       toast.success('Answer key exported (.docx template)');
     } catch {
       toast.error('Failed to export answer key');
+    } finally {
+      setExportingKeyId(null);
+    }
+  };
+
+  // One button to regenerate both the exam and the answer-key .docx after reordering or
+  // re-pointing questions. Flushing first guarantees the files match the latest layout, and
+  // resetting the baseline dims the button until the next change.
+  const handleGenerateWord = async (examId: number) => {
+    if (generatingWord) return;
+    setGeneratingWord(true);
+    try {
+      await flushPendingWrites();
+      await downloadDocx(`/exams/builder/${examId}/export`, `exam_${examId}.docx`);
+      await downloadDocx(`/exams/builder/${examId}/export-answer-key`, `answer_key_${examId}.docx`);
+      setWordBaseline({ examId, signature: currentWordSignature });
+      toast.success('Generated new Word (exam + answer key)');
+    } catch {
+      toast.error('Failed to generate Word');
+    } finally {
+      setGeneratingWord(false);
     }
   };
 
@@ -360,17 +523,36 @@ const TeacherExamGenerator: React.FC = () => {
     }
   };
 
-  const reorderQuestions = async (nextQuestionIds: number[]) => {
+  const reorderQuestions = (nextQuestionIds: number[]): void => {
     if (!selectedExam?.questions) return;
-    try {
-      await api.patch(`/exams/builder/${selectedExam.id}/reorder`, {
-        orderedQuestionIds: nextQuestionIds,
-      });
-      await loadExamDetail(selectedExam.id);
-      toast.success('Exam structure updated');
-    } catch {
-      toast.error('Failed to reorder questions');
-    }
+    const examId = selectedExam.id;
+
+    // Optimistically reorder locally so drag/shuffle feels instant. The backend persists
+    // positions 1..N in the same order we send, so the local order already matches the result.
+    const byId = new Map(selectedExam.questions.map((item) => [item.question.id, item]));
+    const nextQuestions = nextQuestionIds
+      .map((id, index) => {
+        const item = byId.get(id);
+        return item ? { ...item, position: index + 1 } : null;
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null);
+    applyExamData({ ...selectedExam, questions: nextQuestions });
+
+    // Persist the latest order through the serial queue. Coalescing means a burst of drags
+    // collapses to one PATCH, and serialization stops overlapping renumbers from deadlocking.
+    const order = nextQuestionIds;
+    pendingReorderRef.current.set(examId, order);
+    void enqueueWrite(async () => {
+      if (pendingReorderRef.current.get(examId) !== order) return; // superseded by a newer order
+      pendingReorderRef.current.delete(examId);
+      try {
+        await api.patch(`/exams/builder/${examId}/reorder`, { orderedQuestionIds: order });
+        // Optimistic state already matches the persisted order — no reconcile needed.
+      } catch {
+        toast.error('Failed to reorder questions');
+        await loadExamDetail(examId); // resync to server truth
+      }
+    });
   };
 
   const handleDragStart = (questionId: number) => {
@@ -382,7 +564,7 @@ const TeacherExamGenerator: React.FC = () => {
     setDragOverQuestionId(null);
   };
 
-  const reorderWithinSection = async (sectionType: 'MULTIPLE_CHOICE' | 'ESSAY', nextSectionQuestions: number[]) => {
+  const reorderWithinSection = (sectionType: 'MULTIPLE_CHOICE' | 'ESSAY', nextSectionQuestions: number[]) => {
     if (!selectedExam?.questions) return;
 
     const otherQuestions = selectedExam.questions
@@ -393,7 +575,7 @@ const TeacherExamGenerator: React.FC = () => {
       ? [...nextSectionQuestions, ...otherQuestions]
       : [...otherQuestions, ...nextSectionQuestions];
 
-    await reorderQuestions(nextOrder);
+    reorderQuestions(nextOrder);
   };
 
   const handleDropOnQuestion = async (sectionType: 'MULTIPLE_CHOICE' | 'ESSAY', targetQuestionId: number) => {
@@ -469,23 +651,67 @@ const TeacherExamGenerator: React.FC = () => {
       newOrder = [...mcqs, ...sectionItems].map((it) => it.question.id);
     }
 
-    try {
-      await reorderQuestions(newOrder);
-      toast.success('Shuffled section questions');
-    } catch {
-      toast.error('Failed to shuffle section');
-    }
+    reorderQuestions(newOrder);
+    toast.success('Shuffled section questions');
   };
 
-  const handleUpdateQuestionPoints = async (questionId: number, points: number) => {
-    if (!selectedExam) return;
-    try {
-      await api.patch(`/exams/builder/${selectedExam.id}/questions/${questionId}/points`, { points });
-      await loadExamDetail(selectedExam.id);
-      toast.success('Updated question points');
-    } catch (e) {
-      toast.error('Failed to update question points');
+  const handleUpdateQuestionPoints = (questionId: number, points: number): void => {
+    if (!selectedExam?.questions) return;
+    const examId = selectedExam.id;
+    const prevPoints = Number(
+      selectedExam.questions.find((item) => item.question.id === questionId)?.points ?? 0
+    );
+
+    // Set just this question's points so a concurrent reorder/edit isn't clobbered.
+    const setQuestionPoints = (value: number) =>
+      setExams((prev) =>
+        prev.map((exam) =>
+          exam.id === examId
+            ? {
+                ...exam,
+                questions: exam.questions?.map((item) =>
+                  item.question.id === questionId ? { ...item, points: value } : item
+                ),
+              }
+            : exam
+        )
+      );
+
+    setQuestionPoints(points); // optimistic
+
+    // Serialize with reorder writes so the two never collide on the same exam rows.
+    void enqueueWrite(async () => {
+      try {
+        await api.patch(`/exams/builder/${examId}/questions/${questionId}/points`, { points });
+        toast.success('Updated question points');
+      } catch {
+        setQuestionPoints(prevPoints); // revert just this field
+        toast.error('Failed to update question points');
+      }
+    });
+  };
+
+  // The points input is uncontrolled-by-draft while typing (see pointsDrafts) and only commits
+  // on blur / Enter, so we don't fire a request + reload on every keystroke.
+  const commitQuestionPoints = (questionId: number) => {
+    if (!selectedExam?.questions) return;
+    const draft = pointsDrafts[questionId];
+    setPointsDrafts((prev) => {
+      if (!(questionId in prev)) return prev;
+      const next = { ...prev };
+      delete next[questionId];
+      return next;
+    });
+    if (draft === undefined) return;
+
+    const parsed = Number(draft);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      toast.error('Points must be a number ≥ 0');
+      return;
     }
+    const current = selectedExam.questions.find((item) => item.question.id === questionId);
+    if (current && Number(current.points || 0) === parsed) return;
+    handleUpdateQuestionPoints(questionId, parsed);
   };
 
   const parseQuestionOptions = (question: Question): string[] => {
@@ -501,13 +727,14 @@ const TeacherExamGenerator: React.FC = () => {
   const openQuestionModal = (question: Question) => {
     setActiveQuestion({ examQuestionId: question.id, question });
     setActiveTab('EDIT');
+    const parsedOptions = question.type === 'MULTIPLE_CHOICE' ? parseQuestionOptions(question) : [];
     setQuestionForm({
       content: question.content,
       answer: question.answer,
       difficulty: question.difficulty || 'MEDIUM',
       status: question.status || 'ACTIVE',
       learningOutcomeId: question.learningOutcomeId ? String(question.learningOutcomeId) : '',
-      options: question.type === 'MULTIPLE_CHOICE' ? (parseQuestionOptions(question).length > 0 ? parseQuestionOptions(question) : ['', '', '', '']) : ['', '', '', ''],
+      options: parsedOptions.length > 0 ? parsedOptions : ['', '', '', ''],
     });
     setSearchQuery('');
     setReplacementDifficulty('ALL');
@@ -523,7 +750,7 @@ const TeacherExamGenerator: React.FC = () => {
   };
 
   const saveQuestionEdit = async () => {
-    if (!activeQuestion) return;
+    if (!activeQuestion || savingQuestion) return;
     const payload: Record<string, unknown> = {
       content: questionForm.content.trim(),
       answer: questionForm.answer.trim(),
@@ -541,6 +768,7 @@ const TeacherExamGenerator: React.FC = () => {
       payload.options = options;
     }
 
+    setSavingQuestion(true);
     try {
       await api.put(`/questions/${activeQuestion.question.id}`, payload);
       toast.success('Question updated in the question bank');
@@ -548,11 +776,14 @@ const TeacherExamGenerator: React.FC = () => {
       closeQuestionModal();
     } catch (err: any) {
       toast.error(err?.response?.data?.error || 'Failed to save question changes');
+    } finally {
+      setSavingQuestion(false);
     }
   };
 
   const runReplacementSearch = async () => {
     if (!selectedExam || !activeQuestion) return;
+    const seq = ++replacementSearchSeqRef.current;
     setLoadingReplacement(true);
     try {
       const params = new URLSearchParams();
@@ -573,17 +804,19 @@ const TeacherExamGenerator: React.FC = () => {
           if (bScore !== aScore) return bScore - aScore;
           return Number(new Date(b.createdAt || 0)) - Number(new Date(a.createdAt || 0));
         });
+      if (seq !== replacementSearchSeqRef.current) return;
       setReplacementResults(sorted);
       setSelectedReplacementId(sorted[0]?.id ?? null);
     } catch {
-      toast.error('Failed to search replacement questions');
+      if (seq === replacementSearchSeqRef.current) toast.error('Failed to search replacement questions');
     } finally {
-      setLoadingReplacement(false);
+      if (seq === replacementSearchSeqRef.current) setLoadingReplacement(false);
     }
   };
 
   const confirmManualReplacement = async () => {
-    if (!selectedExam || !activeQuestion || !selectedReplacementId) return;
+    if (!selectedExam || !activeQuestion || !selectedReplacementId || savingQuestion) return;
+    setSavingQuestion(true);
     try {
       await api.patch(`/exams/builder/${selectedExam.id}/questions/${activeQuestion.question.id}/replace`, {
         replacementQuestionId: selectedReplacementId,
@@ -593,11 +826,15 @@ const TeacherExamGenerator: React.FC = () => {
       closeQuestionModal();
     } catch (err: any) {
       toast.error(err?.response?.data?.error || 'Failed to replace question');
+    } finally {
+      setSavingQuestion(false);
     }
   };
 
   const confirmAutoReplacement = async () => {
-    if (!selectedExam || !activeQuestion) return;
+    if (!selectedExam || !activeQuestion || savingQuestion) return;
+    if (!window.confirm('Tự động thay câu hỏi này bằng một câu tương đương trong ngân hàng?')) return;
+    setSavingQuestion(true);
     try {
       await api.patch(`/exams/builder/${selectedExam.id}/questions/${activeQuestion.question.id}/replace`, {
         autoReplace: true,
@@ -607,6 +844,8 @@ const TeacherExamGenerator: React.FC = () => {
       closeQuestionModal();
     } catch (err: any) {
       toast.error(err?.response?.data?.error || 'No matching replacement question was found');
+    } finally {
+      setSavingQuestion(false);
     }
   };
 
@@ -619,6 +858,10 @@ const TeacherExamGenerator: React.FC = () => {
   const mcqQuestions = selectedExam?.questions?.filter((item) => item.question.type === 'MULTIPLE_CHOICE') || [];
   const essayQuestions = selectedExam?.questions?.filter((item) => item.question.type === 'ESSAY') || [];
 
+  const currentWordSignature = useMemo(() => examWordSignature(selectedExam), [selectedExam]);
+  // True once the order or any points drift from the last generated/opened state → light the button.
+  const isWordDirty =
+    !!selectedExam && wordBaseline?.examId === selectedExam.id && wordBaseline.signature !== currentWordSignature;
 
   const handleReqChange = (field: 'total' | 'multipleChoice' | 'essay', value: number) => {
     const newReq = { ...requirements, [field]: value };
@@ -632,15 +875,44 @@ const TeacherExamGenerator: React.FC = () => {
       } else if (newReq.essay === 0) {
         setSectionPoints({ multipleChoice: TOTAL_EXAM_POINTS, essay: 0 });
       }
+      // When a section is dropped to 0 we force its points — drop any stale input drafts so the
+      // boxes show the forced values instead of leftover typing.
+      if (newReq.multipleChoice === 0 || newReq.essay === 0) {
+        setRawInputs((prev) => {
+          if (!('spMcq' in prev) && !('spEssay' in prev)) return prev;
+          const next = { ...prev };
+          delete next.spMcq;
+          delete next.spEssay;
+          return next;
+        });
+        clearConfigErrors('spMcq', 'spEssay', 'sectionPoints');
+      }
     }
+  };
+
+  const setDifficulty = (
+    section: 'multipleChoice' | 'essay',
+    level: 'easy' | 'medium' | 'hard',
+    value: number
+  ) => {
+    setRequirements((prev) => {
+      const dd = prev.difficultyDistribution ?? {
+        multipleChoice: { easy: 50, medium: 35, hard: 15 },
+        essay: { easy: 50, medium: 35, hard: 15 },
+      };
+      return {
+        ...prev,
+        difficultyDistribution: {
+          multipleChoice:
+            section === 'multipleChoice' ? { ...dd.multipleChoice, [level]: value } : dd.multipleChoice,
+          essay: section === 'essay' ? { ...dd.essay, [level]: value } : dd.essay,
+        },
+      };
+    });
   };
 
   const sum = requirements.multipleChoice + requirements.essay;
   const sectionPointsTotal = sectionPoints.multipleChoice + sectionPoints.essay;
-  const isValid = sum === requirements.total
-    && requirements.total > 0
-    && Math.abs(sectionPointsTotal - TOTAL_EXAM_POINTS) <= 0.0001
-    && !!selectedSubjectId;
 
   const selectedSubjectData = subjects.find((s) => s.id === parseInt(selectedSubjectId));
   const totalQuestions = selectedSubjectData?._count?.questions ?? 0;
@@ -688,7 +960,7 @@ const TeacherExamGenerator: React.FC = () => {
               <select
                 className="input-field"
                 value={selectedSubjectId}
-                onChange={(e) => setSelectedSubjectId(e.target.value)}
+                onChange={(e) => { setSelectedSubjectId(e.target.value); clearConfigErrors('subject'); }}
               >
                 <option value="">-- Select a subject --</option>
                 {subjects.map((s) => (
@@ -697,6 +969,9 @@ const TeacherExamGenerator: React.FC = () => {
                   </option>
                 ))}
               </select>
+            )}
+            {configErrors.subject && (
+              <p className="text-xs text-red-600 mt-1.5">{configErrors.subject}</p>
             )}
             {selectedSubjectId && totalQuestions < requirements.total && (
               <p className="flex items-center gap-1.5 text-xs text-red-600 mt-1.5">
@@ -717,8 +992,9 @@ const TeacherExamGenerator: React.FC = () => {
                 className="input-field py-2.5"
                 placeholder={selectedSubjectData ? `${selectedSubjectData.name} Midterm` : 'Exam title...'}
                 value={examTitle}
-                onChange={(e) => setExamTitle(e.target.value)}
+                onChange={(e) => { titleTouchedRef.current = true; setExamTitle(e.target.value); clearConfigErrors('title'); }}
               />
+              {configErrors.title && <p className="text-xs text-red-600 mt-1">{configErrors.title}</p>}
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1.5">Duration (min)</label>
@@ -726,9 +1002,10 @@ const TeacherExamGenerator: React.FC = () => {
                 type="number"
                 min={15}
                 className="input-field py-2.5"
-                value={durationMinutes}
-                onChange={(e) => setDurationMinutes(parseInt(e.target.value, 10) || 60)}
+                value={rawValueOf('duration', durationMinutes)}
+                onChange={(e) => handleNumInput('duration', e.target.value, (n) => setDurationMinutes(n))}
               />
+              {configErrors.duration && <p className="text-xs text-red-600 mt-1">{configErrors.duration}</p>}
             </div>
           </div>
 
@@ -754,19 +1031,23 @@ const TeacherExamGenerator: React.FC = () => {
                         max={100}
                         className="input-field"
                         placeholder="Ratio %"
-                        value={outcomeRatios[outcome.id] ?? 0}
-                        onChange={(e) => {
-                          const value = parseInt(e.target.value || '0', 10) || 0;
-                          setOutcomeRatios((prev) => ({
-                            ...prev,
-                            [outcome.id]: value,
-                          }));
-                        }}
+                        value={rawValueOf(`outcome:${outcome.id}`, outcomeRatios[outcome.id] ?? 0)}
+                        onChange={(e) =>
+                          handleNumInput(
+                            `outcome:${outcome.id}`,
+                            e.target.value,
+                            (n) => setOutcomeRatios((prev) => ({ ...prev, [outcome.id]: n })),
+                            ['outcomeRatio']
+                          )
+                        }
                       />
                     </div>
                   </div>
                 ))}
               </div>
+              {configErrors.outcomeRatio && (
+                <p className="text-xs text-red-600 mt-2">{configErrors.outcomeRatio}</p>
+              )}
             </div>
           )}
 
@@ -784,9 +1065,21 @@ const TeacherExamGenerator: React.FC = () => {
                     type="number"
                     min={0}
                     className="input-field"
-                    value={requirements[field]}
-                    onChange={(e) => handleReqChange(field, parseInt(e.target.value) || 0)}
+                    value={rawValueOf(field === 'multipleChoice' ? 'mcqCount' : 'essayCount', requirements[field])}
+                    onChange={(e) =>
+                      handleNumInput(
+                        field === 'multipleChoice' ? 'mcqCount' : 'essayCount',
+                        e.target.value,
+                        (n) => handleReqChange(field, n),
+                        ['total']
+                      )
+                    }
                   />
+                  {configErrors[field === 'multipleChoice' ? 'mcqCount' : 'essayCount'] && (
+                    <p className="text-xs text-red-600 mt-1">
+                      {configErrors[field === 'multipleChoice' ? 'mcqCount' : 'essayCount']}
+                    </p>
+                  )}
                 </div>
               ))}
 
@@ -797,24 +1090,35 @@ const TeacherExamGenerator: React.FC = () => {
                 }`}>
                   {requirements.total}
                 </div>
+                {configErrors.total && <p className="text-xs text-red-600 mt-1">{configErrors.total}</p>}
               </div>
               <div>
                 <label className="block text-xs font-medium text-gray-700 mb-1">Section Points</label>
                 <div className="grid grid-cols-2 gap-2">
-                  <input
-                    type="number"
-                    min={0}
-                    className="input-field"
-                    value={sectionPoints.multipleChoice}
-                    onChange={(e) => setSectionPoints((prev) => ({ ...prev, multipleChoice: Number(e.target.value || 0) }))}
-                  />
-                  <input
-                    type="number"
-                    min={0}
-                    className="input-field"
-                    value={sectionPoints.essay}
-                    onChange={(e) => setSectionPoints((prev) => ({ ...prev, essay: Number(e.target.value || 0) }))}
-                  />
+                  <div>
+                    <input
+                      type="number"
+                      min={0}
+                      className="input-field"
+                      value={rawValueOf('spMcq', sectionPoints.multipleChoice)}
+                      onChange={(e) =>
+                        handleNumInput('spMcq', e.target.value, (n) => setSectionPoints((prev) => ({ ...prev, multipleChoice: n })), ['sectionPoints'])
+                      }
+                    />
+                    {configErrors.spMcq && <p className="text-xs text-red-600 mt-1">{configErrors.spMcq}</p>}
+                  </div>
+                  <div>
+                    <input
+                      type="number"
+                      min={0}
+                      className="input-field"
+                      value={rawValueOf('spEssay', sectionPoints.essay)}
+                      onChange={(e) =>
+                        handleNumInput('spEssay', e.target.value, (n) => setSectionPoints((prev) => ({ ...prev, essay: n })), ['sectionPoints'])
+                      }
+                    />
+                    {configErrors.spEssay && <p className="text-xs text-red-600 mt-1">{configErrors.spEssay}</p>}
+                  </div>
                 </div>
                 <p className={`text-xs mt-1 ${Math.abs(sectionPointsTotal - TOTAL_EXAM_POINTS) > 0.0001 ? 'text-red-600' : 'text-gray-500'}`}>
                   Total: {sectionPointsTotal}. Required total: {TOTAL_EXAM_POINTS}. Defaults for mixed exams: MCQ 7, Essay 3.
@@ -841,127 +1145,47 @@ const TeacherExamGenerator: React.FC = () => {
               <div>
                 <p className="text-xs font-semibold text-gray-700 mb-1">MCQ Difficulty Ratio (%)</p>
                 <div className="grid grid-cols-3 gap-2">
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    className="input-field"
-                    placeholder="Easy"
-                    value={requirements.difficultyDistribution?.multipleChoice.easy ?? 50}
-                    onChange={(e) => setRequirements((prev) => ({
-                      ...prev,
-                      difficultyDistribution: {
-                        multipleChoice: {
-                          easy: parseInt(e.target.value || '0', 10) || 0,
-                          medium: prev.difficultyDistribution?.multipleChoice.medium ?? 35,
-                          hard: prev.difficultyDistribution?.multipleChoice.hard ?? 15,
-                        },
-                        essay: prev.difficultyDistribution?.essay ?? { easy: 50, medium: 35, hard: 15 },
-                      },
-                    }))}
-                  />
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    className="input-field"
-                    placeholder="Medium"
-                    value={requirements.difficultyDistribution?.multipleChoice.medium ?? 35}
-                    onChange={(e) => setRequirements((prev) => ({
-                      ...prev,
-                      difficultyDistribution: {
-                        multipleChoice: {
-                          easy: prev.difficultyDistribution?.multipleChoice.easy ?? 50,
-                          medium: parseInt(e.target.value || '0', 10) || 0,
-                          hard: prev.difficultyDistribution?.multipleChoice.hard ?? 15,
-                        },
-                        essay: prev.difficultyDistribution?.essay ?? { easy: 50, medium: 35, hard: 15 },
-                      },
-                    }))}
-                  />
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    className="input-field"
-                    placeholder="Hard"
-                    value={requirements.difficultyDistribution?.multipleChoice.hard ?? 15}
-                    onChange={(e) => setRequirements((prev) => ({
-                      ...prev,
-                      difficultyDistribution: {
-                        multipleChoice: {
-                          easy: prev.difficultyDistribution?.multipleChoice.easy ?? 50,
-                          medium: prev.difficultyDistribution?.multipleChoice.medium ?? 35,
-                          hard: parseInt(e.target.value || '0', 10) || 0,
-                        },
-                        essay: prev.difficultyDistribution?.essay ?? { easy: 50, medium: 35, hard: 15 },
-                      },
-                    }))}
-                  />
+                  {([
+                    { key: 'mcqEasy', level: 'easy', placeholder: 'Easy', fallback: 50 },
+                    { key: 'mcqMedium', level: 'medium', placeholder: 'Medium', fallback: 35 },
+                    { key: 'mcqHard', level: 'hard', placeholder: 'Hard', fallback: 15 },
+                  ] as const).map(({ key, level, placeholder, fallback }) => (
+                    <input
+                      key={key}
+                      type="number"
+                      min={0}
+                      max={100}
+                      className="input-field"
+                      placeholder={placeholder}
+                      value={rawValueOf(key, requirements.difficultyDistribution?.multipleChoice[level] ?? fallback)}
+                      onChange={(e) => handleNumInput(key, e.target.value, (n) => setDifficulty('multipleChoice', level, n), ['mcqRatio'])}
+                    />
+                  ))}
                 </div>
+                {configErrors.mcqRatio && <p className="text-xs text-red-600 mt-1">{configErrors.mcqRatio}</p>}
               </div>
 
               <div>
                 <p className="text-xs font-semibold text-gray-700 mb-1">Essay Difficulty Ratio (%)</p>
                 <div className="grid grid-cols-3 gap-2">
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    className="input-field"
-                    placeholder="Easy"
-                    value={requirements.difficultyDistribution?.essay.easy ?? 50}
-                    onChange={(e) => setRequirements((prev) => ({
-                      ...prev,
-                      difficultyDistribution: {
-                        multipleChoice: prev.difficultyDistribution?.multipleChoice ?? { easy: 50, medium: 35, hard: 15 },
-                        essay: {
-                          easy: parseInt(e.target.value || '0', 10) || 0,
-                          medium: prev.difficultyDistribution?.essay.medium ?? 35,
-                          hard: prev.difficultyDistribution?.essay.hard ?? 15,
-                        },
-                      },
-                    }))}
-                  />
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    className="input-field"
-                    placeholder="Medium"
-                    value={requirements.difficultyDistribution?.essay.medium ?? 35}
-                    onChange={(e) => setRequirements((prev) => ({
-                      ...prev,
-                      difficultyDistribution: {
-                        multipleChoice: prev.difficultyDistribution?.multipleChoice ?? { easy: 50, medium: 35, hard: 15 },
-                        essay: {
-                          easy: prev.difficultyDistribution?.essay.easy ?? 50,
-                          medium: parseInt(e.target.value || '0', 10) || 0,
-                          hard: prev.difficultyDistribution?.essay.hard ?? 15,
-                        },
-                      },
-                    }))}
-                  />
-                  <input
-                    type="number"
-                    min={0}
-                    max={100}
-                    className="input-field"
-                    placeholder="Hard"
-                    value={requirements.difficultyDistribution?.essay.hard ?? 15}
-                    onChange={(e) => setRequirements((prev) => ({
-                      ...prev,
-                      difficultyDistribution: {
-                        multipleChoice: prev.difficultyDistribution?.multipleChoice ?? { easy: 50, medium: 35, hard: 15 },
-                        essay: {
-                          easy: prev.difficultyDistribution?.essay.easy ?? 50,
-                          medium: prev.difficultyDistribution?.essay.medium ?? 35,
-                          hard: parseInt(e.target.value || '0', 10) || 0,
-                        },
-                      },
-                    }))}
-                  />
+                  {([
+                    { key: 'essayEasy', level: 'easy', placeholder: 'Easy', fallback: 50 },
+                    { key: 'essayMedium', level: 'medium', placeholder: 'Medium', fallback: 35 },
+                    { key: 'essayHard', level: 'hard', placeholder: 'Hard', fallback: 15 },
+                  ] as const).map(({ key, level, placeholder, fallback }) => (
+                    <input
+                      key={key}
+                      type="number"
+                      min={0}
+                      max={100}
+                      className="input-field"
+                      placeholder={placeholder}
+                      value={rawValueOf(key, requirements.difficultyDistribution?.essay[level] ?? fallback)}
+                      onChange={(e) => handleNumInput(key, e.target.value, (n) => setDifficulty('essay', level, n), ['essayRatio'])}
+                    />
+                  ))}
                 </div>
+                {configErrors.essayRatio && <p className="text-xs text-red-600 mt-1">{configErrors.essayRatio}</p>}
               </div>
             </div>
           </div>
@@ -969,7 +1193,7 @@ const TeacherExamGenerator: React.FC = () => {
           {/* Generate button */}
           <button
             onClick={handleGenerate}
-            disabled={generating || !isValid || totalQuestions < requirements.total}
+            disabled={generating || totalQuestions < requirements.total}
             className="btn-primary w-full py-3 text-base flex items-center justify-center gap-3"
           >
             {generating ? (
@@ -1023,8 +1247,8 @@ const TeacherExamGenerator: React.FC = () => {
                         <p className="text-xs text-gray-500">{exam.subject?.name} • {exam._count?.questions ?? 0} questions • v{exam.version}</p>
                       </div>
                       <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
-                        <button className="btn-secondary text-xs" onClick={() => handleExport(exam.id)}>Export Exam (.docx)</button>
-                        <button className="btn-secondary text-xs" onClick={() => handleExportAnswerKey(exam.id)}>Answer Key</button>
+                        <button className="btn-secondary text-xs" disabled={exportingExamId === exam.id} onClick={() => handleExport(exam.id)}>{exportingExamId === exam.id ? 'Exporting…' : 'Export Exam (.docx)'}</button>
+                        <button className="btn-secondary text-xs" disabled={exportingKeyId === exam.id} onClick={() => handleExportAnswerKey(exam.id)}>{exportingKeyId === exam.id ? 'Exporting…' : 'Answer Key'}</button>
                       </div>
                     </div>
                   </div>
@@ -1048,6 +1272,17 @@ const TeacherExamGenerator: React.FC = () => {
                       <div className="flex items-center gap-2">
                         <button className="btn-secondary text-xs" onClick={() => handleShuffleSection('MULTIPLE_CHOICE')}>Shuffle MCQ</button>
                         <button className="btn-secondary text-xs" onClick={() => handleShuffleSection('ESSAY')}>Shuffle Essay</button>
+                        <button
+                          className={`text-xs ${isWordDirty ? 'btn-primary' : 'btn-secondary opacity-50'}`}
+                          disabled={!isWordDirty || generatingWord}
+                          onClick={() => handleGenerateWord(selectedExam.id)}
+                          title={isWordDirty
+                            ? 'Question order or points changed — generate updated exam + answer key (.docx)'
+                            : 'No changes since the last generated Word'}
+                        >
+                          <Download size={14} className="inline mr-1" />
+                          {generatingWord ? 'Generating…' : 'Generate New Word'}
+                        </button>
                       </div>
                     </div>
 
@@ -1108,9 +1343,17 @@ const TeacherExamGenerator: React.FC = () => {
                                 <div className="text-xs text-gray-500">Points</div>
                                 <input
                                   type="number"
+                                  min={0}
+                                  step={0.25}
                                   className="input-field w-28 text-right"
-                                  value={Number(item.points || 0)}
-                                  onChange={(e) => handleUpdateQuestionPoints(item.question.id, Number(e.target.value || 0))}
+                                  value={pointsDrafts[item.question.id] ?? String(Number(item.points || 0))}
+                                  onChange={(e) =>
+                                    setPointsDrafts((prev) => ({ ...prev, [item.question.id]: e.target.value }))
+                                  }
+                                  onBlur={() => commitQuestionPoints(item.question.id)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+                                  }}
                                 />
                               </div>
                             </div>
@@ -1322,7 +1565,7 @@ const TeacherExamGenerator: React.FC = () => {
 
                     <div className="flex items-center justify-end gap-2 pt-2">
                       <button type="button" className="btn-secondary" onClick={closeQuestionModal}>Cancel</button>
-                      <button type="button" className="btn-primary" onClick={saveQuestionEdit}>Save Changes</button>
+                      <button type="button" className="btn-primary" disabled={savingQuestion} onClick={saveQuestionEdit}>{savingQuestion ? 'Saving…' : 'Save Changes'}</button>
                     </div>
                   </div>
                 ) : (
@@ -1363,11 +1606,11 @@ const TeacherExamGenerator: React.FC = () => {
                         </select>
                       </div>
                       <div className="md:col-span-2 flex items-end gap-2">
-                        <button type="button" className="btn-secondary flex items-center gap-2" onClick={runReplacementSearch}>
-                          <Search size={14} /> Search
+                        <button type="button" className="btn-secondary flex items-center gap-2" disabled={loadingReplacement} onClick={runReplacementSearch}>
+                          <Search size={14} /> {loadingReplacement ? 'Searching…' : 'Search'}
                         </button>
-                        <button type="button" className="btn-secondary flex items-center gap-2" onClick={confirmAutoReplacement}>
-                          <RefreshCw size={14} /> Auto Replace
+                        <button type="button" className="btn-secondary flex items-center gap-2" disabled={savingQuestion} onClick={confirmAutoReplacement}>
+                          <RefreshCw size={14} /> {savingQuestion ? 'Replacing…' : 'Auto Replace'}
                         </button>
                       </div>
                     </div>
@@ -1404,7 +1647,7 @@ const TeacherExamGenerator: React.FC = () => {
 
                     <div className="flex items-center justify-end gap-2 pt-2">
                       <button type="button" className="btn-secondary" onClick={closeQuestionModal}>Cancel</button>
-                      <button type="button" className="btn-primary" disabled={!selectedReplacementId} onClick={confirmManualReplacement}>Replace Selected</button>
+                      <button type="button" className="btn-primary" disabled={!selectedReplacementId || savingQuestion} onClick={confirmManualReplacement}>{savingQuestion ? 'Replacing…' : 'Replace Selected'}</button>
                     </div>
                   </div>
                 )}

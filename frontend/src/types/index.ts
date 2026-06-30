@@ -149,6 +149,7 @@ export interface ExamSubmission {
   scanFiles?: string;
   scanEntries?: ExamScanEntry[];
   scanCount?: number;
+  attempts?: ExamSubmissionAttempt[];
   status: 'SUBMITTED' | 'GRADED' | 'REVIEWED' | 'FINALIZED';
   aiScore?: number | null;
   finalScore?: number | null;
@@ -171,6 +172,29 @@ export interface ExamSubmission {
     totalScore: number;
     createdAt: string;
   }>;
+}
+
+export interface ExamSubmissionAttempt {
+  id: number;
+  submissionId: number;
+  attemptNumber: number;
+  sourceDraftId?: number | null;
+  scanFiles?: string;
+  scanEntries?: ExamScanEntry[];
+  scanCount?: number;
+  status: 'SUBMITTED' | 'GRADED' | 'REVIEWED' | 'FINALIZED';
+  aiScore?: number | null;
+  finalScore?: number | null;
+  feedback?: string | null;
+  mergedPdfUrl?: string | null;
+  objectiveScore?: number | null;
+  essayScore?: number | null;
+  totalScore?: number | null;
+  objectiveDetectedCount?: number | null;
+  objectiveCorrectCount?: number | null;
+  warnings?: string[];
+  gradedAt?: string | null;
+  createdAt: string;
 }
 
 export interface StudentPublishedExamResult {

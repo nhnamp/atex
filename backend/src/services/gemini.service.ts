@@ -329,26 +329,39 @@ const normalizeEssayResults = (
       ? Math.max(0, Math.min(resolvedMaxScore, incomingScore))
       : 0;
     const componentScores = normalizeComponentScores(raw.componentScores, resolvedMaxScore);
-    const componentTotal = componentScores.length > 0
+    const hasComponents = componentScores.length > 0;
+    const componentTotal = hasComponents
       ? componentScores.reduce((acc, component) => acc + component.score, 0)
       : resolvedScore;
-    const feedbackText = String(raw.feedback || '').toLowerCase();
-    const strongNegativeFeedback = /(sai|lạc đề|không đúng|không nêu|không trả lời|chưa giải thích|chưa đưa ra|né tránh|mơ hồ|không có bằng chứng)/i.test(feedbackText);
-    const partialNegativeFeedback = /(thiếu|chưa đầy đủ|chung chung|một phần|sơ sài)/i.test(feedbackText);
+    // When per-criterion component scores exist, their sum IS the authoritative
+    // question score (partial correctness is already encoded per criterion).
+    // Otherwise fall back to the model-reported total.
+    const baseScore = hasComponents ? componentTotal : resolvedScore;
+    // Evidence guards (independent of correctness): no extracted answer => 0,
+    // suspiciously short answer => cap at 20% to resist hallucinated scores.
     const cappedByAnswerLength = !extractedAnswer
       ? 0
       : answerWordCount < 6
-        ? Math.min(resolvedScore, componentTotal, resolvedMaxScore * 0.2)
-        : Math.min(resolvedScore, componentTotal);
-    const cappedByFeedback = strongNegativeFeedback
-      ? Math.min(cappedByAnswerLength, resolvedMaxScore * 0.2)
-      : partialNegativeFeedback
-        ? Math.min(cappedByAnswerLength, resolvedMaxScore * 0.6)
-        : cappedByAnswerLength;
+        ? Math.min(baseScore, resolvedMaxScore * 0.2)
+        : baseScore;
+    // Feedback-keyword caps only apply when there is NO trustworthy component
+    // breakdown; with components present the keyword "sai/thiếu/..." just
+    // describes one criterion and must not slash the whole question score.
+    const feedbackText = String(raw.feedback || '').toLowerCase();
+    const strongNegativeFeedback = /(sai|lạc đề|không đúng|không nêu|không trả lời|chưa giải thích|chưa đưa ra|né tránh|mơ hồ|không có bằng chứng)/i.test(feedbackText);
+    const partialNegativeFeedback = /(thiếu|chưa đầy đủ|chung chung|một phần|sơ sài)/i.test(feedbackText);
+    const cappedByFeedback = hasComponents
+      ? cappedByAnswerLength
+      : strongNegativeFeedback
+        ? Math.min(cappedByAnswerLength, resolvedMaxScore * 0.2)
+        : partialNegativeFeedback
+          ? Math.min(cappedByAnswerLength, resolvedMaxScore * 0.6)
+          : cappedByAnswerLength;
+    const finalQuestionScore = Math.max(0, Math.min(resolvedMaxScore, cappedByFeedback));
 
     normalizedByQuestion.set(questionId, {
       questionId,
-      score: Number(cappedByFeedback.toFixed(2)),
+      score: Number(finalQuestionScore.toFixed(2)),
       maxScore: Number(resolvedMaxScore.toFixed(2)),
       feedback: String(raw.feedback || raw.comments || '').trim().slice(0, 1000),
       componentScores,

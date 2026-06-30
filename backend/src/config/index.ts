@@ -18,8 +18,8 @@ const parseStringList = (raw: string | undefined, fallback: string[]): string[] 
 // Gemini grading models in priority order. Each request tries the first model;
 // when a model is rate-limited/overloaded it is skipped and the next one is used.
 const DEFAULT_GEMINI_MODELS = [
-  'gemini-3.5-flash',
   'gemini-3-flash-preview',
+  'gemini-3.5-flash',
   'gemini-3.1-flash-lite',
   'gemini-2.5-flash',
   'gemini-2.5-flash-lite',

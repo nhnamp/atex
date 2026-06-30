@@ -49,9 +49,9 @@ const TeacherQuestions: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'ACTIVE' | 'ARCHIVED'>('ALL');
   const [isImportModalOpen, setIsImportModalOpen] = useState(false);
 
-  const fetchData = async () => {
+  const fetchData = async ({ silent = false }: { silent?: boolean } = {}) => {
     if (!subjectId) return;
-    setLoading(true);
+    if (!silent) setLoading(true);
     try {
       const [qRes, sRes, oRes] = await Promise.all([
         api.get<Question[]>(`/questions/subject/${subjectId}`),
@@ -64,7 +64,7 @@ const TeacherQuestions: React.FC = () => {
     } catch {
       toast.error('Failed to load question bank');
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
@@ -126,7 +126,7 @@ const TeacherQuestions: React.FC = () => {
         toast.success('Question added');
       }
       setShowModal(false);
-      fetchData();
+      fetchData({ silent: true });
     } catch (err: any) {
       toast.error(err?.response?.data?.error || 'Failed to save question');
     } finally {
@@ -139,7 +139,7 @@ const TeacherQuestions: React.FC = () => {
     try {
       await api.delete(`/questions/${id}`);
       toast.success('Question archived');
-      fetchData();
+      fetchData({ silent: true });
     } catch {
       toast.error('Failed to archive question');
     }
@@ -165,15 +165,17 @@ const TeacherQuestions: React.FC = () => {
               <h1 className="text-2xl font-bold text-gray-900">{subject?.name ?? 'Question Bank'}</h1>
               <p className="text-gray-500 mt-1">{questions.length} total questions</p>
             </div>
-            <button onClick={openCreate} className="btn-primary flex items-center gap-2">
-              <Plus size={18} /> Add Question
-            </button>
-            <button
-              onClick={() => setIsImportModalOpen(true)}
-              className="btn-secondary flex items-center gap-2"
-            >
-              <Upload size={18} /> Import Questions
-            </button>
+            <div className="flex items-center gap-2">
+              <button onClick={openCreate} className="btn-primary flex items-center gap-2">
+                <Plus size={18} /> Add Question
+              </button>
+              <button
+                onClick={() => setIsImportModalOpen(true)}
+                className="btn-secondary flex items-center gap-2"
+              >
+                <Upload size={18} /> Import Questions
+              </button>
+            </div>
           </div>
         </div>
 
@@ -370,7 +372,7 @@ const TeacherQuestions: React.FC = () => {
         outcomes={outcomes}
         isOpen={isImportModalOpen}
         onClose={() => setIsImportModalOpen(false)}
-        onSuccess={fetchData}
+        onSuccess={() => fetchData({ silent: true })}
       />
     </Layout>
   );
